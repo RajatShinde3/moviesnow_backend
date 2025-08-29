@@ -69,8 +69,11 @@ class Person(Base):
     also_known_as = Column(JSONB, nullable=True, doc="Alternate/stage names (array of strings).")
 
     # ─────────────── Demographics ───────────────
-    gender = Column(SAEnum(PersonGender, name="person_gender"), nullable=False,
-                    server_default=text("'unknown'"))
+    gender = Column(
+        SAEnum(PersonGender, name="person_gender"),
+        nullable=False,
+        server_default=text("'UNKNOWN'"), 
+    )
     birth_date = Column(Date, nullable=True)
     death_date = Column(Date, nullable=True)
     birth_place = Column(String(256), nullable=True, doc="Free‑text city/region/country.")
@@ -132,6 +135,7 @@ class Person(Base):
     profile_image_asset = relationship(
         "MediaAsset",
         primaryjoin="Person.profile_image_asset_id == MediaAsset.id",
+        foreign_keys="[Person.profile_image_asset_id]",
         viewonly=True,
         lazy="selectin",
     )
@@ -142,7 +146,10 @@ class Person(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
+        primaryjoin="Credit.person_id == Person.id",
+        foreign_keys="[Credit.person_id]",
     )
+
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Person id={self.id} name={self.primary_name!r} slug={self.slug!r} active={self.active}>"

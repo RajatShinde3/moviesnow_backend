@@ -2,24 +2,11 @@
 from __future__ import annotations
 
 """
-# MoviesNow — Database Engines & Session Dependencies
+MoviesNow — Database Engines & Session Dependencies
 
-Production-grade SQLAlchemy 2.0 setup with **sync** and **async** engines:
-
-- **Sync engine** (`engine`) for Alembic, CLI scripts, one-off jobs.
-- **Async engine** (`async_engine`) for FastAPI and background tasks.
-- Session factories: `SessionLocal` (sync) and `async_session_maker` (async).
-- FastAPI dependencies: `get_db()` and `get_async_db()` with **safe rollback**.
-- Utilities:
-  - `transactional_async_session()` — async context manager for `session.begin()`.
-  - `db_healthcheck()` — quick `SELECT 1` for readiness probes.
-  - URL derivation if `ASYNC_DATABASE_URL` isn’t set.
-
-Design notes
-------------
-- **Expire on commit** disabled to keep objects usable after commit.
-- **Pool** settings tuned for API workloads; adjust via env if needed.
-- We **don’t** auto-commit in dependencies; callers decide when to commit.
+- Async engine/session for FastAPI & tests.
+- Sync engine/session are created lazily (only when used), so importing this
+  module won't crash if psycopg2 isn't installed in test envs.
 """
 
 from typing import AsyncGenerator, Generator, Optional
@@ -28,6 +15,7 @@ from contextlib import asynccontextmanager
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -39,86 +27,31 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-
 # ─────────────────────────────────────────────────────────────
-# 🔧 Helpers
+# Helpers
 # ─────────────────────────────────────────────────────────────
 
 def _derive_async_url(sync_url: str) -> str:
-    """
-    Convert a sync Postgres URL to an asyncpg URL if needed.
-
-    Examples:
-        postgresql://user:pass@host/db  -> postgresql+asyncpg://user:pass@host/db
-        (returns input unchanged if already async)
-    """
+    """Convert a sync Postgres URL to an asyncpg URL if needed."""
     if "+asyncpg" in sync_url or "postgresql+asyncpg" in sync_url:
         return sync_url
     if sync_url.startswith("postgresql://"):
         return sync_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    # Add other RDBMS mappings as required (e.g., MySQL async driver)
     return sync_url
 
-
-# Resolve URLs with sane fallbacks
+# Resolve URLs
 SYNC_DATABASE_URL: str = getattr(settings, "DATABASE_URL")
 ASYNC_DATABASE_URL: str = getattr(settings, "ASYNC_DATABASE_URL", "") or _derive_async_url(SYNC_DATABASE_URL)
 
-
-# Pool tuning knobs (adjust per environment if needed)
+# Pool knobs
 _POOL_PRE_PING = True
-_POOL_RECYCLE = 1800     # seconds
-_POOL_TIMEOUT = 30       # seconds
-_POOL_SIZE = 10          # base worker pool
-_MAX_OVERFLOW = 20       # bursty traffic headroom
-
-
-# ─────────────────────────────────────────────────────────────
-# 🧱 SYNC ENGINE — For Alembic Migrations, CLI Scripts
-# ─────────────────────────────────────────────────────────────
-
-engine = create_engine(
-    SYNC_DATABASE_URL,
-    pool_pre_ping=_POOL_PRE_PING,
-    pool_recycle=_POOL_RECYCLE,
-    pool_size=_POOL_SIZE,
-    max_overflow=_MAX_OVERFLOW,
-    pool_timeout=_POOL_TIMEOUT,
-    future=True,
-)
-
-SessionLocal = sessionmaker(
-    bind=engine,
-    autocommit=False,
-    autoflush=False,
-    expire_on_commit=False,
-)
-
-
-def get_db() -> Generator[Session, None, None]:
-    """
-    FastAPI dependency that yields a **sync** SQLAlchemy session.
-
-    Yields:
-        Session: A SQLAlchemy ORM session.
-
-    Guarantees:
-        - Closes the session after request.
-        - Rolls back on exceptions to avoid leaking open transactions.
-    """
-    db = SessionLocal()
-    try:
-        yield db
-        # Caller decides to commit; many CLI/migration contexts handle their own tx
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
+_POOL_RECYCLE = 1800
+_POOL_TIMEOUT = 30
+_POOL_SIZE = 10
+_MAX_OVERFLOW = 20
 
 # ─────────────────────────────────────────────────────────────
-# ⚡ ASYNC ENGINE — For FastAPI and Async Workloads
+# ⚡ ASYNC ENGINE — used by app & tests
 # ─────────────────────────────────────────────────────────────
 
 async_engine: AsyncEngine = create_async_engine(
@@ -128,7 +61,7 @@ async_engine: AsyncEngine = create_async_engine(
     pool_size=_POOL_SIZE,
     max_overflow=_MAX_OVERFLOW,
     pool_timeout=_POOL_TIMEOUT,
-    echo=False,  # flip to True temporarily for debugging SQL
+    echo=False,
     future=True,
 )
 
@@ -138,22 +71,8 @@ async_session_maker = async_sessionmaker(
     expire_on_commit=False,
 )
 
-
 async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    FastAPI dependency that yields an **async** SQLAlchemy session.
-
-    Yields:
-        AsyncSession: An async ORM session.
-
-    Guarantees:
-        - Closes the session after request.
-        - Rolls back on exceptions to avoid leaking open transactions.
-
-    Usage:
-        async def route(db: AsyncSession = Depends(get_async_db)):
-            ...
-    """
+    """FastAPI dependency that yields an async SQLAlchemy session."""
     async with async_session_maker() as session:
         try:
             yield session
@@ -163,33 +82,18 @@ async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
         finally:
             await session.close()
 
-
 @asynccontextmanager
 async def transactional_async_session() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Async context manager that opens a session and a transaction.
-
-    Example:
-        async with transactional_async_session() as session:
-            session.add(obj)
-            # commits when block exits; rolls back on exception
-    """
+    """Async context manager that opens a session and a transaction."""
     async with async_session_maker() as session:
         async with session.begin():
             try:
                 yield session
             except Exception:
-                # session.begin() will roll back automatically on exception
-                raise
-
+                raise  # rollback handled by session.begin()
 
 async def db_healthcheck() -> bool:
-    """
-    Quick `SELECT 1` to verify DB connectivity (used by `/readyz`).
-
-    Returns:
-        bool: True when a round-trip query succeeds.
-    """
+    """Quick SELECT 1 to verify DB connectivity (used by /readyz)."""
     try:
         async with async_engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
@@ -198,14 +102,66 @@ async def db_healthcheck() -> bool:
         logger.exception("DB healthcheck failed")
         return False
 
+# ─────────────────────────────────────────────────────────────
+# 🧱 SYNC ENGINE — created lazily (avoids psycopg2 import on import)
+# ─────────────────────────────────────────────────────────────
+
+_engine: Optional[Engine] = None
+_SessionLocal: Optional[sessionmaker] = None
+
+def get_sync_engine() -> Engine:
+    """Create the sync engine on first use (requires psycopg2 or psycopg)."""
+    global _engine
+    if _engine is None:
+        _engine = create_engine(
+            SYNC_DATABASE_URL,
+            pool_pre_ping=_POOL_PRE_PING,
+            pool_recycle=_POOL_RECYCLE,
+            pool_size=_POOL_SIZE,
+            max_overflow=_MAX_OVERFLOW,
+            pool_timeout=_POOL_TIMEOUT,
+            future=True,
+        )
+    return _engine
+
+def get_session_local() -> sessionmaker:
+    """Create the sync session factory on first use."""
+    global _SessionLocal
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(
+            bind=get_sync_engine(),
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+    return _SessionLocal
+
+def get_db() -> Generator[Session, None, None]:
+    """
+    FastAPI dependency that yields a sync SQLAlchemy session.
+
+    NOTE: This initializes the sync engine on first call. If you don't need
+    sync DB access (e.g., in tests), don't call this and psycopg2 isn't needed.
+    """
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    try:
+        yield db
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 __all__ = [
-    "engine",
-    "SessionLocal",
-    "get_db",
+    # async
     "async_engine",
     "async_session_maker",
     "get_async_db",
     "transactional_async_session",
     "db_healthcheck",
+    # sync (lazy)
+    "get_sync_engine",
+    "get_session_local",
+    "get_db",
 ]

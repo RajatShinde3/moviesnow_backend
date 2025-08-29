@@ -186,18 +186,26 @@ class Artwork(Base):
         back_populates="artworks",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="Artwork.title_id == Title.id",
+        foreign_keys="[Artwork.title_id]",
     )
+
     season = relationship(
         "Season",
         back_populates="artworks",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="Artwork.season_id == Season.id",
+        foreign_keys="[Artwork.season_id]",
     )
+
     episode = relationship(
         "Episode",
         back_populates="artworks",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="Artwork.episode_id == Episode.id",
+        foreign_keys="[Artwork.episode_id]",
     )
 
     # ──────────────────────────────────────────────────────────

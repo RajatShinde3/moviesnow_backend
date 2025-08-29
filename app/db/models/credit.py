@@ -128,14 +128,15 @@ class Credit(Base):
         CheckConstraint("(episode_count IS NULL OR episode_count > 0)", name="ck_credits_episode_count_pos"),
         # Optional taxonomy consistency (kind ↔ role)
         CheckConstraint(
-            "(kind = 'cast' AND role IN ('actor','voice','guest_star','cameo')) OR "
-            "(kind = 'crew' AND role IN (\n"
-            "  'director','writer','producer','executive_producer','showrunner','creator','composer',\n"
-            "  'editor','cinematographer','costume_designer','vfx_supervisor','sound_mixer','music_supervisor',\n"
-            "  'stunt_coordinator','other'\n"
+            "(kind::text = 'cast' AND role::text IN ('actor','voice','guest_star','cameo')) OR "
+            "(kind::text = 'crew' AND role::text IN ("
+            "  'director','writer','producer','executive_producer','showrunner','creator','composer',"
+            "  'editor','cinematographer','costume_designer','vfx_supervisor','sound_mixer','music_supervisor',"
+            "  'stunt_coordinator','other'"
             "))",
-            name="ck_credits_kind_role_consistent",
+            name="ck_credits_ck_credits_kind_role_consistent",
         ),
+
 
         # De‑dup per scope
         Index(
@@ -170,10 +171,41 @@ class Credit(Base):
     )
 
     # Relationships
-    person = relationship("Person", back_populates="credits", lazy="selectin", passive_deletes=True)
-    title = relationship("Title", back_populates="credits", lazy="selectin", passive_deletes=True)
-    season = relationship("Season", back_populates="credits", lazy="selectin", passive_deletes=True)
-    episode = relationship("Episode", back_populates="credits", lazy="selectin", passive_deletes=True)
+    person = relationship(
+        "Person",
+        back_populates="credits",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Credit.person_id == Person.id",
+        foreign_keys="[Credit.person_id]",
+    )
+
+    title = relationship(
+        "Title",
+        back_populates="credits",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Credit.title_id == Title.id",
+        foreign_keys="[Credit.title_id]",
+    )
+
+    season = relationship(
+        "Season",
+        back_populates="credits",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Credit.season_id == Season.id",
+        foreign_keys="[Credit.season_id]",
+    )
+
+    episode = relationship(
+        "Episode",
+        back_populates="credits",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Credit.episode_id == Episode.id",
+        foreign_keys="[Credit.episode_id]",
+    )
 
     def __repr__(self) -> str:  # pragma: no cover
         parent = "title" if self.title_id else ("season" if self.season_id else "episode")

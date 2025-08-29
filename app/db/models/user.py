@@ -135,20 +135,103 @@ class User(Base):
         back_populates="user",
         uselist=False,
         cascade="all, delete-orphan",
+        single_parent=True,
         passive_deletes=True,
         lazy="selectin",
+        primaryjoin="Profile.user_id == User.id",
+        foreign_keys="[Profile.user_id]",
     )
 
-    otps = relationship("OTP", back_populates="user", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
-    refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
-    mfa_reset_tokens = relationship("MFAResetToken", back_populates="user", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
 
-    audit_logs = relationship("AuditLog", back_populates="user", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
-    watchlist_items = relationship("WatchlistItem", back_populates="user", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
-    collections = relationship("Collection", back_populates="owner", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
-    progress_entries = relationship("Progress", back_populates="user", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
-    reviews = relationship("Review", back_populates="user", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
-    playback_sessions = relationship("PlaybackSession", back_populates="user", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
+    otps = relationship(
+        "OTP",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="OTP.user_id == User.id",
+        foreign_keys="[OTP.user_id]",
+    )
+
+    refresh_tokens = relationship(
+        "RefreshToken",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="RefreshToken.user_id == User.id",
+        foreign_keys="[RefreshToken.user_id]",
+    )
+
+    mfa_reset_tokens = relationship(
+        "MFAResetToken",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="MFAResetToken.user_id == User.id",
+        foreign_keys="[MFAResetToken.user_id]",
+    )
+
+    audit_logs = relationship(
+        "AuditLog",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="AuditLog.user_id == User.id",
+        foreign_keys="[AuditLog.user_id]",
+    )
+
+    watchlist_items = relationship(
+        "WatchlistItem",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="WatchlistItem.user_id == User.id",
+        foreign_keys="[WatchlistItem.user_id]",
+    )
+
+    collections = relationship(
+        "Collection",
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="Collection.owner_user_id == User.id",
+        foreign_keys="[Collection.owner_user_id]",
+    )
+
+    progress_entries = relationship(
+        "Progress",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="Progress.user_id == User.id",
+        foreign_keys="[Progress.user_id]",
+    )
+
+    reviews = relationship(
+        "Review",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="Review.user_id == User.id",
+        foreign_keys="[Review.user_id]",
+    )
+
+    playback_sessions = relationship(
+        "PlaybackSession",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="PlaybackSession.user_id == User.id",
+        foreign_keys="[PlaybackSession.user_id]",
+    )
 
     # ── Convenience ─────────────────────────────────────────────────────────
     def __repr__(self) -> str:  # pragma: no cover

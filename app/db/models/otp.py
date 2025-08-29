@@ -86,7 +86,14 @@ class OTP(Base):
     )
 
     # ─────────────── Relationships ───────────────
-    user = relationship("User", back_populates="otps", lazy="selectin", passive_deletes=True)
+    user = relationship(
+        "User",
+        back_populates="otps",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="OTP.user_id == User.id",
+        foreign_keys="[OTP.user_id]",
+    )
 
     # ─────────────── Helpers ───────────────
     @property

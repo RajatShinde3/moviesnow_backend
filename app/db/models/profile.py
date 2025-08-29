@@ -111,7 +111,16 @@ class Profile(Base):
     )
 
     # ── Relationship ─────────────────────────────────────────────────────────
-    user = relationship("User", back_populates="profile", lazy="selectin", passive_deletes=True)
+    user = relationship(
+        "User",
+        back_populates="profile",
+        uselist=False,
+        passive_deletes=True,
+        lazy="selectin",
+        primaryjoin="Profile.user_id == User.id",
+        foreign_keys="[Profile.user_id]",
+    )
+
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Profile id={self.id} user_id={self.user_id} handle={self.handle}>"

@@ -96,6 +96,7 @@ class Genre(Base):
     )
 
     # ───────────────── Relationships ─────────────────
+    # Self-hierarchy
     parent = relationship(
         "Genre",
         remote_side=lambda: [Genre.id],
@@ -103,6 +104,7 @@ class Genre(Base):
         lazy="selectin",
         passive_deletes=True,
     )
+
     children = relationship(
         "Genre",
         back_populates="parent",
@@ -111,7 +113,7 @@ class Genre(Base):
         passive_deletes=True,
     )
 
-    # M2M to titles via association table name (avoids circular imports)
+    # M2M to titles
     titles = relationship(
         "Title",
         secondary="title_genres",
@@ -119,6 +121,7 @@ class Genre(Base):
         lazy="selectin",
         passive_deletes=True,
     )
+
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Genre id={self.id} slug={self.slug} active={self.is_active}>"

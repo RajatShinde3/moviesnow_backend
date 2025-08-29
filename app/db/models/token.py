@@ -95,7 +95,10 @@ class RefreshToken(Base):
         back_populates="refresh_tokens",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="RefreshToken.user_id == User.id",
+        foreign_keys="[RefreshToken.user_id]",
     )
+
 
     # ── Indexes & constraints ───────────────────────────────────────────────
     __table_args__ = (

@@ -120,10 +120,30 @@ class Certification(Base):
     )
 
     # Relationships (two‑way; add `certifications` on parents)
-    title = relationship("Title", back_populates="certifications", lazy="selectin", passive_deletes=True)
-    season = relationship("Season", back_populates="certifications", lazy="selectin", passive_deletes=True)
-    episode = relationship("Episode", back_populates="certifications", lazy="selectin", passive_deletes=True)
-
+    title = relationship(
+        "Title",
+        back_populates="certifications",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Certification.title_id == Title.id",
+        foreign_keys="[Certification.title_id]",
+    )
+    season = relationship(
+        "Season",
+        back_populates="certifications",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Certification.season_id == Season.id",
+        foreign_keys="[Certification.season_id]",
+    )
+    episode = relationship(
+        "Episode",
+        back_populates="certifications",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Certification.episode_id == Episode.id",
+        foreign_keys="[Certification.episode_id]",
+    )
     def __repr__(self) -> str:  # pragma: no cover
         parent = "T" if self.title_id else ("S" if self.season_id else "E")
         return f"<Certification {parent} rating={self.rating_code} {self.system} {self.region} current={self.is_current}>"
@@ -203,10 +223,30 @@ class ContentAdvisory(Base):
     )
 
     # Relationships (two‑way; add `content_advisories` on parents)
-    title = relationship("Title", back_populates="content_advisories", lazy="selectin", passive_deletes=True)
-    season = relationship("Season", back_populates="content_advisories", lazy="selectin", passive_deletes=True)
-    episode = relationship("Episode", back_populates="content_advisories", lazy="selectin", passive_deletes=True)
-
+    title = relationship(
+        "Title",
+        back_populates="content_advisories",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="ContentAdvisory.title_id == Title.id",
+        foreign_keys="[ContentAdvisory.title_id]",
+    )
+    season = relationship(
+        "Season",
+        back_populates="content_advisories",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="ContentAdvisory.season_id == Season.id",
+        foreign_keys="[ContentAdvisory.season_id]",
+    )
+    episode = relationship(
+        "Episode",
+        back_populates="content_advisories",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="ContentAdvisory.episode_id == Episode.id",
+        foreign_keys="[ContentAdvisory.episode_id]",
+    )
     # Helpers
     def is_scene_level(self) -> bool:
         """True when this advisory applies to a time‑bounded segment."""

@@ -1,7 +1,8 @@
+# app/db/models/title.py
 from __future__ import annotations
 
 """
-🎬 MoviesNow — Title Model (production‑grade, deduplicated & hardened)
+🎬 MoviesNow — Title Model (production-grade, deduplicated & hardened)
 =====================================================================
 
 Canonical catalog entity for a **video work**: either a single **Movie** or a
@@ -10,41 +11,41 @@ playback integrations with strict constraints and pragmatic indexes.
 
 Design highlights
 -----------------
-• First‑class `type` (MOVIE/SERIES) and lifecycle `status`.
-• Case‑insensitive **slug uniqueness** and non‑blank name/slug guards.
+• First-class `type` (MOVIE/SERIES) and lifecycle `status`.
+• Case-insensitive **slug uniqueness** and non-blank name/slug guards.
 • Release metadata (year/date), ISO country/language arrays, optional runtime.
 • Canonical **artwork/trailer pointers** to `MediaAsset` rows.
-• External IDs (IMDB/TMDB) for de‑dup and backfilling.
-• Popularity/ratings with **range checks**; finance fields kept non‑negative.
+• External IDs (IMDB/TMDB) for de-dup and backfilling.
+• Popularity/ratings with **range checks**; finance fields kept non-negative.
 • Clean relationships matching the wider schema (no duplicates).
 
 Relationships (defined here; counterparts live in their models)
 --------------------------------------------------------------
-• `seasons`            ↔ Season.title                     (1‑to‑many)
-• `media_assets`       ↔ MediaAsset.title                 (1‑to‑many)
-• `credits`            ↔ Credit.title                     (1‑to‑many)
+• `seasons`            ↔ Season.title                     (1-to-many)
+• `media_assets`       ↔ MediaAsset.title                 (1-to-many)
+• `credits`            ↔ Credit.title                     (1-to-many)
 • `genres`             ↔ M2M via `secondary="title_genres"`
-• `collection_items`   ↔ CollectionItem.title             (1‑to‑many)
-• `in_collections`     ↔ Collection.titles                (many‑to‑many, view‑only)
-• `availabilities`     ↔ Availability.title               (1‑to‑many)
-• `progress_entries`   ↔ Progress.title                   (1‑to‑many)
-• `reviews`            ↔ Review.title                     (1‑to‑many)
-• `playback_sessions`  ↔ PlaybackSession.title            (1‑to‑many)
-• `subtitles`          ↔ Subtitle.title                   (1‑to‑many)
-• `watchlisted_by`     ↔ WatchlistItem.title              (1‑to‑many)  # assumes your watchlist item class name
+• `collection_items`   ↔ CollectionItem.title             (1-to-many)
+• `in_collections`     ↔ Collection.titles                (many-to-many, view-only)
+• `availabilities`     ↔ Availability.title               (1-to-many)
+• `progress_entries`   ↔ Progress.title                   (1-to-many)
+• `reviews`            ↔ Review.title                     (1-to-many)
+• `playback_sessions`  ↔ PlaybackSession.title            (1-to-many)
+• `subtitles`          ↔ Subtitle.title                   (1-to-many)
+• `watchlisted_by`     ↔ WatchlistItem.title              (1-to-many)
 
 Conventions
 -----------
-• All timestamps are timezone‑aware UTC with DB‑side defaults (`func.now()`).
+• All timestamps are timezone-aware UTC with DB-side defaults (`func.now()`).
 • Use `MediaAsset` for galleries; these pointer FKs pick the canonical poster,
   backdrop, and trailer.
 • `runtime_minutes`/`movie_part` only apply to movies.
 """
 
-from enum import Enum
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Column,
     Date,
@@ -54,10 +55,9 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    UniqueConstraint,
-    Boolean,
-    func,
     text,
+    func,
+    and_
 )
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, BIGINT
 from sqlalchemy.orm import relationship
@@ -66,19 +66,8 @@ from app.db.base_class import Base
 from app.schemas.enums import TitleType, TitleStatus
 
 
-# ──────────────────────────────────────────────────────────────
-# 🎬 Model
-# ──────────────────────────────────────────────────────────────
 class Title(Base):
-    """Canonical catalog entity for Movies and Series.
-
-    Notes
-    -----
-    • **Movies**: set `runtime_minutes`; optional `movie_part` for multi‑part films.
-    • **Series**: children live under `Season` → `Episode`.
-    • Prefer **MediaAsset** rows for galleries; the pointer FKs here select
-      the *primary* assets for UI.
-    """
+    """Canonical catalog entity for Movies and Series."""
 
     __tablename__ = "titles"
 
@@ -97,7 +86,7 @@ class Title(Base):
     # ─────────────── Names & SEO ───────────────
     name = Column(String(255), nullable=False, doc="Display name (default locale).")
     original_name = Column(String(255), nullable=True, doc="Original production name.")
-    slug = Column(String(255), nullable=False, index=True, doc="URL‑safe slug (CI unique).")
+    slug = Column(String(255), nullable=False, index=True, doc="URL-safe slug (CI unique).")
 
     # ─────────────── Synopsis ───────────────
     overview = Column(String, nullable=True)
@@ -108,12 +97,12 @@ class Title(Base):
     release_date = Column(Date, nullable=True, index=True)
     end_date = Column(Date, nullable=True, comment="For series: last air date when ended.")
     runtime_minutes = Column(Integer, nullable=True, comment="For movies: total runtime in minutes.")
-    movie_part = Column(Integer, nullable=True, comment="For multi‑part movies (1,2,3,…).")
+    movie_part = Column(Integer, nullable=True, comment="For multi-part movies (1,2,3,…).")
 
     # ─────────────── Locales & Audience ───────────────
-    origin_countries = Column(ARRAY(String(2)), nullable=True, comment="ISO‑3166‑1 alpha‑2, e.g. ['US','IN'].")
+    origin_countries = Column(ARRAY(String(2)), nullable=True, comment="ISO-3166-1 alpha-2, e.g. ['US','IN'].")
     spoken_languages = Column(ARRAY(String(8)), nullable=True, comment="IETF/ISO codes, e.g. ['en','hi'].")
-    content_rating = Column(String(16), nullable=True, comment="Certification label, e.g. 'PG‑13', 'U/A 13+'.")
+    content_rating = Column(String(16), nullable=True, comment="Certification label, e.g. 'PG-13', 'U/A 13+'.")
     is_adult = Column(Boolean, nullable=False, server_default=text("false"))
 
     # ─────────────── Artwork / Trailer (canonical pointers) ───────────────
@@ -138,7 +127,7 @@ class Title(Base):
     budget_usd = Column(BIGINT, nullable=True)
     revenue_usd = Column(BIGINT, nullable=True)
 
-    # ─────────────── Timestamps (DB‑driven, UTC) ───────────────
+    # ─────────────── Timestamps (DB-driven, UTC) ───────────────
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -146,13 +135,13 @@ class Title(Base):
 
     # ─────────────── Indexes & Constraints ───────────────
     __table_args__ = (
-        # Name hygiene
+        # Hygiene
         CheckConstraint("length(btrim(name)) > 0", name="ck_titles_name_not_blank"),
         CheckConstraint("length(btrim(slug)) > 0", name="ck_titles_slug_not_blank"),
-        # Case‑insensitive uniqueness on slug
+        # Case-insensitive uniqueness on slug (use unique index for expressions)
         Index("uq_titles_slug_lower", func.lower(slug), unique=True),
         # Reduce dup imports: CI uniqueness on (name, release_year)
-        UniqueConstraint(func.lower(name), "release_year", name="uq_titles_name_year_ci"),
+        Index("uq_titles_name_year_ci", func.lower(name), "release_year", unique=True),
         # Numeric guards
         CheckConstraint("runtime_minutes IS NULL OR runtime_minutes >= 0", name="ck_titles_runtime_nonneg"),
         CheckConstraint("movie_part IS NULL OR movie_part >= 1", name="ck_titles_movie_part_min_1"),
@@ -161,17 +150,22 @@ class Title(Base):
         CheckConstraint("rating_count >= 0", name="ck_titles_rating_count_nonneg"),
         CheckConstraint("budget_usd IS NULL OR budget_usd >= 0", name="ck_titles_budget_nonneg"),
         CheckConstraint("revenue_usd IS NULL OR revenue_usd >= 0", name="ck_titles_revenue_nonneg"),
-        # Movie‑only fields
+        # Movie-only fields (disallow on SERIES; not requiring them on MOVIE)
         CheckConstraint(
-            "(type = 'MOVIE' AND runtime_minutes IS NOT NULL) OR (type <> 'MOVIE' AND runtime_minutes IS NULL) OR runtime_minutes IS NULL",
+            "(type <> 'MOVIE' AND runtime_minutes IS NULL) OR (type = 'MOVIE')",
             name="ck_titles_runtime_movie_only",
         ),
         CheckConstraint(
-            "(type = 'MOVIE' AND movie_part IS NOT NULL) OR (type <> 'MOVIE' AND movie_part IS NULL) OR movie_part IS NULL",
+            "(type <> 'MOVIE' AND movie_part IS NULL) OR (type = 'MOVIE')",
             name="ck_titles_movie_part_movie_only",
         ),
-        # Dates & search/sort accelerators
+        # Dates sanity
         CheckConstraint("(release_year IS NULL) OR (release_year BETWEEN 1870 AND 3000)", name="ck_titles_release_year_sane"),
+        CheckConstraint(
+            "(end_date IS NULL) OR (release_date IS NULL) OR (end_date >= release_date)",
+            name="ck_titles_dates_order",
+        ),
+        # Search/sort accelerators
         Index("ix_titles_type_status_year", "type", "status", "release_year"),
         Index("ix_titles_popularity_published", "is_published", "popularity_score"),
         Index("ix_titles_dates", "release_date", "end_date"),
@@ -187,7 +181,18 @@ class Title(Base):
         lazy="selectin",
         cascade="all, delete-orphan",
         passive_deletes=True,
+        primaryjoin="Season.title_id == Title.id",
+        foreign_keys="[Season.title_id]",
         order_by="Season.season_number",
+    )
+
+    episodes = relationship(
+        "Episode",
+        back_populates="title",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Episode.title_id == Title.id",
+        foreign_keys="[Episode.title_id]",
     )
 
     media_assets = relationship(
@@ -195,6 +200,17 @@ class Title(Base):
         back_populates="title",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="MediaAsset.title_id == Title.id",
+        foreign_keys="[MediaAsset.title_id]",
+    )
+
+    artworks = relationship(
+        "Artwork",
+        back_populates="title",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Artwork.title_id == Title.id",
+        foreign_keys="[Artwork.title_id]",
     )
 
     credits = relationship(
@@ -202,10 +218,11 @@ class Title(Base):
         back_populates="title",
         lazy="selectin",
         passive_deletes=True,
-        cascade="all, delete-orphan",
+        primaryjoin="Credit.title_id == Title.id",
+        foreign_keys="[Credit.title_id]",
     )
 
-    genres = relationship(
+    genres = relationship(  # secondary is fine as-is
         "Genre",
         secondary="title_genres",
         back_populates="titles",
@@ -216,65 +233,91 @@ class Title(Base):
     collection_items = relationship(
         "CollectionItem",
         back_populates="title",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
         lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="CollectionItem.title_id == Title.id",
+        foreign_keys="[CollectionItem.title_id]",
     )
 
     in_collections = relationship(
         "Collection",
         secondary="collection_items",
-        back_populates="titles",
-        lazy="selectin",
+        primaryjoin="CollectionItem.title_id == Title.id",
+        secondaryjoin="CollectionItem.collection_id == Collection.id",
         viewonly=True,
+        lazy="selectin",
     )
 
     availabilities = relationship(
         "Availability",
         back_populates="title",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
         lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Availability.title_id == Title.id",
+        foreign_keys="[Availability.title_id]",
     )
 
     progress_entries = relationship(
         "Progress",
         back_populates="title",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
         lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Progress.title_id == Title.id",
+        foreign_keys="[Progress.title_id]",
     )
 
     reviews = relationship(
         "Review",
         back_populates="title",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
         lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Review.title_id == Title.id",
+        foreign_keys="[Review.title_id]",
     )
 
     playback_sessions = relationship(
         "PlaybackSession",
         back_populates="title",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
         lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="PlaybackSession.title_id == Title.id",
+        foreign_keys="[PlaybackSession.title_id]",
     )
 
     subtitles = relationship(
         "Subtitle",
         back_populates="title",
-        passive_deletes=True,
         lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Subtitle.title_id == Title.id",
+        foreign_keys="[Subtitle.title_id]",
     )
 
-    # Optional; adjust to your actual watchlist item model/class name
     watchlisted_by = relationship(
         "WatchlistItem",
         back_populates="title",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
         lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="WatchlistItem.title_id == Title.id",
+        foreign_keys="[WatchlistItem.title_id]",
+    )
+
+    certifications = relationship(
+        "Certification",
+        back_populates="title",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Certification.title_id == Title.id",
+        foreign_keys="[Certification.title_id]",
+    )
+
+    content_advisories = relationship(
+        "ContentAdvisory",
+        back_populates="title",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="ContentAdvisory.title_id == Title.id",
+        foreign_keys="[ContentAdvisory.title_id]",
     )
 
     def __repr__(self) -> str:  # pragma: no cover

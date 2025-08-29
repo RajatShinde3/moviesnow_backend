@@ -150,11 +150,14 @@ class Collection(Base):
     )
 
     # Relationships
+
     owner = relationship(
         "User",
         back_populates="collections",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="Collection.owner_user_id == User.id",
+        foreign_keys="[Collection.owner_user_id]",
     )
 
     items = relationship(
@@ -163,21 +166,19 @@ class Collection(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
-        order_by=lambda: (
-            nullslast(CollectionItem.position.asc()),
-            CollectionItem.created_at.asc(),
-        ),
+        primaryjoin="CollectionItem.collection_id == Collection.id",
+        foreign_keys="[CollectionItem.collection_id]",
+        order_by=lambda: (nullslast(CollectionItem.position.asc()), CollectionItem.created_at.asc()),
     )
 
-    # Convenience many‑to‑many to reach titles directly
-    titles = relationship(
+    titles = relationship(  # view-only convenience
         "Title",
         secondary="collection_items",
-        back_populates="in_collections",
+        primaryjoin="CollectionItem.collection_id == Collection.id",
+        secondaryjoin="CollectionItem.title_id == Title.id",
+        viewonly=True,
         lazy="selectin",
-        viewonly=True,  # authoritative edits go via CollectionItem
-    )
-
+)
     def __repr__(self) -> str:  # pragma: no cover
         return (
             f"<Collection id={self.id} slug='{self.slug}' "
@@ -282,18 +283,25 @@ class CollectionItem(Base):
         back_populates="items",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="CollectionItem.collection_id == Collection.id",
+        foreign_keys="[CollectionItem.collection_id]",
     )
+
     title = relationship(
         "Title",
         back_populates="collection_items",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="CollectionItem.title_id == Title.id",
+        foreign_keys="[CollectionItem.title_id]",
     )
+
     added_by = relationship(
         "User",
-        foreign_keys=[added_by_user_id],
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="CollectionItem.added_by_user_id == User.id",
+        foreign_keys="[CollectionItem.added_by_user_id]",
     )
 
     def __repr__(self) -> str:  # pragma: no cover

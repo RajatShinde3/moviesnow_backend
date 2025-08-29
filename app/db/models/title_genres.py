@@ -88,9 +88,21 @@ class TitleGenre(Base):
     __mapper_args__ = {"eager_defaults": True}
 
     # ── Lightweight convenience relationships (no back_populates required) ──
-    # Safe even if Title/Genre use `secondary="title_genres"` relationships.
-    title = relationship("Title", lazy="selectin", passive_deletes=True)
-    genre = relationship("Genre", lazy="selectin", passive_deletes=True)
+    title = relationship(
+        "Title",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="TitleGenre.title_id == Title.id",
+        foreign_keys="[TitleGenre.title_id]",
+    )
+
+    genre = relationship(
+        "Genre",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="TitleGenre.genre_id == Genre.id",
+        foreign_keys="[TitleGenre.genre_id]",
+    )
 
     # ── Indexes / constraints ───────────────────────────────────────────────
     __table_args__ = (

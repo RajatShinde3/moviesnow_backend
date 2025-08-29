@@ -4,15 +4,16 @@ from __future__ import annotations
 🌍 MoviesNow — Availability (rights, territories & windows)
 ==========================================================
 
-Production‑grade model defining **where**, **when**, and **how** a Title (optionally
-narrowed to a Season or Episode) can be streamed or downloaded.
+Production-grade model defining **where**, **when**, and **how** a Title
+(optionally narrowed to a Season or Episode) can be streamed or downloaded.
 
 Why this model?
 ---------------
-• Central, query‑friendly record for rights checks: *is this playable here, now, on this device/plan?*
-• Territory scoping via ISO‑3166 country codes with GLOBAL/INCLUDE/EXCLUDE modes.
-• Open‑ended or bounded windows with defensive constraints.
-• PostgreSQL‑optimized arrays for distribution channels & device classes.
+• Central, query-friendly record for rights checks:
+  “is this playable here, now, on this device/plan?”
+• Territory scoping via ISO-3166 country codes with GLOBAL / INCLUDE / EXCLUDE modes.
+• Open-ended or bounded windows with defensive constraints.
+• PostgreSQL-optimized arrays for distribution channels & device classes.
 • Extensible JSONB `rights` for contract extras without migrations.
 
 Specificity & precedence
@@ -22,13 +23,12 @@ match. This model does not enforce exclusivity; it provides the data to rank.
 
 Indexing strategy
 -----------------
-• B‑tree composites for scope & quick filters.
+• B-tree composites for scope & quick filters.
 • GIN on arrays for membership queries.
 • GiST on `tstzrange(window_start, COALESCE(window_end, 'infinity'))` for efficient
-  *overlaps/contains* time‑window queries.
+  *overlaps/contains* time-window queries.
 """
 
-from enum import Enum as PyEnum
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -45,6 +45,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     text,
+    literal_column,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
@@ -52,17 +53,18 @@ from sqlalchemy.orm import relationship
 from app.schemas.enums import TerritoryMode, DistributionKind, DeviceClass
 from app.db.base_class import Base
 
+
 # ──────────────────────────────────────────────────────────────
 # 📦 Model
 # ──────────────────────────────────────────────────────────────
 class Availability(Base):
-    """Licensing/rights record governing **when/where/how** a title/season/episode
-    can be offered.
+    """
+    Licensing/rights record governing **when/where/how** a title/season/episode can be offered.
 
-    De‑duplication
+    De-duplication
     --------------
     A uniqueness guard helps avoid exact duplicates per **scope + window + territory**.
-    (You can widen this to include policy columns if required by contracts.)
+    (Widen to additional columns if your contracts require it.)
     """
 
     __tablename__ = "availabilities"
@@ -70,30 +72,60 @@ class Availability(Base):
     # ── Identity & scope ──────────────────────────────────────
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
 
-    title_id = Column(UUID(as_uuid=True), ForeignKey("titles.id", ondelete="CASCADE"), nullable=False, index=True)
-    season_id = Column(UUID(as_uuid=True), ForeignKey("seasons.id", ondelete="CASCADE"), nullable=True, index=True,
-                       doc="Optional: narrow the availability to a specific season.")
-    episode_id = Column(UUID(as_uuid=True), ForeignKey("episodes.id", ondelete="CASCADE"), nullable=True, index=True,
-                        doc="Optional: narrow the availability to a specific episode.")
+    title_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("titles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="Owning title (always present).",
+    )
+    season_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("seasons.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        doc="Optional: narrow the availability to a specific season.",
+    )
+    episode_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("episodes.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        doc="Optional: narrow the availability to a specific episode.",
+    )
 
     # ── Window (UTC) ──────────────────────────────────────────
-    window_start = Column(DateTime(timezone=True), nullable=False, server_default=func.now(),
-                          doc="Start of rights window (inclusive, UTC).")
-    window_end = Column(DateTime(timezone=True), nullable=True,
-                        doc="End of rights window (exclusive, UTC). NULL = open‑ended.")
+    window_start = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="Start of rights window (inclusive, UTC).",
+    )
+    window_end = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        doc="End of rights window (exclusive, UTC). NULL = open-ended.",
+    )
 
     # ── Territories ───────────────────────────────────────────
-    territory_mode = Column(Enum(TerritoryMode, name="territory_mode"), nullable=False,
-                            server_default=text("'GLOBAL'"))
-    countries = Column(ARRAY(String(2)), nullable=True,
-                       doc="ISO‑3166‑1 alpha‑2 country codes (required when mode != GLOBAL).")
+    territory_mode = Column(
+        Enum(TerritoryMode, name="territory_mode"),
+        nullable=False,
+        server_default=text("'GLOBAL'"),
+        doc="How `countries` should be interpreted: GLOBAL / INCLUDE / EXCLUDE.",
+    )
+    countries = Column(
+        ARRAY(String(2)),
+        nullable=True,
+        doc="ISO-3166-1 alpha-2 country codes (required when mode != GLOBAL).",
+    )
 
     # ── Distribution / device policy ──────────────────────────
     distribution = Column(
         ARRAY(Enum(DistributionKind, name="distribution_kind")),
         nullable=False,
         server_default=text("'{SVOD}'::distribution_kind[]"),
-        doc="One or more distribution channels this availability permits.",
+        doc="One or more distribution channels this availability permits (e.g., SVOD, AVOD, TVOD).",
     )
     device_classes = Column(
         ARRAY(Enum(DeviceClass, name="device_class")),
@@ -101,37 +133,52 @@ class Availability(Base):
         doc="Optional device class restrictions; NULL = all devices.",
     )
     is_download_allowed = Column(Boolean, nullable=False, server_default=text("false"))
-    max_offline_days = Column(Integer, nullable=True,
-                              doc="If downloads allowed, max days the download can remain playable.")
+    max_offline_days = Column(
+        Integer,
+        nullable=True,
+        doc="If downloads are allowed, maximum days the download may remain playable.",
+    )
 
     # ── Extensible rights/contract info ───────────────────────
-    rights = Column(JSONB, nullable=True,
-                    doc="Structured contract extras (licensor, carve‑outs, priority, notes).")
+    rights = Column(
+        JSONB,
+        nullable=True,
+        doc="Structured contract extras (licensor, carve-outs, priority, notes).",
+    )
 
     # ── Timestamps ────────────────────────────────────────────
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
     __mapper_args__ = {"eager_defaults": True}
 
+    # ──────────────────────────────────────────────────────────
+    # 🔒 Constraints & 📇 Indexes
+    # ──────────────────────────────────────────────────────────
     __table_args__ = (
         # Window sanity
-        CheckConstraint("window_end IS NULL OR window_end > window_start", name="ck_avail_valid_window"),
-
-        # Territory sanity
         CheckConstraint(
-            "(territory_mode = 'GLOBAL') OR (countries IS NOT NULL AND array_length(countries, 1) > 0)",
+            "window_end IS NULL OR window_end > window_start",
+            name="ck_avail_valid_window",
+        ),
+
+        # Territory sanity — cast enum to text to avoid DDL enum coercion pitfalls
+        CheckConstraint(
+            "(territory_mode::text = 'GLOBAL') "
+            "OR (countries IS NOT NULL AND array_length(countries, 1) > 0)",
             name="ck_avail_countries_required_when_scoped",
         ),
 
         # Download policy consistency
         CheckConstraint(
-            "(is_download_allowed = false AND max_offline_days IS NULL) OR "
-            "(is_download_allowed = true AND max_offline_days IS NOT NULL AND max_offline_days > 0)",
+            "(NOT is_download_allowed AND max_offline_days IS NULL) "
+            "OR (is_download_allowed AND max_offline_days IS NOT NULL AND max_offline_days > 0)",
             name="ck_avail_download_policy_consistent",
         ),
 
-        # De‑dup guard for exact duplicates within the same scope & window
+        # De-dup guard for exact duplicates within the same scope & window
         UniqueConstraint(
             "title_id",
             "season_id",
@@ -143,28 +190,73 @@ class Availability(Base):
             name="uq_avail_scope_window_territory",
         ),
 
-        # Useful selectors
+        # B-tree: sort/filter by time window
         Index("ix_avail_active_window", "window_start", "window_end"),
-        Index("ix_avail_open_ended", text("window_end IS NULL")),
+
+        # Partial index for open-ended windows (fast WHERE window_end IS NULL)
+        Index(
+            "ix_avail_open_ended",
+            "title_id",
+            "season_id",
+            "episode_id",
+            "window_start",
+            postgresql_where=(window_end.is_(None)),
+        ),
+
+        # Scope lookups
         Index("ix_avail_scope_title_season_episode", "title_id", "season_id", "episode_id"),
+
+        # GIN for ARRAY membership filters
         Index("ix_avail_distribution_gin", "distribution", postgresql_using="gin"),
         Index("ix_avail_countries_gin", "countries", postgresql_using="gin"),
-        # GiST for window queries (requires range ops; available for tstzrange)
+
+        # GiST for time-window overlap/containment queries
         Index(
             "ix_avail_window_gist",
-            func.tstzrange(text("window_start"), func.coalesce(text("window_end"), text("'infinity'::timestamptz"))),
+            func.tstzrange(
+                window_start,
+                func.coalesce(window_end, literal_column("'infinity'::timestamptz")),
+            ),
             postgresql_using="gist",
         ),
     )
 
-    # ── Relationships ─────────────────────────────────────────
-    title = relationship("Title", back_populates="availabilities", lazy="selectin", passive_deletes=True)
-    season = relationship("Season", back_populates="availabilities", lazy="selectin", passive_deletes=True)
-    episode = relationship("Episode", back_populates="availabilities", lazy="selectin", passive_deletes=True)
+    # ──────────────────────────────────────────────────────────
+    # 🔗 Relationships (disambiguated)
+    # ──────────────────────────────────────────────────────────
+    title = relationship(
+        "Title",
+        back_populates="availabilities",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Availability.title_id == Title.id",
+        foreign_keys="[Availability.title_id]",
+    )
 
-    # ── Helpers ───────────────────────────────────────────────
+    season = relationship(
+        "Season",
+        back_populates="availabilities",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Availability.season_id == Season.id",
+        foreign_keys="[Availability.season_id]",
+    )
+
+    episode = relationship(
+        "Episode",
+        back_populates="availabilities",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Availability.episode_id == Episode.id",
+        foreign_keys="[Availability.episode_id]",
+    )
+
+    # ──────────────────────────────────────────────────────────
+    # 🧰 Helpers
+    # ──────────────────────────────────────────────────────────
     def applies_to_country(self, country_code: str) -> bool:
-        """Lightweight in‑process check for a single country code (uppercased).
+        """
+        Lightweight in-process check for a single country code (uppercased).
         Prefer SQL filters for set operations at scale.
         """
         cc = (country_code or "").upper()
@@ -189,10 +281,17 @@ class Availability(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         scope = (
-            f"ep={self.episode_id}" if self.episode_id else (
-                f"season={self.season_id}" if self.season_id else f"title={self.title_id}"
-            )
+            f"ep={self.episode_id}"
+            if self.episode_id
+            else (f"season={self.season_id}" if self.season_id else f"title={self.title_id}")
         )
-        terr = self.territory_mode.value + (f"[{','.join(self.countries or [])}]" if self.territory_mode != TerritoryMode.GLOBAL else "")
+        terr = self.territory_mode.value + (
+            f"[{','.join(self.countries or [])}]"
+            if self.territory_mode != TerritoryMode.GLOBAL
+            else ""
+        )
         win_end = self.window_end.isoformat() if self.window_end else "∞"
-        return f"<Availability {scope} {terr} {self.window_start.isoformat()}→{win_end} dist={self.distribution}>"
+        return (
+            f"<Availability {scope} {terr} "
+            f"{self.window_start.isoformat()}→{win_end} dist={self.distribution}>"
+        )

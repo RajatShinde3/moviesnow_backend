@@ -98,7 +98,14 @@ class AuditLog(Base):
     # ─────────────────────────────
     # 🔁 Relationship
     # ─────────────────────────────
-    user = relationship("User", back_populates="audit_logs", lazy="selectin", passive_deletes=True)
+    user = relationship(
+        "User",
+        back_populates="audit_logs",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="AuditLog.user_id == User.id",
+        foreign_keys="[AuditLog.user_id]",
+    )
 
     # ─────────────────────────────
     # 🧭 Indexes & constraints

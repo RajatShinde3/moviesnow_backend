@@ -219,10 +219,41 @@ class PlaybackSession(Base):
     )
 
     # ── Relationships ──────────────────────────────────────────────────────
-    user = relationship("User", back_populates="playback_sessions", lazy="selectin", passive_deletes=True)
-    title = relationship("Title", back_populates="playback_sessions", lazy="selectin", passive_deletes=True)
-    episode = relationship("Episode", back_populates="playback_sessions", lazy="selectin", passive_deletes=True)
-    stream_variant = relationship("StreamVariant", back_populates="playback_sessions", lazy="selectin", passive_deletes=True)
+    user = relationship(
+        "User",
+        back_populates="playback_sessions",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="PlaybackSession.user_id == User.id",
+        foreign_keys="[PlaybackSession.user_id]",
+    )
+
+    title = relationship(
+        "Title",
+        back_populates="playback_sessions",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="PlaybackSession.title_id == Title.id",
+        foreign_keys="[PlaybackSession.title_id]",
+    )
+
+    episode = relationship(
+        "Episode",
+        back_populates="playback_sessions",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="and_(PlaybackSession.episode_id == Episode.id, PlaybackSession.title_id == Episode.title_id)",
+        foreign_keys="[PlaybackSession.episode_id, PlaybackSession.title_id]",
+    )
+
+    stream_variant = relationship(
+        "StreamVariant",
+        back_populates="playback_sessions",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="PlaybackSession.stream_variant_id == StreamVariant.id",
+        foreign_keys="[PlaybackSession.stream_variant_id]",
+    )
 
     # ── Convenience ────────────────────────────────────────────────────────
     @property

@@ -139,10 +139,41 @@ class Progress(Base):
     )
 
     # ── Relationships ─────────────────────────────────────────
-    user = relationship("User", back_populates="progress_entries", lazy="selectin", passive_deletes=True)
-    title = relationship("Title", back_populates="progress_entries", lazy="selectin", passive_deletes=True)
-    season = relationship("Season", back_populates="progress_entries", lazy="selectin", passive_deletes=True)
-    episode = relationship("Episode", back_populates="progress_entries", lazy="selectin", passive_deletes=True)
+    user = relationship(
+        "User",
+        back_populates="progress_entries",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Progress.user_id == User.id",
+        foreign_keys="[Progress.user_id]",
+    )
+
+    title = relationship(
+        "Title",
+        back_populates="progress_entries",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Progress.title_id == Title.id",
+        foreign_keys="[Progress.title_id]",
+    )
+
+    season = relationship(
+        "Season",
+        back_populates="progress_entries",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Progress.season_id == Season.id",
+        foreign_keys="[Progress.season_id]",
+    )
+
+    episode = relationship(
+        "Episode",
+        back_populates="progress_entries",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Progress.episode_id == Episode.id",
+        foreign_keys="[Progress.episode_id]",
+    )
 
     # ── Convenience properties ────────────────────────────────
     @property

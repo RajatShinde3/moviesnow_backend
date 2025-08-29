@@ -99,7 +99,14 @@ class MFAResetToken(Base):
     )
 
     # ─────────────── Relationship ───────────────
-    user = relationship("User", back_populates="mfa_reset_tokens", lazy="selectin", passive_deletes=True)
+    user = relationship(
+        "User",
+        back_populates="mfa_reset_tokens",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="MFAResetToken.user_id == User.id",
+        foreign_keys="[MFAResetToken.user_id]",
+    )
 
     # ─────────────── Helpers (no schema changes) ───────────────
     @property

@@ -1,32 +1,28 @@
+# app/db/models/stream_variant.py
 from __future__ import annotations
 
 """
-🎞️ MoviesNow — StreamVariant (per‑rendition streams)
+🎞️ MoviesNow — StreamVariant (per-rendition streams)
 ===================================================
 
-Represents an individual streaming/download rendition derived from a source
-**MediaAsset** (e.g., HLS/DASH ladder entries, audio‑only tracks, progressive MP4).
+Represents a single streaming/download rendition derived from a source
+**MediaAsset** (e.g., HLS ladder entries, progressive MP4s, audio-only).
 
-Why this model
---------------
-• Clean separation between the **source asset** and its **derived variants**.
-• Strong typing for protocol/container/codec/DRM to avoid free‑form strings.
-• Practical fields for ABR selection (bandwidth, resolution, fps), audio, HDR.
-• Flexible `drm_params` JSONB for provider‑specific bits (PSSH, FairPlay data).
-• Protective constraints & indexes for de‑duplication and fast selection.
-
-Relationships
--------------
-• `StreamVariant.media_asset`  ↔ `MediaAsset.stream_variants`
-• `StreamVariant.playback_sessions` ↔ `PlaybackSession.stream_variant`
+Streaming policy (your requirement)
+-----------------------------------
+• Only these three *streamable* tiers are allowed: **1080p, 720p, 480p**.
+• At most **one** streamable variant per (asset, tier): admin picks which file
+  is used for streaming by setting `is_streamable=true` and `stream_tier`.
+• Other qualities (4K, HDR masters, etc.) may still exist, but should be
+  flagged **download-only** (keep `is_streamable=false`, set `is_downloadable=true`).
 
 Conventions
 -----------
-• `url_path` should be a **relative** CDN/storage path (e.g., `videos/.../1080p.m3u8`).
-• Manifest protocols use `url_path` for a variant playlist (HLS) or representation (DASH).
-• Keep **Title/Episode** references on `MediaAsset`; variants hang off the asset.
+• `url_path` is a **relative** CDN/storage path (e.g., `videos/.../1080p.m3u8`).
+• Keep Title/Episode references on `MediaAsset`; variants hang off the asset.
 """
 
+from uuid import uuid4
 from enum import Enum as PyEnum
 
 from sqlalchemy import (
@@ -47,39 +43,36 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
-from uuid import uuid4
-from app.db.base_class import Base
-from app.schemas.enums import( 
-    StreamProtocol, Container,
-    VideoCodec, AudioCodec,
-    DRMType, HDRFormat
 
+from app.db.base_class import Base
+from app.schemas.enums import (
+    StreamProtocol,  # HLS / DASH / PROGRESSIVE
+    Container,       # TS / FMP4 / MP4
+    VideoCodec,      # H264 / H265 / VP9 / AV1 / NONE
+    AudioCodec,      # AAC / AC3 / EAC3 / OPUS / NONE
+    DRMType,         # NONE / WIDEVINE / FAIRPLAY / PLAYREADY
+    HDRFormat,       # SDR / HDR10 / HLG / DOLBY_VISION
+    StreamTier,      # <-- NEW: P1080, P720, P480 (add to app.schemas.enums)
 )
 
-# ──────────────────────────────────────────────────────────────
-# 🎬 Model
-# ──────────────────────────────────────────────────────────────
 class StreamVariant(Base):
     """
-    A single playable rendition of a video `MediaAsset`.
+    A single playable or downloadable rendition of a `MediaAsset`.
 
-    Examples
-    --------
-    • HLS 1080p @ 6.5 Mbps, H.264/AAC, SDR
-    • DASH 2160p @ 14 Mbps, H.265/EAC3, HDR10
-    • Progressive 720p MP4 @ 3 Mbps, H.264/AAC
-    • Audio‑only HLS @ 128 kbps, AAC
+    De-duplication:
+        • Unique per (media_asset_id, protocol, url_path).
+        • A secondary uniqueness across core technical params helps prevent
+          accidental duplicates in an ABR ladder.
 
-    De‑duplication
-    --------------
-    Uniqueness is enforced per `(media_asset_id, protocol, url_path)`. A secondary
-    technical signature prevents accidental duplicates in the ladder.
+    Streaming policy:
+        • `is_streamable = true` requires a `stream_tier` of P1080/P720/P480.
+        • One streamable row per (asset, tier) enforced by a partial unique index.
     """
 
     __tablename__ = "stream_variants"
 
-    # Identity / linkage
-    id = Column(UUID(as_uuid=True),default=uuid4, primary_key=True)
+    # ── Identity / linkage ──────────────────────────────────────────────────
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4, index=True)
     media_asset_id = Column(
         UUID(as_uuid=True),
         ForeignKey("media_assets.id", ondelete="CASCADE"),
@@ -87,7 +80,7 @@ class StreamVariant(Base):
         index=True,
     )
 
-    # Locator
+    # ── Locator ─────────────────────────────────────────────────────────────
     url_path = Column(
         String(1024),
         nullable=False,
@@ -95,62 +88,67 @@ class StreamVariant(Base):
         doc="Relative path to the variant playlist/representation or progressive file.",
     )
 
-    # Playback descriptors
+    # ── Playback descriptors ────────────────────────────────────────────────
     protocol = Column(Enum(StreamProtocol, name="stream_protocol"), nullable=False)
     container = Column(Enum(Container, name="stream_container"), nullable=False)
-    video_codec = Column(
-        Enum(VideoCodec, name="video_codec"),
-        nullable=False,
-        server_default=text("'H264'"),
-    )
-    audio_codec = Column(
-        Enum(AudioCodec, name="audio_codec"),
-        nullable=False,
-        server_default=text("'AAC'"),
-    )
+    video_codec = Column(Enum(VideoCodec, name="video_codec"), nullable=False, server_default=text("'H264'"))
+    audio_codec = Column(Enum(AudioCodec, name="audio_codec"), nullable=False, server_default=text("'AAC'"))
 
-    # ABR / quality characteristics
-    bandwidth_bps = Column(Integer, nullable=False, doc="Peak bandwidth in bits per second (EXT-X-STREAM-INF BANDWIDTH).")
+    # ── ABR / quality characteristics ───────────────────────────────────────
+    bandwidth_bps = Column(Integer, nullable=False, doc="Peak bandwidth in bps (EXT-X-STREAM-INF BANDWIDTH).")
     avg_bandwidth_bps = Column(Integer, nullable=True, doc="Average bandwidth in bps (EXT-X-STREAM-INF AVERAGE-BANDWIDTH).")
     width = Column(Integer, nullable=True)
     height = Column(Integer, nullable=True)
-    frame_rate = Column(Float, nullable=True, doc="Frames per second (e.g., 23.976, 24, 25, 29.97, 60).")
+    frame_rate = Column(Float, nullable=True, doc="Frames per second, e.g., 23.976, 24, 30, 60.")
 
-    # Audio details
+    # ── Audio details ───────────────────────────────────────────────────────
     audio_channels = Column(Integer, nullable=True, doc="Channel count (e.g., 2, 6).")
-    audio_language = Column(String(16), nullable=True, doc="BCP‑47 language tag (e.g., 'en', 'en-US').")
+    audio_language = Column(String(16), nullable=True, doc="BCP-47 tag (e.g., 'en', 'en-US').")
 
-    # Color / HDR
+    # ── Color / HDR ─────────────────────────────────────────────────────────
     hdr = Column(Enum(HDRFormat, name="hdr_format"), nullable=False, server_default=text("'SDR'"))
     bit_depth = Column(Integer, nullable=True, doc="Color bit depth (8, 10, 12).")
 
-    # DRM
+    # ── DRM ─────────────────────────────────────────────────────────────────
     drm_type = Column(Enum(DRMType, name="drm_type"), nullable=False, server_default=text("'NONE'"))
-    drm_kid = Column(UUID(as_uuid=True), nullable=True, doc="Content key ID (UUID) when applicable.")
-    drm_params = Column(
-        JSONB,
-        nullable=True,
-        doc="Provider‑specific DRM data (e.g., Widevine PSSH b64, FairPlay cert URL).",
-    )
+    drm_kid = Column(UUID(as_uuid=True), nullable=True, doc="Key ID (UUID) if applicable.")
+    drm_params = Column(JSONB, nullable=True, doc="Provider-specific DRM data (e.g., Widevine PSSH b64).")
 
-    # Operational flags / sizing
+    # ── Operational flags / sizing ──────────────────────────────────────────
     is_default = Column(Boolean, nullable=False, server_default=text("false"),
-                        doc="Preferred variant when no client preference is provided.")
+                        doc="General default indicator (e.g., preferred within a group).")
     is_audio_only = Column(Boolean, nullable=False, server_default=text("false"))
     is_downloadable = Column(Boolean, nullable=False, server_default=text("false"))
-    size_bytes = Column(Integer, nullable=True, doc="Approx size of progressive file; NULL for segmented streams.")
 
-    # Labeling
+    # NEW: streaming policy knobs
+    is_streamable = Column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        index=True,
+        doc="If true, this row is one of the *three* streamable tiers (1080/720/480).",
+    )
+    stream_tier = Column(
+        Enum(StreamTier, name="stream_tier"),
+        nullable=True,
+        index=True,
+        doc="P1080, P720, or P480 when `is_streamable` is true.",
+    )
+
+    size_bytes = Column(Integer, nullable=True, doc="Approx size for progressive; null for segmented.")
+
+    # ── Labeling ────────────────────────────────────────────────────────────
     label = Column(String(64), nullable=True, doc="Human label (e.g., '1080p', '4K HDR', 'Audio EN').")
 
-    # Timestamps (DB‑driven UTC)
+    # ── Timestamps (DB-driven UTC) ─────────────────────────────────────────
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     __mapper_args__ = {"eager_defaults": True}
 
+    # ── Constraints & Indexes ──────────────────────────────────────────────
     __table_args__ = (
-        # Basic hygiene
+        # Hygiene
         CheckConstraint("length(btrim(url_path)) > 0", name="ck_stream_variant_path_not_blank"),
         CheckConstraint("bandwidth_bps > 0", name="ck_stream_variant_bandwidth_positive"),
         CheckConstraint("(width IS NULL) OR (width >= 0)", name="ck_stream_variant_width_nonneg"),
@@ -159,6 +157,8 @@ class StreamVariant(Base):
         CheckConstraint("(audio_channels IS NULL) OR (audio_channels >= 0)", name="ck_stream_variant_audio_channels_nonneg"),
         CheckConstraint("(size_bytes IS NULL) OR (size_bytes >= 0)", name="ck_stream_variant_size_nonneg"),
         CheckConstraint("updated_at >= created_at", name="ck_stream_variant_updated_after_created"),
+        CheckConstraint("(label IS NULL) OR (length(btrim(label)) > 0)", name="ck_stream_variant_label_not_blank"),
+        CheckConstraint("(audio_language IS NULL) OR (char_length(audio_language) BETWEEN 2 AND 16)", name="ck_stream_variant_lang_len"),
 
         # Audio/video logic
         CheckConstraint(
@@ -170,22 +170,44 @@ class StreamVariant(Base):
             name="ck_stream_variant_non_audio_has_video",
         ),
 
-        # Optional language tag length sanity
-        CheckConstraint("(audio_language IS NULL) OR (char_length(audio_language) BETWEEN 2 AND 16)",
-                        name="ck_stream_variant_lang_len"),
-        # Optional non‑blank label
-        CheckConstraint("(label IS NULL) OR (length(btrim(label)) > 0)", name="ck_stream_variant_label_not_blank"),
-
-        # Downloadability guard (allow PROGRESSIVE or HLS offline; forbid DASH by default)
+        # Downloadability guard (allow MP4 or HLS offline; avoid DASH)
         CheckConstraint(
-            "(NOT is_downloadable) OR (protocol IN ('PROGRESSIVE','HLS'))",
+            "(NOT is_downloadable) OR (protocol IN ('MP4','HLS'))",
             name="ck_stream_variant_downloadable_protocol",
         ),
 
-        # Path uniqueness per asset & protocol
-        UniqueConstraint("media_asset_id", "protocol", "url_path", name="uq_stream_variant_asset_proto_path"),
+        # ── STREAMING POLICY ENFORCEMENT ────────────────────────────────────
+        # Must specify a tier when marking a row streamable
+        CheckConstraint(
+            "NOT is_streamable OR stream_tier IS NOT NULL",
+            name="ck_stream_variant_streamable_requires_tier",
+        ),
+        # Streamable rows must be video (not audio-only)
+        CheckConstraint(
+            "NOT is_streamable OR (is_audio_only = false)",
+            name="ck_stream_variant_streamable_not_audio_only",
+        ),
+        # Constrain streamable rows to the three heights (if height is set)
+        CheckConstraint(
+            "NOT is_streamable OR height IS NULL OR height IN (1080, 720, 480)",
+            name="ck_stream_variant_streamable_height_whitelist",
+        ),
+        # Recommend HLS for streamable rows (tighten if you want HLS-only)
+        CheckConstraint(
+            "NOT is_streamable OR protocol = 'HLS'",
+            name="ck_stream_variant_streamable_hls_only",
+        ),
+        # At most one streamable row per (asset, tier)
+        Index(
+            "uq_stream_variant_one_streamable_per_tier",
+            "media_asset_id",
+            "stream_tier",
+            unique=True,
+            postgresql_where=text("is_streamable = true"),
+        ),
 
-        # Technical de‑duplication guard (best‑effort)
+        # ── De-duplication & lookup ─────────────────────────────────────────
+        UniqueConstraint("media_asset_id", "protocol", "url_path", name="uq_stream_variant_asset_proto_path"),
         UniqueConstraint(
             "media_asset_id",
             "protocol",
@@ -198,12 +220,10 @@ class StreamVariant(Base):
             name="uq_stream_variant_tech_params",
         ),
 
-        # One default per (asset, audio_language, hdr) when flagged
+        # One "default" per (asset, language, hdr) when flagged
         Index(
             "uq_stream_variant_default_per_scope",
-            "media_asset_id",
-            "audio_language",
-            "hdr",
+            "media_asset_id", "audio_language", "hdr",
             unique=True,
             postgresql_where=text("is_default = true"),
         ),
@@ -215,24 +235,31 @@ class StreamVariant(Base):
         Index("ix_stream_variant_created_at", "created_at"),
     )
 
-    # ── Relationships ─────────────────────────────────────────
+    # ── Relationships ───────────────────────────────────────────────────────
     media_asset = relationship(
         "MediaAsset",
         back_populates="stream_variants",
         lazy="selectin",
         passive_deletes=True,
+        primaryjoin="StreamVariant.media_asset_id == MediaAsset.id",
+        foreign_keys="[StreamVariant.media_asset_id]",
     )
+
     playback_sessions = relationship(
         "PlaybackSession",
         back_populates="stream_variant",
-        passive_deletes=True,
         lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="PlaybackSession.stream_variant_id == StreamVariant.id",
+        foreign_keys="[PlaybackSession.stream_variant_id]",
     )
 
-    def __repr__(self) -> str:  # pragma: no cover - debug aid
+    # ── Convenience ─────────────────────────────────────────────────────────
+    def __repr__(self) -> str:  # pragma: no cover
         wh = f"{self.width}x{self.height}" if self.width and self.height else ("audio" if self.is_audio_only else "unknown")
+        tier = f" tier={self.stream_tier.value}" if self.stream_tier else ""
         return (
             f"<StreamVariant id={self.id} asset={self.media_asset_id} "
             f"{self.protocol.value}/{self.container.value} {self.video_codec.value}/{self.audio_codec.value} "
-            f"{wh} @ {self.bandwidth_bps}bps default={self.is_default}>"
+            f"{wh} @ {self.bandwidth_bps}bps streamable={self.is_streamable}{tier}>"
         )

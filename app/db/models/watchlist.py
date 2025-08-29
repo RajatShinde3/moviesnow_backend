@@ -99,8 +99,23 @@ class WatchlistItem(Base):
     )
 
     # ── Relationships ───────────────────────────────────────────────────────
-    user = relationship("User", back_populates="watchlist_items", lazy="selectin", passive_deletes=True)
-    title = relationship("Title", back_populates="watchlisted_by", lazy="selectin", passive_deletes=True)
+    user = relationship(
+        "User",
+        back_populates="watchlist_items",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="WatchlistItem.user_id == User.id",
+        foreign_keys="[WatchlistItem.user_id]",
+    )
+
+    title = relationship(
+        "Title",
+        back_populates="watchlisted_by",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="WatchlistItem.title_id == Title.id",
+        foreign_keys="[WatchlistItem.title_id]",
+    )
 
     def __repr__(self) -> str:  # pragma: no cover
         return (

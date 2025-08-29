@@ -165,17 +165,53 @@ class Subtitle(Base):
 
         # JSONB/lookup helpers
         Index("ix_subtitles_scope_lang_active", "title_id", "season_id", "episode_id", "language", "active"),
-        Index("ix_subtitles_metadata_gin", "metadata", postgresql_using="gin"),
+        Index("ix_subtitles_metadata_gin", "metadata_json", postgresql_using="gin"),
         Index("ix_subtitles_created_at", "created_at"),
     )
 
     # ─────────────── Relationships ───────────────
-    title = relationship("Title", back_populates="subtitles", lazy="selectin", passive_deletes=True)
-    season = relationship("Season", back_populates="subtitles", lazy="selectin", passive_deletes=True)
-    episode = relationship("Episode", back_populates="subtitles", lazy="selectin", passive_deletes=True)
 
-    asset = relationship("MediaAsset", lazy="selectin", passive_deletes=True)
-    created_by = relationship("User", lazy="selectin")
+    title = relationship(
+        "Title",
+        back_populates="subtitles",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Subtitle.title_id == Title.id",
+        foreign_keys="[Subtitle.title_id]",
+    )
+
+    season = relationship(
+        "Season",
+        back_populates="subtitles",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="and_(Subtitle.season_id == Season.id, Subtitle.title_id == Season.title_id)",
+        foreign_keys="[Subtitle.season_id, Subtitle.title_id]",
+    )
+
+    episode = relationship(
+        "Episode",
+        back_populates="subtitles",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="and_(Subtitle.episode_id == Episode.id, Subtitle.title_id == Episode.title_id)",
+        foreign_keys="[Subtitle.episode_id, Subtitle.title_id]",
+    )
+
+    asset = relationship(
+        "MediaAsset",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Subtitle.asset_id == MediaAsset.id",
+        foreign_keys="[Subtitle.asset_id]",
+    )
+
+    created_by = relationship(
+        "User",
+        lazy="selectin",
+        primaryjoin="Subtitle.created_by_id == User.id",
+        foreign_keys="[Subtitle.created_by_id]",
+    )
 
     def __repr__(self) -> str:  # pragma: no cover
         scope = f"title={self.title_id}, season={self.season_id}, episode={self.episode_id}"
