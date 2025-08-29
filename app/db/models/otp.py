@@ -1,77 +1,108 @@
-# app/db/models/otp.py
-
 from __future__ import annotations
+
+"""
+🔑 MoviesNow — OTP (One‑Time Password)
+=====================================
+
+Temporary verification codes for flows like email/phone verification, MFA, and
+password reset.
+
+Design highlights
+-----------------
+• **Per‑user purpose scoping** with one *active* (unused) OTP per `(user, purpose)`
+  via a partial unique index.
+• **Planner‑friendly** filtered indexes for fast validation and cleanup queries.
+• **DB‑driven UTC** timestamps; simple helper properties for `expired`/`is_active`.
+• Relationship hygiene: `OTP.user` ↔ `User.otps`.
+
+Notes
+-----
+• We intentionally avoid a hard `expires_at > created_at` CHECK to allow tests or
+  backfills to insert already‑expired OTPs. Enforce freshness in application code.
+"""
 
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, String, DateTime, Boolean, ForeignKey, Index
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
 
 from app.db.base_class import Base
 
 
 class OTP(Base):
-    """
-    One-Time Password (OTP) model for temporary codes used in user verification
-    (email verification, MFA, password reset).
-    """
+    """One‑Time Password used for short‑lived verification flows."""
 
-    __tablename__ = "otp"
+    __tablename__ = "otps"
 
-    # ──────────────── Primary Key ────────────────
+    # ─────────────── Identity ───────────────
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
 
-    # ──────────────── Foreign Keys ────────────────
+    # ─────────────── Foreign Keys ───────────────
     user_id = Column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="The user this OTP belongs to",
+        comment="User this OTP belongs to",
     )
 
-    # ──────────────── OTP Details ────────────────
-    code = Column(String, nullable=False, comment="OTP code value")
-    purpose = Column(String, nullable=False, comment="Purpose e.g., 'email_verification', 'mfa', 'password_reset'")
+    # ─────────────── OTP Details ───────────────
+    code = Column(String, nullable=False, doc="OTP code value (string; format validated in app layer)")
+    purpose = Column(String, nullable=False, doc="Purpose: e.g., 'email_verification', 'mfa', 'password_reset'")
 
-    # TZ-aware timestamps; created_at from DB (UTC)
-    expires_at = Column(DateTime(timezone=True), nullable=False, comment="Expiration timestamp for the OTP")
-    used = Column(Boolean, default=False, nullable=False, comment="Flag if OTP has been used")
-    created_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-        comment="Timestamp of OTP creation (UTC)",
-    )
+    # TZ‑aware timestamps; `created_at` from DB (UTC)
+    expires_at = Column(DateTime(timezone=True), nullable=False, doc="Expiration timestamp (UTC)")
+    used = Column(Boolean, nullable=False, server_default=text("false"), doc="Whether the OTP has been consumed")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __mapper_args__ = {"eager_defaults": True}
 
-    # ──────────────── Indexes ────────────────
+    # ─────────────── Indexes ───────────────
     __table_args__ = (
-        # General multi-column index to speed verification checks / cleanup jobs
-        Index("ix_otp_user_purpose_used_exp", "user_id", "purpose", "used", "expires_at"),
-        # NOTE: We intentionally DO NOT keep a CHECK like `expires_at > created_at`
-        # because tests (and some flows) may insert already-expired OTPs.
-        # Enforce freshness in application logic instead.
+        # One *active* OTP per user/purpose
+        Index(
+            "uq_otps_one_active_per_user_purpose",
+            "user_id",
+            "purpose",
+            unique=True,
+            postgresql_where=text("used = false"),
+        ),
+        # Fast validation lookups
+        Index("ix_otps_user_purpose_code", "user_id", "purpose", "code"),
+        # Cleanup/audits
+        Index("ix_otps_expires_at", "expires_at"),
+        Index("ix_otps_user_used", "user_id", "used"),
     )
 
-    # ──────────────── Relationships ────────────────
+    # ─────────────── Relationships ───────────────
     user = relationship("User", back_populates="otps", lazy="selectin", passive_deletes=True)
 
-    # ──────────────── Helpers ────────────────
+    # ─────────────── Helpers ───────────────
     @property
     def expired(self) -> bool:
-        """True if the OTP has expired as of now (UTC). Handles naive/aware safely."""
-        now = datetime.now(timezone.utc)
+        """True when the OTP is past its `expires_at` (UTC‑aware)."""
         exp = self.expires_at
         if exp is None:
             return True
         if exp.tzinfo is None:
             exp = exp.replace(tzinfo=timezone.utc)
-        return now > exp
+        return datetime.now(timezone.utc) > exp
 
-    def __repr__(self) -> str:
+    @property
+    def is_active(self) -> bool:
+        """Convenience: OTP is unused and not expired."""
+        return (not self.used) and (not self.expired)
+
+    def __repr__(self) -> str:  # pragma: no cover
         return f"<OTP id={self.id} user_id={self.user_id} purpose={self.purpose} used={self.used}>"

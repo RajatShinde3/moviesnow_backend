@@ -1,31 +1,30 @@
-# app/db/models/stream_variant.py
 from __future__ import annotations
 
 """
-🎞️ StreamVariant — per-rendition streams for a MediaAsset (production-grade)
-============================================================================
+🎞️ MoviesNow — StreamVariant (per‑rendition streams)
+===================================================
 
-Represents an individual streaming/download rendition generated from a source
-**MediaAsset** (e.g., HLS/DASH ladder entries, audio-only tracks, progressive MP4).
+Represents an individual streaming/download rendition derived from a source
+**MediaAsset** (e.g., HLS/DASH ladder entries, audio‑only tracks, progressive MP4).
 
 Why this model
 --------------
-- Clean separation between the **source asset** and its **derived variants**
-- Strong typing for protocol/container/codec/DRM to avoid free-form strings
-- Practical fields for ABR selection (bandwidth, resolution, fps), audio, HDR
-- Flexible `drm_params` JSON for provider-specific bits (PSSH, FairPlay data)
-- Safe constraints & indexes for de-duplication and fast selection
+• Clean separation between the **source asset** and its **derived variants**.
+• Strong typing for protocol/container/codec/DRM to avoid free‑form strings.
+• Practical fields for ABR selection (bandwidth, resolution, fps), audio, HDR.
+• Flexible `drm_params` JSONB for provider‑specific bits (PSSH, FairPlay data).
+• Protective constraints & indexes for de‑duplication and fast selection.
 
 Relationships
 -------------
-- `StreamVariant.media_asset`  ←→  `MediaAsset.stream_variants`
+• `StreamVariant.media_asset`  ↔ `MediaAsset.stream_variants`
+• `StreamVariant.playback_sessions` ↔ `PlaybackSession.stream_variant`
 
-Notes
------
-- `url_path` should be a **relative** CDN or storage path (e.g., `videos/…/1080p.m3u8`).
-- For manifest-based protocols, `url_path` typically points to a **variant playlist**
-  (HLS) or a representation segment index (DASH).
-- Keep **Title/Episode** references on `MediaAsset`; variants hang off the asset.
+Conventions
+-----------
+• `url_path` should be a **relative** CDN/storage path (e.g., `videos/.../1080p.m3u8`).
+• Manifest protocols use `url_path` for a variant playlist (HLS) or representation (DASH).
+• Keep **Title/Episode** references on `MediaAsset`; variants hang off the asset.
 """
 
 from enum import Enum as PyEnum
@@ -44,10 +43,11 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     func,
+    text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
-
+from uuid import uuid4
 from app.db.base_class import Base
 
 
@@ -55,31 +55,31 @@ from app.db.base_class import Base
 # 🔤 Enums
 # ──────────────────────────────────────────────────────────────
 class StreamProtocol(PyEnum):
-    HLS = "HLS"            # HTTP Live Streaming
-    DASH = "DASH"          # MPEG-DASH
+    HLS = "HLS"              # HTTP Live Streaming
+    DASH = "DASH"            # MPEG‑DASH
     PROGRESSIVE = "PROGRESSIVE"  # direct MP4 (download/offline)
 
 
 class Container(PyEnum):
-    TS = "TS"              # MPEG-TS (HLS legacy)
-    FMP4 = "FMP4"          # fragmented MP4 (HLS/DASH CMAF)
-    MP4 = "MP4"            # progressive MP4
+    TS = "TS"                # MPEG‑TS (HLS legacy)
+    FMP4 = "FMP4"            # fragmented MP4 (HLS/DASH CMAF)
+    MP4 = "MP4"              # progressive MP4
 
 
 class VideoCodec(PyEnum):
     H264 = "H264"
-    H265 = "H265"          # HEVC
+    H265 = "H265"            # HEVC
     VP9 = "VP9"
     AV1 = "AV1"
-    NONE = "NONE"          # audio-only
+    NONE = "NONE"            # audio‑only
 
 
 class AudioCodec(PyEnum):
     AAC = "AAC"
     AC3 = "AC3"
-    EAC3 = "EAC3"          # Dolby Digital Plus
+    EAC3 = "EAC3"            # Dolby Digital Plus
     OPUS = "OPUS"
-    NONE = "NONE"          # video-only (uncommon but possible)
+    NONE = "NONE"            # video‑only (uncommon)
 
 
 class DRMType(PyEnum):
@@ -103,22 +103,23 @@ class StreamVariant(Base):
     """
     A single playable rendition of a video `MediaAsset`.
 
-    Examples:
-        • HLS 1080p @ 6.5 Mbps, H.264/AAC, SDR
-        • DASH 2160p @ 14 Mbps, H.265/EAC3, HDR10
-        • Progressive 720p MP4 @ 3 Mbps, H.264/AAC
-        • Audio-only HLS @ 128 kbps, AAC
+    Examples
+    --------
+    • HLS 1080p @ 6.5 Mbps, H.264/AAC, SDR
+    • DASH 2160p @ 14 Mbps, H.265/EAC3, HDR10
+    • Progressive 720p MP4 @ 3 Mbps, H.264/AAC
+    • Audio‑only HLS @ 128 kbps, AAC
 
-    De-duplication:
-        Uniqueness is enforced per `(media_asset_id, protocol, url_path)`.
-        Additionally, a secondary uniqueness guard across technical parameters
-        avoids accidental duplicates in the ladder.
+    De‑duplication
+    --------------
+    Uniqueness is enforced per `(media_asset_id, protocol, url_path)`. A secondary
+    technical signature prevents accidental duplicates in the ladder.
     """
 
     __tablename__ = "stream_variants"
 
     # Identity / linkage
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True),default=uuid4, primary_key=True)
     media_asset_id = Column(
         UUID(as_uuid=True),
         ForeignKey("media_assets.id", ondelete="CASCADE"),
@@ -130,15 +131,23 @@ class StreamVariant(Base):
     url_path = Column(
         String(1024),
         nullable=False,
-        doc="Relative path to the variant playlist/representation or progressive file.",
         index=True,
+        doc="Relative path to the variant playlist/representation or progressive file.",
     )
 
     # Playback descriptors
     protocol = Column(Enum(StreamProtocol, name="stream_protocol"), nullable=False)
     container = Column(Enum(Container, name="stream_container"), nullable=False)
-    video_codec = Column(Enum(VideoCodec, name="video_codec"), nullable=False, default=VideoCodec.H264)
-    audio_codec = Column(Enum(AudioCodec, name="audio_codec"), nullable=False, default=AudioCodec.AAC)
+    video_codec = Column(
+        Enum(VideoCodec, name="video_codec"),
+        nullable=False,
+        server_default=text("'H264'"),
+    )
+    audio_codec = Column(
+        Enum(AudioCodec, name="audio_codec"),
+        nullable=False,
+        server_default=text("'AAC'"),
+    )
 
     # ABR / quality characteristics
     bandwidth_bps = Column(Integer, nullable=False, doc="Peak bandwidth in bits per second (EXT-X-STREAM-INF BANDWIDTH).")
@@ -149,38 +158,34 @@ class StreamVariant(Base):
 
     # Audio details
     audio_channels = Column(Integer, nullable=True, doc="Channel count (e.g., 2, 6).")
-    audio_language = Column(String(16), nullable=True, doc="BCP-47 language tag (e.g., 'en', 'en-US').")
+    audio_language = Column(String(16), nullable=True, doc="BCP‑47 language tag (e.g., 'en', 'en-US').")
 
     # Color / HDR
-    hdr = Column(Enum(HDRFormat, name="hdr_format"), nullable=False, default=HDRFormat.SDR)
+    hdr = Column(Enum(HDRFormat, name="hdr_format"), nullable=False, server_default=text("'SDR'"))
     bit_depth = Column(Integer, nullable=True, doc="Color bit depth (8, 10, 12).")
 
     # DRM
-    drm_type = Column(Enum(DRMType, name="drm_type"), nullable=False, default=DRMType.NONE)
+    drm_type = Column(Enum(DRMType, name="drm_type"), nullable=False, server_default=text("'NONE'"))
     drm_kid = Column(UUID(as_uuid=True), nullable=True, doc="Content key ID (UUID) when applicable.")
     drm_params = Column(
-        JSON,
+        JSONB,
         nullable=True,
-        doc="Provider-specific DRM data (e.g., Widevine PSSH b64, FairPlay cert URL).",
+        doc="Provider‑specific DRM data (e.g., Widevine PSSH b64, FairPlay cert URL).",
     )
 
     # Operational flags / sizing
-    is_default = Column(Boolean, nullable=False, default=False, doc="Preferred variant when no client preference is provided.")
-    is_audio_only = Column(Boolean, nullable=False, default=False)
-    is_downloadable = Column(Boolean, nullable=False, default=False)
-    size_bytes = Column(Integer, nullable=True, doc="Approx size of progressive file; null for segmented streams.")
+    is_default = Column(Boolean, nullable=False, server_default=text("false"),
+                        doc="Preferred variant when no client preference is provided.")
+    is_audio_only = Column(Boolean, nullable=False, server_default=text("false"))
+    is_downloadable = Column(Boolean, nullable=False, server_default=text("false"))
+    size_bytes = Column(Integer, nullable=True, doc="Approx size of progressive file; NULL for segmented streams.")
 
     # Labeling
     label = Column(String(64), nullable=True, doc="Human label (e.g., '1080p', '4K HDR', 'Audio EN').")
 
-    # Timestamps
+    # Timestamps (DB‑driven UTC)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     __mapper_args__ = {"eager_defaults": True}
 
@@ -193,17 +198,34 @@ class StreamVariant(Base):
         CheckConstraint("(frame_rate IS NULL) OR (frame_rate > 0)", name="ck_stream_variant_fps_positive"),
         CheckConstraint("(audio_channels IS NULL) OR (audio_channels >= 0)", name="ck_stream_variant_audio_channels_nonneg"),
         CheckConstraint("(size_bytes IS NULL) OR (size_bytes >= 0)", name="ck_stream_variant_size_nonneg"),
+        CheckConstraint("updated_at >= created_at", name="ck_stream_variant_updated_after_created"),
 
-        # Audio-only implies no video dimensions
+        # Audio/video logic
         CheckConstraint(
-            "NOT is_audio_only OR (width IS NULL AND height IS NULL)",
-            name="ck_stream_variant_audio_only_dims",
+            "NOT is_audio_only OR (width IS NULL AND height IS NULL AND video_codec = 'NONE' AND audio_codec <> 'NONE')",
+            name="ck_stream_variant_audio_only_implies_audio_track",
+        ),
+        CheckConstraint(
+            "is_audio_only OR video_codec <> 'NONE'",
+            name="ck_stream_variant_non_audio_has_video",
+        ),
+
+        # Optional language tag length sanity
+        CheckConstraint("(audio_language IS NULL) OR (char_length(audio_language) BETWEEN 2 AND 16)",
+                        name="ck_stream_variant_lang_len"),
+        # Optional non‑blank label
+        CheckConstraint("(label IS NULL) OR (length(btrim(label)) > 0)", name="ck_stream_variant_label_not_blank"),
+
+        # Downloadability guard (allow PROGRESSIVE or HLS offline; forbid DASH by default)
+        CheckConstraint(
+            "(NOT is_downloadable) OR (protocol IN ('PROGRESSIVE','HLS'))",
+            name="ck_stream_variant_downloadable_protocol",
         ),
 
         # Path uniqueness per asset & protocol
         UniqueConstraint("media_asset_id", "protocol", "url_path", name="uq_stream_variant_asset_proto_path"),
 
-        # Technical de-duplication guard (best-effort)
+        # Technical de‑duplication guard (best‑effort)
         UniqueConstraint(
             "media_asset_id",
             "protocol",
@@ -216,10 +238,21 @@ class StreamVariant(Base):
             name="uq_stream_variant_tech_params",
         ),
 
+        # One default per (asset, audio_language, hdr) when flagged
+        Index(
+            "uq_stream_variant_default_per_scope",
+            "media_asset_id",
+            "audio_language",
+            "hdr",
+            unique=True,
+            postgresql_where=text("is_default = true"),
+        ),
+
         # Useful selectors
         Index("ix_stream_variant_asset_default", "media_asset_id", "is_default"),
         Index("ix_stream_variant_quality", "height", "bandwidth_bps"),
         Index("ix_stream_variant_drm", "protocol", "drm_type"),
+        Index("ix_stream_variant_created_at", "created_at"),
     )
 
     # ── Relationships ─────────────────────────────────────────
@@ -235,6 +268,7 @@ class StreamVariant(Base):
         passive_deletes=True,
         lazy="selectin",
     )
+
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         wh = f"{self.width}x{self.height}" if self.width and self.height else ("audio" if self.is_audio_only else "unknown")
         return (

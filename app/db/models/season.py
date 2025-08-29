@@ -1,164 +1,173 @@
-# app/db/models/season.py
 from __future__ import annotations
 
 """
-📺 MoviesNow — Season Model (Production-grade)
-=============================================
+⭐ MoviesNow — Review (user ratings & comments)
+==============================================
 
-Represents a **Season** that belongs to a `Title` of type **SERIES**.
-A season aggregates metadata and artwork for a contiguous set of episodes.
+Captures a user’s opinion of a Title (movie or series) with moderation,
+spoiler flags, and light anti‑abuse metadata.
 
-Design goals
-------------
-- Strong **entity boundaries**: each Season is scoped to a single Title
-- Clean **uniqueness**: `(title_id, season_number)` and case-insensitive slug
-- Practical fields for **ingest**, **catalog**, and **UI** (dates, artwork, IDs)
-- DB-driven timestamps and defensive **constraints**
-- Relationships tuned for FastAPI/SQLAlchemy async with `selectin` loading
+Highlights
+----------
+• **Single review per (user, title)** via unique constraint/partial indexes.
+• **Moderation workflow** with compact enum: PENDING / APPROVED / REJECTED / REMOVED.
+• **Spoiler & language** fields for UX filters and i18n.
+• **Defensive checks** on rating range, counters, JSON shape, and timestamps.
+• **Analytics‑friendly indexes**, including partial indexes over approved rows.
 
-Key relationships
------------------
-- `title`     → Title (parent)                      [back_populates="seasons"]
-- `episodes`  → Episode (children)                  [back_populates="season"]
-- `media_assets` (optional) → MediaAsset (season-scoped artwork/teasers)
+Relationships
+-------------
+• `Review.user`  ↔ `User.reviews`
+• `Review.title` ↔ `Title.reviews`
 """
 
-from uuid import uuid4
+from enum import Enum as PyEnum
 
 from sqlalchemy import (
-    Column,
-    String,
-    Integer,
     Boolean,
-    Date,
-    DateTime,
-    ForeignKey,
-    UniqueConstraint,
     CheckConstraint,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
     Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
 
 
-class Season(Base):
+# ───────────────────────────────────────────────────────────────
+# Enums
+# ───────────────────────────────────────────────────────────────
+class ModerationStatus(PyEnum):
+    """Lifecycle of a review in the moderation system."""
+
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    REMOVED = "REMOVED"  # admin hard‑remove but keep row for audit
+
+
+# ───────────────────────────────────────────────────────────────
+# Model
+# ───────────────────────────────────────────────────────────────
+class Review(Base):
+    """A user’s rating and optional text commentary for a `Title`.
+
+    Conventions
+    -----------
+    • `rating` is an **integer 1..10** (store halves client‑side as ×2 if needed).
+    • `content` is plain text or already‑sanitized HTML (sanitized upstream).
+    • `published_at` is set **iff** the review is `APPROVED`.
     """
-    Season container for a series.
 
-    Notes
-    -----
-    • `(title_id, season_number)` is unique; `season_number` starts at **1**.  
-    • `slug` is optional but useful for readable URLs; uniqueness is enforced
-      **per title** and **case-insensitive**.  
-    • `poster_asset_id`/`backdrop_asset_id`/`trailer_asset_id` are *pointers*
-      to the preferred artwork/trailer (all variants can still live in
-      `MediaAsset` with a `season_id` FK).
-    """
+    __tablename__ = "reviews"
 
-    __tablename__ = "seasons"
+    # ── Identity & ownership ────────────────────────────────────────────────
+    id = Column(UUID(as_uuid=True), primary_key=True)
 
-    # ─────────────── Identity ───────────────
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True, doc="Author of the review.")
 
-    title_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("titles.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-        doc="Parent Title (must be a SERIES).",
-    )
+    title_id = Column(UUID(as_uuid=True), ForeignKey("titles.id", ondelete="CASCADE"),
+                      nullable=False, index=True, doc="Reviewed Title (movie or series).")
 
-    # ─────────────── Ordinal / Naming / SEO ───────────────
-    season_number = Column(Integer, nullable=False, doc="Ordinal season number (1-based).")
-    name = Column(String(255), nullable=True, doc="Optional display name (e.g., 'Season of Fire').")
-    slug = Column(String(255), nullable=True, index=True, doc="Optional URL-safe slug unique per title.")
+    # ── Core review fields ──────────────────────────────────────────────────
+    rating = Column(SmallInteger, nullable=False, doc="User rating, integer 1..10.")
 
-    # ─────────────── Synopsis ───────────────
-    overview = Column(String, nullable=True)
+    content = Column(Text, nullable=True, doc="Optional review text (sanitized upstream).")
 
-    # ─────────────── Dates ───────────────
-    release_date = Column(Date, nullable=True, index=True, doc="First air date for the season.")
-    end_date = Column(Date, nullable=True, doc="Last air date for the season (if concluded).")
+    is_spoiler = Column(Boolean, nullable=False, server_default=text("false"),
+                        doc="Marks the review as containing spoilers.")
 
-    # ─────────────── Artwork / Trailer (canonical pointers) ───────────────
-    poster_asset_id = Column(UUID(as_uuid=True), ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True)
-    backdrop_asset_id = Column(UUID(as_uuid=True), ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True)
-    trailer_asset_id = Column(UUID(as_uuid=True), ForeignKey("media_assets.id", ondelete="SET NULL"), nullable=True)
+    language = Column(String(16), nullable=True, doc="BCP‑47/ISO language tag for `content` (e.g., 'en', 'en-US').")
 
-    # ─────────────── External IDs (ingestion/dedup) ───────────────
-    imdb_id = Column(String(32), nullable=True, unique=True)
-    tmdb_id = Column(String(32), nullable=True, unique=True)
+    # ── Moderation / abuse / meta ───────────────────────────────────────────
+    moderation_status = Column(Enum(ModerationStatus, name="review_moderation_status"),
+                               nullable=False, server_default=text("'PENDING'"), index=True)
 
-    # ─────────────── Catalog & Publishing ───────────────
-    episode_count = Column(Integer, nullable=False, server_default=text("0"))
-    is_published = Column(Boolean, nullable=False, server_default=text("false"), index=True)
+    abuse_report_count = Column(Integer, nullable=False, server_default=text("0"),
+                                doc="Number of times users reported this review.")
+    last_reported_at = Column(DateTime(timezone=True), nullable=True)
 
-    # ─────────────── Timestamps (DB-driven, UTC) ───────────────
+    helpful_count = Column(Integer, nullable=False, server_default=text("0"),
+                           doc="Community 'helpful' votes.")
+
+    ip_hash = Column(String(64), nullable=True, index=True,
+                     doc="Hashed remote IP (for rate‑limiting/abuse heuristics; never store raw IP).")
+
+    client_app = Column(String(64), nullable=True, doc="Client build identifier, e.g., 'web@1.42.0'.")
+
+    moderation_meta = Column(JSONB, nullable=True, doc="Free‑form moderation notes/labels (kept minimal; no PII).")
+
+    # ── Timestamps ─────────────────────────────────────────────────────────
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    published_at = Column(DateTime(timezone=True), nullable=True, doc="When it first became public (upon approval).")
 
     __mapper_args__ = {"eager_defaults": True}
 
-    # ─────────────── Indexes & Constraints ───────────────
+    # ── Constraints & indexes ──────────────────────────────────────────────
     __table_args__ = (
-        # One season number per title; enforce 1-based numbering
-        UniqueConstraint("title_id", "season_number", name="uq_seasons_title_num"),
-        CheckConstraint("season_number >= 1", name="ck_seasons_num_ge_1"),
-        CheckConstraint("episode_count >= 0", name="ck_seasons_episode_count_ge_0"),
-        # Case-insensitive uniqueness of slug within a title (when slug present)
-        UniqueConstraint(
-            "title_id",
-            func.lower(slug),
-            name="uq_seasons_title_slug_ci",
+        # One review per (user,title)
+        UniqueConstraint("user_id", "title_id", name="uq_reviews_user_title"),
+        # Rating sanity (1..10)
+        CheckConstraint("rating BETWEEN 1 AND 10", name="ck_reviews_rating_range"),
+        # Non‑negative counters
+        CheckConstraint("abuse_report_count >= 0", name="ck_reviews_reports_nonneg"),
+        CheckConstraint("helpful_count >= 0", name="ck_reviews_helpful_nonneg"),
+        # IP hash hygiene (if present, must look like a SHA‑256 hex digest)
+        CheckConstraint("(ip_hash IS NULL) OR (char_length(ip_hash) = 64)", name="ck_reviews_iphash_len"),
+        # Language tag length sanity
+        CheckConstraint("(language IS NULL) OR (char_length(language) BETWEEN 2 AND 16)",
+                        name="ck_reviews_language_len"),
+        # Content length guard
+        CheckConstraint("content IS NULL OR char_length(content) <= 8000", name="ck_reviews_content_len"),
+        # Timestamp/order sanity
+        CheckConstraint("updated_at >= created_at", name="ck_reviews_updated_after_created"),
+        # `published_at` iff APPROVED
+        CheckConstraint(
+            "(moderation_status = 'APPROVED' AND published_at IS NOT NULL) OR "
+            "(moderation_status <> 'APPROVED' AND published_at IS NULL)",
+            name="ck_reviews_published_iff_approved",
         ),
-        Index("ix_seasons_title_published", "title_id", "is_published"),
-        Index("ix_seasons_dates", "release_date", "end_date"),
+        # Speed up listing/aggregations over visible reviews
+        Index("ix_reviews_title_approved", "title_id", unique=False,
+              postgresql_where=text("moderation_status = 'APPROVED'")),
+        Index("ix_reviews_user_approved", "user_id",
+              postgresql_where=text("moderation_status = 'APPROVED'")),
+        Index("ix_reviews_title_created", "title_id", "created_at"),
+        Index("ix_reviews_user_created", "user_id", "created_at"),
+        # JSONB acceleration for moderation metadata
+        Index("ix_reviews_moderation_meta_gin", "moderation_meta", postgresql_using="gin"),
     )
 
-    # ─────────────── Relationships ───────────────
-    title = relationship(
-        "Title",
-        back_populates="seasons",
-        lazy="selectin",
-        passive_deletes=True,
-    )
+    # ── Relationships ──────────────────────────────────────────────────────
+    user = relationship("User", back_populates="reviews", lazy="selectin", passive_deletes=True)
+    title = relationship("Title", back_populates="reviews", lazy="selectin", passive_deletes=True)
 
-    episodes = relationship(
-        "Episode",
-        back_populates="season",
-        lazy="selectin",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        order_by="Episode.episode_number",  # natural ordering
-    )
+    # ── Convenience API ────────────────────────────────────────────────────
+    @property
+    def stars_5(self) -> float:
+        """Return a 0–5 star value (half‑star precision) derived from the 1–10 rating."""
+        return round(self.rating / 2.0, 1)
 
-    # Optional: season-scoped asset rows (thumbnails, stills, teasers, etc.)
-    media_assets = relationship(
-        "MediaAsset",
-        back_populates="season",
-        lazy="selectin",
-        passive_deletes=True,
-    )
-    subtitles = relationship("Subtitle", back_populates="season", passive_deletes=True, lazy="selectin")
-    credits = relationship("Credit", back_populates="season", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
-    availabilities = relationship(
-        "Availability",
-        back_populates="season",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        lazy="selectin",
-    )
+    @property
+    def is_public(self) -> bool:
+        """True if this review is publicly visible."""
+        return self.moderation_status == ModerationStatus.APPROVED
 
-    progress_entries = relationship(
-        "Progress",
-        back_populates="season",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        lazy="selectin",
-    )
     def __repr__(self) -> str:  # pragma: no cover
-        return f"<Season id={self.id} title_id={self.title_id} S{self.season_number} published={self.is_published}>"
+        return (
+            f"<Review user={self.user_id} title={self.title_id} "
+            f"rating={self.rating} status={self.moderation_status.value}>"
+        )

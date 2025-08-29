@@ -1,55 +1,52 @@
-# app/db/models/subtitle.py
 from __future__ import annotations
 
 """
-📝 MoviesNow — Subtitle Model (Production-grade)
-===============================================
+📝 MoviesNow — Subtitle (logical text track)
+===========================================
 
-Represents a **text track** (subtitle/caption) associated with a `Title`,
-`Season`, or `Episode`. This model stores track-level metadata (language,
-role/flags, default/forced) and points to the underlying binary **file** via
-`MediaAsset` (which carries storage info, checksum, size, mime, etc.).
+Represents a **text track** (subtitle/caption) associated with a `Title`, `Season`,
+or `Episode`. It binds **playback semantics** (default/forced/SDH, language, label)
+while the underlying file lives in `MediaAsset(kind='subtitle'|'caption')`.
 
 Why a dedicated model?
 ----------------------
-`MediaAsset(kind='subtitle')` captures the file itself, while `Subtitle`
-captures **playback semantics** and catalog metadata (e.g., default/forced [per
-scope+language], hearing-impaired/SDH, track label). This separation avoids
-overloading assets with player rules and enables clean querying per scope.
+`MediaAsset` stores the binary/file details (storage key, checksum, size, mime),
+whereas `Subtitle` captures *catalog & player rules* per scope.
 
 Key properties
 --------------
-- **Scope-aware**: Optional links to `Title`, `Season`, `Episode` with composite
-  FKs that preserve hierarchical consistency (episode ⇒ season ⇒ title).
-- **File binding**: `asset_id` → `MediaAsset` (typically `kind='subtitle'`).
-- **Playback flags**: `is_default`, `is_forced`, `is_sdh` (hearing-impaired).
-- **Uniqueness guards** (PostgreSQL partial unique indexes):
-  • at most one **default** track per (scope, language)  
-  • at most one **forced** track per (scope, language)
-- **Rich metadata**: `language` (BCP-47), `format` (srt/vtt/ass/ttml), `encoding`,
-  optional `time_offset_ms`, `label`, and arbitrary JSON `metadata`.
+• Scope‑aware: optional links to `Title`/`Season`/`Episode` with composite FKs that
+  enforce hierarchical consistency (episode ⇒ season ⇒ title).
+• File binding: `asset_id` → `MediaAsset` (usually kind='subtitle' or 'caption').
+• Playback flags: `is_default`, `is_forced`, `is_sdh` (hearing‑impaired/CC).
+• Uniqueness guards (partial uniques): at most one **default** and one **forced**
+  track per *(scope, language)* among **active** rows.
+• Rich metadata: BCP‑47 `language`, `format` enum (srt/vtt/ass/ttml/…), `encoding`,
+  optional `time_offset_ms`, human `label`, and JSONB `metadata`.
 
-Relations
----------
-- `title`   → Title     (optional, CASCADE)
-- `season`  → Season    (optional, CASCADE; consistent with `title_id`)
-- `episode` → Episode   (optional, CASCADE; consistent with `season_id/title_id`)
-- `asset`   → MediaAsset(kind='subtitle' or 'caption') (CASCADE)
-- `created_by` → User   (optional, SET NULL)
+Relationships
+-------------
+• `Subtitle.title`    ↔ `Title.subtitles`
+• `Subtitle.season`   ↔ `Season.subtitles`
+• `Subtitle.episode`  ↔ `Episode.subtitles`
+• `Subtitle.asset`    → `MediaAsset`
+• `Subtitle.created_by` → `User`
 """
 
 from uuid import uuid4
+from enum import Enum as PyEnum
 
 from sqlalchemy import (
-    Column,
-    String,
-    Integer,
     Boolean,
+    CheckConstraint,
+    Column,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
-    CheckConstraint,
     Index,
+    Integer,
+    String,
+    Enum,
     func,
     text,
 )
@@ -57,6 +54,19 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
+
+
+# ──────────────────────────────────────────────────────────────
+# 🔤 Enum: SubtitleFormat
+# ──────────────────────────────────────────────────────────────
+class SubtitleFormat(PyEnum):
+    SRT = "SRT"
+    VTT = "VTT"          # WebVTT
+    ASS = "ASS"
+    TTML = "TTML"        # IMSC/TTML/DFXP family
+    SCC = "SCC"
+    SMI = "SMI"
+    UNKNOWN = "UNKNOWN"
 
 
 class Subtitle(Base):
@@ -69,7 +79,6 @@ class Subtitle(Base):
 
     # ─────────────── Scope (Title / Season / Episode) ───────────────
     title_id = Column(UUID(as_uuid=True), ForeignKey("titles.id", ondelete="CASCADE"), nullable=True, index=True)
-
     season_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     episode_id = Column(UUID(as_uuid=True), nullable=True, index=True)
 
@@ -100,24 +109,15 @@ class Subtitle(Base):
     )
 
     # ─────────────── Track metadata ───────────────
-    language = Column(
-        String(16),
-        nullable=False,
-        index=True,
-        doc="BCP-47/ISO tag (e.g., 'en', 'en-US').",
-    )
-    format = Column(
-        String(16),
-        nullable=False,
-        doc="Container/format (e.g., 'vtt', 'srt', 'ass', 'ttml').",
-    )
+    language = Column(String(16), nullable=False, index=True, doc="BCP‑47 tag (e.g., 'en', 'en-US').")
+    format = Column(Enum(SubtitleFormat, name="subtitle_format"), nullable=False, server_default=text("'VTT'"))
     encoding = Column(String(32), nullable=True, doc="Text encoding (e.g., 'utf-8').")
-    label = Column(String(128), nullable=True, doc="Human-readable label (e.g., 'English [CC]').")
+    label = Column(String(128), nullable=True, doc="Human‑readable label (e.g., 'English [CC]').")
 
     # Playback flags
     is_default = Column(Boolean, nullable=False, server_default=text("false"), index=True)
     is_forced = Column(Boolean, nullable=False, server_default=text("false"), index=True)
-    is_sdh = Column(Boolean, nullable=False, server_default=text("false"), index=True)  # hearing-impaired/CC
+    is_sdh = Column(Boolean, nullable=False, server_default=text("false"), index=True)  # hearing‑impaired/CC
 
     # Optional timing metadata
     time_offset_ms = Column(Integer, nullable=False, server_default=text("0"), doc="Track offset relative to media.")
@@ -125,7 +125,7 @@ class Subtitle(Base):
 
     # Misc
     active = Column(Boolean, nullable=False, server_default=text("true"), index=True)
-    metadata = Column(JSONB, nullable=True, doc="Arbitrary structured info (supplier, notes, QC flags, etc.).")
+    metadata_json = Column(JSONB, nullable=True, doc="Arbitrary structured info (supplier, QC flags, notes, …).")
 
     # Audit
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -136,47 +136,50 @@ class Subtitle(Base):
 
     # ─────────────── Constraints & Indexes ───────────────
     __table_args__ = __table_args__ + (  # type: ignore[operator]
-        # Scope coherence: at least one scope must be present
+        # Scope coherence: at least one scope, and stronger scopes imply parents
         CheckConstraint(
             "(title_id IS NOT NULL) OR (season_id IS NOT NULL) OR (episode_id IS NOT NULL)",
             name="ck_subtitles_has_some_scope",
         ),
-        CheckConstraint(
-            "(season_id IS NULL) OR (title_id IS NOT NULL)",
-            name="ck_subtitles_season_requires_title",
-        ),
+        CheckConstraint("(season_id IS NULL) OR (title_id IS NOT NULL)", name="ck_subtitles_season_requires_title"),
         CheckConstraint(
             "(episode_id IS NULL) OR (season_id IS NOT NULL AND title_id IS NOT NULL)",
             name="ck_subtitles_episode_requires_parents",
         ),
-        # Numeric sanity
+        # Hygiene & numeric sanity
         CheckConstraint("(time_offset_ms BETWEEN -10800000 AND 10800000)", name="ck_subtitles_offset_reasonable"),
-        CheckConstraint(
-            "(duration_seconds IS NULL) OR (duration_seconds >= 0)",
-            name="ck_subtitles_duration_nonneg",
-        ),
+        CheckConstraint("(duration_seconds IS NULL) OR (duration_seconds >= 0)", name="ck_subtitles_duration_nonneg"),
         CheckConstraint("updated_at >= created_at", name="ck_subtitles_updated_after_created"),
-        # Partial uniques (PostgreSQL) to ensure one default/forced per scope+language
+        # BCP‑47 length & shape (loose)
+        CheckConstraint(
+            "(char_length(language) BETWEEN 2 AND 16)",
+            name="ck_subtitles_lang_len",
+        ),
+        CheckConstraint(
+            "(language ~ '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$')",
+            name="ck_subtitles_lang_shape",
+        ),
+        # Optional non‑blank label
+        CheckConstraint("(label IS NULL) OR (length(btrim(label)) > 0)", name="ck_subtitles_label_not_blank"),
+
+        # Partial uniques (PostgreSQL): one default/forced per (scope, language) among ACTIVE rows
         Index(
             "uq_subtitles_default_per_scope_language",
-            "title_id",
-            "season_id",
-            "episode_id",
-            "language",
+            "title_id", "season_id", "episode_id", "language",
             unique=True,
-            postgresql_where=text("is_default = true"),
+            postgresql_where=text("is_default = true AND active = true"),
         ),
         Index(
             "uq_subtitles_forced_per_scope_language",
-            "title_id",
-            "season_id",
-            "episode_id",
-            "language",
+            "title_id", "season_id", "episode_id", "language",
             unique=True,
-            postgresql_where=text("is_forced = true"),
+            postgresql_where=text("is_forced = true AND active = true"),
         ),
-        # Helpful composites for listing & lookups
+
+        # JSONB/lookup helpers
         Index("ix_subtitles_scope_lang_active", "title_id", "season_id", "episode_id", "language", "active"),
+        Index("ix_subtitles_metadata_gin", "metadata", postgresql_using="gin"),
+        Index("ix_subtitles_created_at", "created_at"),
     )
 
     # ─────────────── Relationships ───────────────
@@ -190,4 +193,4 @@ class Subtitle(Base):
     def __repr__(self) -> str:  # pragma: no cover
         scope = f"title={self.title_id}, season={self.season_id}, episode={self.episode_id}"
         flags = f"default={self.is_default}, forced={self.is_forced}, sdh={self.is_sdh}"
-        return f"<Subtitle id={self.id} lang={self.language} fmt={self.format} {flags} {scope}>"
+        return f"<Subtitle id={self.id} lang={self.language} fmt={self.format.name} {flags} {scope}>"

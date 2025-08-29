@@ -1,57 +1,58 @@
-# app/db/models/profile.py
 from __future__ import annotations
 
+"""
+👤 MoviesNow — User Profile (minimal, privacy‑friendly)
+======================================================
+
+Compact, future‑proof profile that attaches **1:1** to `User`.
+
+Highlights
+----------
+• Public **handle** with strict lowercase charset and **case‑insensitive** uniqueness.
+• Lightweight presentation fields (avatar/banner URLs) with sane length checks.
+• **Privacy‑first**: preferences & favorite genres stored as JSONB (shape‑checked),
+  no PII beyond display name and public handle.
+• Fast filters for **visibility/discoverability**, plus JSONB GIN indexes.
+• DB‑driven UTC timestamps and `eager_defaults=True` for consistent writes.
+
+Relationships
+-------------
+• `Profile.user` ↔ `User.profile` (one‑to‑one; enforced by unique FK).
+"""
+
 import uuid
+
 from sqlalchemy import (
-    Column,
-    String,
     Boolean,
+    CheckConstraint,
+    Column,
     DateTime,
     ForeignKey,
     Index,
-    CheckConstraint,
+    String,
     Text,
+    func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
 
 from app.db.base_class import Base
 
 
 class Profile(Base):
-    """
-    🎬 MoviesNow — User Profile (minimal & future-proof)
-    ----------------------------------------------------
-    Compact, privacy-friendly profile attached 1:1 to `User`.
-
-    Includes:
-    - Identity: `handle` (unique, lowercase), `full_name`
-    - Presentation: `avatar_url`, optional `banner_url`, short `bio`
-    - Preferences: JSONB blob for UI/content settings
-    - Domain: `favorite_genres` (JSONB array of strings)
-    - Visibility: `is_visible`, `is_discoverable`
-    - Timestamps with DB defaults
-    """
-
     __tablename__ = "profiles"
 
     # ── Identity ──────────────────────────────────────────────────────────────
-    id = Column(
-        PG_UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-        index=True,
-        doc="Primary key for the profile",
-    )
+    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
 
     user_id = Column(
         PG_UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
-        unique=True,
+        unique=True,  # one profile per user
         nullable=False,
         index=True,
-        comment="One-to-one reference to the associated user",
+        comment="One‑to‑one reference to the associated user",
     )
 
     # Public handle for profile URLs & @mentions (lowercase, strict charset)
@@ -70,17 +71,14 @@ class Profile(Base):
     banner_url = Column(String(2048), nullable=True)
 
     # ── Privacy / Discovery ──────────────────────────────────────────────────
-    is_visible = Column(Boolean, default=True, nullable=False, comment="Visible to others")
-    is_discoverable = Column(Boolean, default=True, nullable=False, comment="Can appear in search/browse")
+    is_visible = Column(Boolean, nullable=False, server_default=text("true"), comment="Visible to others")
+    is_discoverable = Column(Boolean, nullable=False, server_default=text("true"), comment="Can appear in search/browse")
 
     # ── Preferences & Domain ─────────────────────────────────────────────────
-    # JSONB object for UI/language/theme/timezone, etc.
     preferences = Column(JSONB, nullable=True, comment="Flexible settings blob (object)")
-
-    # JSONB array of strings, e.g., ['Action','Drama']
     favorite_genres = Column(JSONB, nullable=True, comment="Preferred genres (array of strings)")
 
-    # ── Timestamps (UTC, DB-driven) ──────────────────────────────────────────
+    # ── Timestamps (UTC, DB‑driven) ──────────────────────────────────────────
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -88,11 +86,12 @@ class Profile(Base):
 
     # ── Indexes & Constraints ────────────────────────────────────────────────
     __table_args__ = (
-        # Case-insensitive uniqueness for handle (Postgres expression index)
+        # Case‑insensitive uniqueness for handle (functional unique index)
         Index("uq_profiles_handle_lower", func.lower(handle), unique=True),
 
         # Fast filters & lists
-        Index("ix_profiles_is_visible", "is_visible"),
+        Index("ix_profiles_visible_discoverable", "is_visible", "is_discoverable"),
+        Index("ix_profiles_created_at", "created_at"),
 
         # GIN indexes for JSONB membership queries
         Index("ix_profiles_favorite_genres_gin", "favorite_genres", postgresql_using="gin"),
@@ -100,7 +99,9 @@ class Profile(Base):
 
         # Data hygiene
         CheckConstraint("updated_at >= created_at", name="ck_profiles_updated_after_created"),
+        CheckConstraint("length(btrim(handle)) > 0", name="ck_profiles_handle_not_blank"),
         CheckConstraint("handle ~ '^[a-z0-9_.-]{3,32}$'", name="ck_profiles_handle_format"),
+        CheckConstraint("(full_name IS NULL) OR (length(btrim(full_name)) > 0)", name="ck_profiles_full_name_not_blank_when_present"),
         CheckConstraint("(avatar_url IS NULL) OR (char_length(avatar_url) <= 2048)", name="ck_profiles_avatar_len"),
         CheckConstraint("(banner_url IS NULL) OR (char_length(banner_url) <= 2048)", name="ck_profiles_banner_len"),
 
@@ -109,13 +110,8 @@ class Profile(Base):
         CheckConstraint("jsonb_typeof(favorite_genres) IN ('array','null')", name="ck_profiles_genres_array"),
     )
 
-    # Relationship
-    user = relationship(
-        "User",
-        back_populates="profile",
-        lazy="selectin",
-        passive_deletes=True,
-    )
+    # ── Relationship ─────────────────────────────────────────────────────────
+    user = relationship("User", back_populates="profile", lazy="selectin", passive_deletes=True)
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Profile id={self.id} user_id={self.user_id} handle={self.handle}>"
