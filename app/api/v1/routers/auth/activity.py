@@ -1,50 +1,52 @@
 # app/api/v1/auth/activity.py
+from __future__ import annotations
 
 """
-Enterprise-grade Login Activity & Security Alerts API
-====================================================
+Enterprise‑grade Login Activity & Security Alerts API — MoviesNow (org‑free)
+===========================================================================
 
 What this router provides
 -------------------------
-- **Readable activity feed** for the signed-in user (auth + security events)
+- **Readable activity feed** for the signed‑in user (auth + security events)
 - **Security alerts subscription** surface (new device / location / impossible travel)
 
 Design goals
 ------------
-- **Privacy**: never returns sensitive bearer material or full user agents unless required
-- **Resilience**: DB-first (`AuditLog`) with **Redis ring buffer** fallback
-- **No-store**: responses set Cache-Control: no-store
-- **Rate-limited**: per-route guards complement global throttles
-- **Auditable**: all reads/writes recorded (best-effort)
+- **Privacy**: never returns sensitive bearer material; trims UA only for display
+- **Resilience**: DB‑first (`AuditLog`) with **Redis ring buffer** fallback
+- **No‑store**: responses set `Cache-Control: no-store`
+- **Rate‑limited**: per‑route guards complement global throttles
+- **Auditable**: reads/writes recorded (best‑effort, non‑blocking)
 
 Data sources
 ------------
 - **DB (preferred)**: `app.db.models.audit_log.AuditLog` with
-  `(id, user_id, action, status, created_at, ip, user_agent, meta_json)`.
+  `(id, user_id, action, status, occurred_at, ip_address, user_agent, metadata_json)`.
 - **Redis fallback**: `audit:recent:{user_id}` (RPUSH newest; LTRIM to max).
 """
 
 import json
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Literal, Callable, Any
+from typing import List, Optional, Literal, Callable, Any, Dict
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Query
-from sqlalchemy import select
+from sqlalchemy import select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.redis_client import redis_wrapper
 from app.core.limiter import rate_limit
-from app.core.dependencies import get_async_db, get_current_user
+from app.db.session import get_async_db
+from app.core.security import get_current_user
 from app.security_headers import set_sensitive_cache
 from app.db.models.user import User
 from app.schemas.auth import ActivityItem, ActivityResponse, AlertsSubscription
 from app.services.audit_log_service import log_audit_event
 
 logger = logging.getLogger(__name__)
-router = APIRouter(tags=["Activity & Alerts"])
+router = APIRouter(prefix="/auth", tags=["Activity & Alerts"])  # grouped with auth
 
 # ──────────────────────────────────────────────────────────────
 # Redis keys
@@ -57,7 +59,7 @@ DEFAULT_LIMIT = 50
 
 
 # ──────────────────────────────────────────────────────────────
-# 🧩 Small Lua snippets (atomic counter + TTL on first increment)
+# 🧩 Small Lua snippet (atomic INCR + EXPIRE on first increment)
 # ──────────────────────────────────────────────────────────────
 INCR_EXPIRE_LUA = """
 local v = redis.call('incr', KEYS[1])
@@ -67,8 +69,9 @@ return v
 
 
 # ──────────────────────────────────────────────────────────────
-# Redis helpers (best-effort; safe on outages)
+# Redis helpers (best‑effort; safe on outages)
 # ──────────────────────────────────────────────────────────────
+
 def _rc():
     """Return the shared Redis client (mock or real), or None."""
     try:
@@ -77,34 +80,33 @@ def _rc():
         return None
 
 
-async def _r_lrange(key: str, start: int, end: int) -> list[Any]:
+def _b2s(v: Any) -> Any:
+    return v.decode() if isinstance(v, (bytes, bytearray)) else v
+
+
+async def _r_lrange(key: str, start: int, end: int) -> List[Any]:
     r = _rc()
     if not r:
         return []
     try:
-        return await r.lrange(key, start, end)
+        res = await r.lrange(key, start, end)
+        return [ _b2s(x) for x in (res or []) ]
     except Exception:
         return []
 
 
-async def _r_hgetall(key: str) -> dict[str, Any]:
+async def _r_hgetall(key: str) -> Dict[str, Any]:
     r = _rc()
     if not r:
         return {}
     try:
         raw = await r.hgetall(key)
-        # Some clients return dict[bytes, bytes]; normalize
-        out: dict[str, Any] = {}
-        for k, v in (raw or {}).items():
-            ks = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
-            vs = v.decode() if isinstance(v, (bytes, bytearray)) else v
-            out[ks] = vs
-        return out
+        return { str(_b2s(k)): _b2s(v) for k, v in (raw or {}).items() }
     except Exception:
         return {}
 
 
-async def _r_hset(key: str, mapping: dict[str, Any]) -> None:
+async def _r_hset(key: str, mapping: Dict[str, Any]) -> None:
     r = _rc()
     if not r:
         raise RuntimeError("KV not available")
@@ -117,13 +119,14 @@ async def _r_hset(key: str, mapping: dict[str, Any]) -> None:
 # ──────────────────────────────────────────────────────────────
 # Decoders / mappers
 # ──────────────────────────────────────────────────────────────
-def _as_str(b: Any) -> str:
-    return b.decode() if isinstance(b, (bytes, bytearray)) else str(b)
-
 
 def _safe_iso(ts: Optional[str]) -> datetime:
     try:
-        return datetime.fromisoformat(ts) if ts else datetime.now(timezone.utc)
+        if not ts:
+            return datetime.now(timezone.utc)
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts)
     except Exception:
         return datetime.now(timezone.utc)
 
@@ -145,15 +148,15 @@ def _match_filter(action: str, tfilter: Optional[str]) -> bool:
 async def _read_recent_from_redis(user_id: UUID, limit: int, tfilter: Optional[str]) -> List[ActivityItem]:
     raw = await _r_lrange(RB_KEY(user_id), -limit, -1)
     items: List[ActivityItem] = []
-    for b in raw or []:
+    for entry in raw:
         try:
-            obj = json.loads(_as_str(b))
+            obj = json.loads(str(entry))
             act = str(obj.get("action", "") or "")
             if not _match_filter(act, tfilter):
                 continue
             items.append(
                 ActivityItem(
-                    id=str(obj.get("id")) or None,
+                    id=str(obj.get("id") or "") or None,
                     at=_safe_iso(obj.get("at")),
                     action=act,
                     status=str(obj.get("status", "") or ""),
@@ -172,11 +175,10 @@ async def _read_recent_from_redis(user_id: UUID, limit: int, tfilter: Optional[s
 async def _read_recent_from_db(
     db: AsyncSession, user_id: UUID, limit: int, tfilter: Optional[str]
 ) -> List[ActivityItem]:
-    """
-    Best-effort DB query using a conventional `AuditLog` model.
+    """Best‑effort DB query using MoviesNow `AuditLog` model.
 
-    Expected columns: id, user_id, action, status, created_at, ip, user_agent, meta_json
-    If the model is not available, returns an empty list.
+    Expected columns: id, user_id, action, status, **occurred_at**, ip_address,
+    user_agent, **metadata_json**. If the model cannot be imported, returns [].
     """
     try:
         from app.db.models.audit_log import AuditLog  # type: ignore
@@ -186,7 +188,7 @@ async def _read_recent_from_db(
     q = (
         select(AuditLog)
         .where(AuditLog.user_id == user_id)
-        .order_by(AuditLog.created_at.desc())
+        .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
         .limit(limit)
     )
     rows = (await db.execute(q)).scalars().all()
@@ -194,11 +196,14 @@ async def _read_recent_from_db(
     items: List[ActivityItem] = []
     for r in rows:
         try:
-            meta_raw = getattr(r, "meta_json", None)
+            meta_raw = getattr(r, "metadata_json", None)
+            meta: Dict[str, Any] = {}
             if isinstance(meta_raw, (bytes, bytearray)):
-                meta_raw = meta_raw.decode()
-            meta = {}
-            if isinstance(meta_raw, str):
+                try:
+                    meta = json.loads(meta_raw.decode())
+                except Exception:
+                    meta = {}
+            elif isinstance(meta_raw, str):
                 try:
                     meta = json.loads(meta_raw)
                 except Exception:
@@ -212,11 +217,11 @@ async def _read_recent_from_db(
 
             items.append(
                 ActivityItem(
-                    id=str(getattr(r, "id", "") or None) or None,
-                    at=getattr(r, "created_at", datetime.now(timezone.utc)),
+                    id=str(getattr(r, "id", "") or "") or None,
+                    at=getattr(r, "occurred_at", datetime.now(timezone.utc)),
                     action=action,
                     status=str(getattr(r, "status", "") or ""),
-                    ip=getattr(r, "ip", None),
+                    ip=getattr(r, "ip_address", None),
                     user_agent=getattr(r, "user_agent", None),
                     geo=(meta.get("geo") if isinstance(meta, dict) else None),
                     device=(meta.get("device") if isinstance(meta, dict) else None),
@@ -233,8 +238,10 @@ async def _load_subscription(user_id: UUID) -> AlertsSubscription:
     h = await _r_hgetall(SUB_KEY(user_id))
     if not h:
         return AlertsSubscription()
+
     def _to_bool(v: Any) -> bool:
         return str(v).lower() in ("1", "true", "yes", "on")
+
     return AlertsSubscription(
         new_device=_to_bool(h.get("new_device", "1")),
         new_location=_to_bool(h.get("new_location", "1")),
@@ -244,7 +251,7 @@ async def _load_subscription(user_id: UUID) -> AlertsSubscription:
 
 
 # ──────────────────────────────────────────────────────────────
-# 🔎 GET /activity — recent login & security activity
+# 🔎 GET /auth/activity — recent login & security activity
 # ──────────────────────────────────────────────────────────────
 @router.get(
     "/activity",
@@ -260,36 +267,34 @@ async def get_activity(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> ActivityResponse:
-    """
-    Return the most recent **auth & security** events for the caller.
+    """Return the most recent **auth & security** events for the caller.
 
     Behavior
     --------
-    - **DB-first**: attempt to read from `AuditLog`; if unavailable, fall back to
+    - **DB‑first**: attempt to read from `AuditLog`; if unavailable, fall back to
       the Redis ring buffer `audit:recent:{user_id}`.
-    - Results are best-effort filtered and limited to `limit`.
-    - Response is marked **no-store**.
+    - Best‑effort filtered and limited to `limit`.
+    - Response is marked **no‑store**.
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    # [Step 0] Cache hardening
     set_sensitive_cache(response)
 
-    # ── [Step 1] Query data sources ──────────────────────────────────────────
+    # [Step 1] Query data sources
     tfilter = None if type == "all" else type
     items_db = await _read_recent_from_db(db, current_user.id, limit, tfilter)
     items = items_db[:limit] if items_db else await _read_recent_from_redis(current_user.id, limit, tfilter)
 
-    # ── [Step 2] Audit & respond ─────────────────────────────────────────────
+    # [Step 2] Audit & respond (best‑effort)
     try:
         await log_audit_event(db, action="ACTIVITY_VIEW", user=current_user, status="SUCCESS", request=request)
     except Exception:
-        # do not fail the read on audit hiccups
         pass
 
     return ActivityResponse(total=len(items), items=items)
 
 
 # ──────────────────────────────────────────────────────────────
-# 🔔 GET /alerts/subscription — view alert preferences
+# 🔔 GET /auth/alerts/subscription — view alert preferences
 # ──────────────────────────────────────────────────────────────
 @router.get(
     "/alerts/subscription",
@@ -302,21 +307,20 @@ async def get_alert_subscription(
     response: Response,
     current_user: User = Depends(get_current_user),
 ) -> AlertsSubscription:
-    """
-    Return the user's current alert subscription preferences.
+    """Return the user's current alert subscription preferences.
 
     Storage
     -------
-    - Backed by Redis `HSET alert:sub:{user_id}` for low-latency checks by login flows.
+    - Backed by Redis `HSET alert:sub:{user_id}` for low‑latency checks by login flows.
     - If Redis is unavailable, returns defaults (all True).
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    # [Step 0] Cache hardening
     set_sensitive_cache(response)
     return await _load_subscription(current_user.id)
 
 
 # ──────────────────────────────────────────────────────────────
-# 🔔 POST /alerts/subscribe — update alert preferences
+# 🔔 POST /auth/alerts/subscribe — update alert preferences
 # ──────────────────────────────────────────────────────────────
 @router.post(
     "/alerts/subscribe",
@@ -331,18 +335,17 @@ async def update_alert_subscription(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> AlertsSubscription:
-    """
-    Update the user's security alert preferences.
+    """Update the user's security alert preferences.
 
     Storage
     -------
     - Preferences are stored in Redis under `alert:sub:{user_id}` as an `HSET`.
     - If Redis is down, returns **503** (since preferences would not persist).
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    # [Step 0] Cache hardening
     set_sensitive_cache(response)
 
-    # ── [Step 1] Persist in Redis (HSET) ─────────────────────────────────────
+    # [Step 1] Persist in Redis (HSET)
     mapping = {
         "new_device": "1" if payload.new_device else "0",
         "new_location": "1" if payload.new_location else "0",
@@ -354,13 +357,18 @@ async def update_alert_subscription(
     except Exception:
         try:
             await log_audit_event(
-                db, action="ALERTS_UPDATE", user=current_user, status="FAILURE", request=request, meta_data={"reason": "kv_unavailable"}
+                db,
+                action="ALERTS_UPDATE",
+                user=current_user,
+                status="FAILURE",
+                request=request,
+                meta_data={"reason": "kv_unavailable"},
             )
         except Exception:
             pass
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Preferences storage unavailable.")
 
-    # ── [Step 2] Audit & respond ─────────────────────────────────────────────
+    # [Step 2] Audit & respond
     try:
         await log_audit_event(db, action="ALERTS_UPDATE", user=current_user, status="SUCCESS", request=request, meta_data=mapping)
     except Exception:
@@ -368,4 +376,4 @@ async def update_alert_subscription(
     return await _load_subscription(current_user.id)
 
 
-__all__ = ["router"]
+__all__ = ["router", "get_activity", "get_alert_subscription", "update_alert_subscription"]

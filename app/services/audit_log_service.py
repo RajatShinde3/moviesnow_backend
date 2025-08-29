@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 """
-MoviesNow — Audit Log Service (async, production-grade)
-======================================================
+MoviesNow — Audit Log Service (async, production‑grade, org‑free)
+================================================================
 
 Purpose
 -------
@@ -11,13 +11,15 @@ Persist structured audit trails for authentication, playback, download,
 search, subscription, and account actions — with request metadata for
 observability and traceability.
 
-Highlights
-----------
-- Proxy-aware IP extraction (X-Forwarded-For / X-Real-IP fallback to client.host)
-- Correlates with `request.state.request_id` (from RequestIDMiddleware)
-- Strict, JSON-serializable `meta_data` with secret-key scrubbing
-- Safe DB writes with `flush()` and optional `commit`
-- Minimal domain: **no org/tenant dependencies**
+Design notes
+------------
+- **Proxy‑aware IP** extraction (`X-Forwarded-For`, `X-Real-IP`, Cloudflare headers).
+- Correlates with `request.state.request_id` (see RequestID middleware).
+- Strict, JSON‑serializable `meta_data` with secret‑key scrubbing.
+- **DB column names** match the model: we write to `metadata_json` and *do not*
+  set timestamps manually (DB default drives `occurred_at`).
+- **Best‑effort** writes: failures are logged, the function swallows errors so
+  business flows are never blocked by auditing.
 
 Usage
 -----
@@ -31,15 +33,13 @@ Usage
     )
 """
 
-from datetime import datetime, timezone
 from enum import Enum
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 from uuid import UUID
 
 from fastapi import Request
-from sqlalchemy.exc import InvalidRequestError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.audit_log import AuditLog
@@ -64,6 +64,9 @@ class AuditEvent(str, Enum):
     DEACTIVATE_USER = "DEACTIVATE_USER"
     REACTIVATE_USER = "REACTIVATE_USER"
     DELETE_USER = "DELETE_USER"
+    MFA_RESET_REQUESTED = "MFA_RESET_REQUESTED"
+    REVOKE_TOKEN = "REVOKE_TOKEN"
+    REQUEST_DEACTIVATION_OTP = "REQUEST_DEACTIVATION_OTP"
 
     # 🎬 Playback & Player
     PLAYBACK_PLAY = "PLAYBACK_PLAY"
@@ -115,27 +118,40 @@ class AuditEvent(str, Enum):
 # ─────────────────────────────────────────────────────────────
 # 🔎 Helpers: request metadata & meta scrubbing
 # ─────────────────────────────────────────────────────────────
-_SENSITIVE_KEYS = {"authorization", "token", "access_token", "refresh_token", "password", "secret", "cookie", "set-cookie"}
+_SENSITIVE_KEYS = {
+    "authorization",
+    "token",
+    "access_token",
+    "refresh_token",
+    "password",
+    "secret",
+    "cookie",
+    "set-cookie",
+}
+
 
 def _client_ip(request: Optional[Request]) -> Optional[str]:
     if not request:
         return None
     hdrs = request.headers
+    # Prefer standard proxy headers (left‑most IP is the client)
     xff = hdrs.get("x-forwarded-for") or hdrs.get("X-Forwarded-For")
     if xff:
-        # take the first IP in the list
         ip = xff.split(",")[0].strip()
         if ip:
             return ip
     xri = hdrs.get("x-real-ip") or hdrs.get("X-Real-IP")
     if xri:
         return xri.strip()
+    ccip = hdrs.get("cf-connecting-ip") or hdrs.get("True-Client-IP")
+    if ccip:
+        return ccip.strip()
     return request.client.host if request and request.client else None
 
+
 def _scrub(obj: Any) -> Any:
-    """
-    Recursively remove obvious secret keys from dicts/lists.
-    Non-dict/list values are returned as-is.
+    """Recursively remove obvious secret keys from dicts/lists.
+    Non‑dict/list values are returned as‑is.
     """
     try:
         if isinstance(obj, dict):
@@ -152,18 +168,20 @@ def _scrub(obj: Any) -> Any:
     except Exception:
         return {"raw": str(obj)}
 
+
 def _safe_metadata(meta_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if meta_data is None:
         return None
     if not isinstance(meta_data, dict):
         meta_data = {"raw": str(meta_data)}
     meta_data = _scrub(meta_data)
-    # Ensure JSON-serializable
+    # Ensure JSON‑serializable
     try:
         json.dumps(meta_data)
         return meta_data
     except Exception:
         return {"raw": "non-serializable metadata"}
+
 
 def _request_snapshot(request: Optional[Request]) -> Dict[str, Any]:
     if not request:
@@ -180,40 +198,42 @@ def _request_snapshot(request: Optional[Request]) -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────
-# 🧠 Audit Writer
+# 🧠 Audit Writer (best‑effort, never raises)
 # ─────────────────────────────────────────────────────────────
 async def log_audit_event(
     db: AsyncSession,
     *,
     user: Optional[User] = None,
-    action: AuditEvent,
+    action: Union[str, AuditEvent],
     status: str,
     request: Optional[Request] = None,
     meta_data: Optional[Dict[str, Any]] = None,
     override_user_id: Optional[UUID] = None,
     commit: bool = True,
 ) -> None:
-    """
-    Persist an audit log row for the given action.
+    """Persist an audit log row for the given action.
 
-    Captures:
-      - user_id (from `user` or `override_user_id`)
-      - action (typed via `AuditEvent`)
-      - status (normalized upper-case string, e.g., SUCCESS / FAILURE)
-      - ip/user-agent/request_id (proxy-aware)
-      - timestamp (UTC)
-      - sanitized, JSON-serializable `meta_data`
+    Captures
+    --------
+    - `user_id` (from `user` or `override_user_id`)
+    - `action` (enum/string)
+    - `status` (normalized UPPER string, e.g., SUCCESS / FAILURE)
+    - `ip_address`, `user_agent`, `request_id`
+    - DB‑driven timestamp (`occurred_at` via default)
+    - Sanitized, JSON‑serializable `meta_data` (stored as `metadata` column via `metadata_json` attr)
 
-    On DB errors:
-      - Attempts rollback, raises `RuntimeError` with a generic message.
+    Reliability
+    -----------
+    Any exception is **caught and logged**; the function returns without raising
+    to avoid breaking business flows. Callers do not need try/except.
     """
     try:
         ip_address = _client_ip(request)
         user_agent = request.headers.get("user-agent") if request else None
         request_id = getattr(request.state, "request_id", None) if request else None
-        user_id = override_user_id or (user.id if user else None)
+        user_id = override_user_id or (getattr(user, "id", None))
 
-        # Merge minimal request snapshot into metadata (without overriding caller-provided keys)
+        # Merge minimal request snapshot into metadata (without overriding caller keys)
         base_meta = _request_snapshot(request)
         clean_meta = _safe_metadata(meta_data) or {}
         for k, v in base_meta.items():
@@ -221,39 +241,26 @@ async def log_audit_event(
 
         entry = AuditLog(
             user_id=user_id,
-            action=action,
+            action=str(action),
             status=str(status or "").upper(),
             ip_address=ip_address,
             user_agent=user_agent,
             request_id=request_id,
-            timestamp=datetime.now(timezone.utc),
-            meta_data=clean_meta if clean_meta else None,
+            metadata_json=clean_meta if clean_meta else None,
         )
 
         db.add(entry)
         await db.flush()
         if commit:
             await db.commit()
-
-    except InvalidRequestError as ire:
-        logger.warning("[AUDIT] Flush failed: %s", ire)
-        raise RuntimeError("Could not flush audit log") from ire
-
-    except SQLAlchemyError as db_err:
-        logger.exception("[AUDIT] Database error: %s", db_err)
+    except Exception as e:  # pragma: no cover — best‑effort path
+        # Try to rollback and log; swallow errors
         try:
             await db.rollback()
-        except Exception as rollback_err:
-            logger.warning("[AUDIT] Rollback failed after DB error: %s", rollback_err)
-        raise RuntimeError("Could not write audit log to database") from db_err
-
-    except Exception as e:
-        logger.exception("[AUDIT] Unexpected failure: %s", e)
-        try:
-            await db.rollback()
-        except Exception as rollback_err:
-            logger.warning("[AUDIT] Rollback failed after unknown error: %s", rollback_err)
-        raise RuntimeError("Audit logging failed unexpectedly") from e
+        except Exception:
+            pass
+        logger.exception("[AUDIT] Failed to write audit log: %s", e)
+        return None
 
 
 __all__ = ["AuditEvent", "log_audit_event"]

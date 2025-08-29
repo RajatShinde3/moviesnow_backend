@@ -17,7 +17,7 @@ from app.services.auth.password_reset_service import generate_otp
 # =====================================================================================
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deletion.send_password_reset_otp")
+@patch("app.api.v1.routers.auth.account_deletion.send_password_reset_otp")
 async def test_request_deletion_otp_success(
     mock_send_email,
     async_client: AsyncClient,
@@ -76,7 +76,7 @@ async def test_request_deletion_otp_mfa_enabled(
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deletion.redis_utils.enforce_rate_limit",
+@patch("app.api.v1.routers.auth.account_deletion.redis_utils.enforce_rate_limit",
        side_effect=HTTPException(status_code=429, detail="Please wait before requesting another OTP."))
 async def test_request_deletion_otp_rate_limited(
     mock_rate_limit,
@@ -266,7 +266,7 @@ async def test_delete_user_missing_mfa_token(
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deletion.redis_utils.enforce_rate_limit",
+@patch("app.api.v1.routers.auth.account_deletion.redis_utils.enforce_rate_limit",
        side_effect=HTTPException(status_code=429, detail="Too many attempts"))
 async def test_delete_user_rate_limited(
     mock_rate_limit,

@@ -115,7 +115,7 @@ def _hash_otp(otp: str, *, user_id: str, purpose: str) -> str:
     """
     if not otp or not user_id or not purpose:
         raise ValueError("otp, user_id and purpose are required")
-    key = settings.SECRET_KEY.get_secret_value().encode("utf-8")  # pepper
+    key = settings.JWT_SECRET_KEY.get_secret_value().encode("utf-8")  # pepper
     msg = f"{purpose}:{user_id}:{otp}".encode("utf-8")
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
 

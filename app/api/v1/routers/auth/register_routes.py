@@ -16,7 +16,6 @@ from . import (
     mfa_reset,
     reactivation,
     refresh_logout,
-    user_info,
     audit_log,
     recovery_codes,
     reauth,
@@ -77,7 +76,6 @@ def build_auth_router(
     router.include_router(reactivation.router,        responses=common_responses)    # /request-reactivation, /reactivate
 
     # ── [Step 7] User info & admin-ish views ──────────────────────────────────
-    router.include_router(user_info.router,           responses=common_responses)    # /me, /me/organization-memberships
     router.include_router(audit_log.router,           responses=common_responses)    # /audit-logs/audit
 
     router.include_router(recovery_codes.router,      responses=common_responses)    

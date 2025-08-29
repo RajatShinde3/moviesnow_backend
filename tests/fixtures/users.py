@@ -1,16 +1,17 @@
+from __future__ import annotations
+
 import pytest
 from uuid import uuid4
 from datetime import datetime, timezone
-from typing import Callable, Awaitable, Tuple
+from typing import Callable, Awaitable, Tuple, Optional
+
 from pyotp import random_base32
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, get_password_hash
-from app.db.models import User
-from app.schemas.enums import OrgRole
-from tests.utils.factory import create_user
-
+from app.db.models.user import User          
+from tests.utils.factory import create_user  
 
 # ──────────────────────────────────────────────────────────────
 # 🧪 Factory: Create or Reuse Test User (by email)
@@ -18,25 +19,21 @@ from tests.utils.factory import create_user
 @pytest.fixture
 def create_test_user(db_session: AsyncSession) -> Callable[..., Awaitable[User]]:
     """
-    ✅ Factory Fixture: Create or retrieve a test user by email.
-
-    - If the user with the given email exists, returns it.
-    - Otherwise, creates a new one using the `create_user` utility.
-
-    Returns:
-        Async Callable that returns a `User` instance.
+    Create or fetch a test user by email (idempotent if email already exists).
     """
     async def _create(**kwargs) -> User:
-        email = kwargs.get("email") or f"test_{uuid4().hex}@example.com"
+        email = (kwargs.get("email") or f"test_{uuid4().hex}@example.com").lower()
         kwargs["email"] = email
-        result = await db_session.execute(select(User).where(User.email == email))
-        existing_user = result.scalar_one_or_none()
+
+        existing_user = (
+            await db_session.execute(select(User).where(User.email == email))
+        ).scalar_one_or_none()
         if existing_user:
             return existing_user
 
         user = await create_user(session=db_session, **kwargs)
         if user is None:
-            raise Exception("⚠️ create_user returned None!")
+            raise RuntimeError("create_user returned None")
         await db_session.commit()
         await db_session.refresh(user)
         return user
@@ -50,18 +47,15 @@ def create_test_user(db_session: AsyncSession) -> Callable[..., Awaitable[User]]
 @pytest.fixture
 def create_user_normal(db_session: AsyncSession) -> Callable[..., Awaitable[User]]:
     """
-    ✅ Factory Fixture: Create a verified test user with minimal setup.
-
-    Returns:
-        Async Callable that returns a `User` instance with a JWT token.
+    Create a verified, active user and attach a convenient JWT at `user.token`.
     """
     async def _create_user(
-        email: str = None,
+        email: Optional[str] = None,
         password: str = "password",
         is_verified: bool = True,
     ) -> User:
         user = User(
-            email=email or f"testuser_{uuid4().hex[:8]}@example.com",
+            email=(email or f"testuser_{uuid4().hex[:8]}@example.com").lower(),
             hashed_password=get_password_hash(password),
             is_active=True,
             is_verified=is_verified,
@@ -72,8 +66,8 @@ def create_user_normal(db_session: AsyncSession) -> Callable[..., Awaitable[User
         await db_session.commit()
         await db_session.refresh(user)
 
-        # Add `token` for convenience in test usage
-        user.token = await create_access_token(user_id=user.id)
+        # Convenience for tests
+        user.token = await create_access_token(user_id=str(user.id))  # ✅ ensure str
         return user
 
     return _create_user
@@ -83,17 +77,16 @@ def create_user_normal(db_session: AsyncSession) -> Callable[..., Awaitable[User
 # 👑 Superadmin Fixture
 # ──────────────────────────────────────────────────────────────
 @pytest.fixture
-async def superadmin_user(create_test_user) -> User:
+async def superadmin_user(create_test_user: Callable[..., Awaitable[User]]) -> User:
     """
-    🚀 Superuser Fixture: Creates a user with elevated privileges for testing admin flows.
-
-    Returns:
-        `User` instance with `is_superuser=True`
+    Create (or reuse) a superuser for admin-path tests.
     """
     return await create_test_user(
         email="superadmin@example.com",
         full_name="Super Admin",
         is_superuser=True,
+        is_verified=True,
+        is_active=True,
     )
 
 
@@ -103,22 +96,24 @@ async def superadmin_user(create_test_user) -> User:
 @pytest.fixture
 def mfa_user_with_token(db_session: AsyncSession) -> Callable[..., Awaitable[Tuple[User, str]]]:
     """
-    🔐 Factory fixture for creating an MFA-enabled user and returning (user, token).
-
-    Automatically sets a valid TOTP secret to allow OTP generation.
+    Create an MFA-enabled user and return (user, jwt_token).
+    Seeds a valid TOTP secret so tests can generate OTPs.
     """
     async def _create(**kwargs) -> Tuple[User, str]:
         kwargs.setdefault("mfa_enabled", True)
         kwargs.setdefault("totp_secret", random_base32())
+        kwargs.setdefault("is_active", True)
+        kwargs.setdefault("is_verified", True)
 
         user = await create_user(session=db_session, **kwargs)
+        if user is None:
+            raise RuntimeError("create_user returned None")
         await db_session.commit()
         await db_session.refresh(user)
 
         token = await create_access_token(
-            user_id=user.id,
-            mfa_authenticated=False,
-            active_org=kwargs.get("active_org")
+            user_id=str(user.id),           # ✅ ensure str
+            mfa_authenticated=False,        # org-free token
         )
         return user, token
 

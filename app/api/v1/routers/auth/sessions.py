@@ -50,7 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.redis_client import redis_wrapper
 from app.core.limiter import rate_limit
-from app.core.dependencies import get_current_user
+from app.core.security import get_current_user
 from app.db.session import get_async_db
 from app.security_headers import set_sensitive_cache
 from app.db.models.user import User

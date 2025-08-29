@@ -1,4 +1,3 @@
-# app/schemas/enums.py
 from __future__ import annotations
 
 """
@@ -7,11 +6,12 @@ Central enum definitions used across MoviesNow.
 Design notes
 ------------
 • All enums subclass `str, PyEnum` for JSON-friendly serialization.
-• Keep VALUE STRINGS stable once deployed (DB enums depend on them).
-• Grouped by domain for clarity; add to `__all__` when introducing new enums.
+• VALUE STRINGS are **stable** once deployed (DB enums depend on them).
+• Grouped by domain for clarity; keep `__all__` in sync when adding new enums.
 """
 
 from enum import Enum as PyEnum
+from typing import Optional
 
 
 # ──────────────────────────────────────────────────────────────
@@ -40,9 +40,9 @@ class ExportFormat(str, PyEnum):
 # ──────────────────────────────────────────────────────────────
 class StreamProtocol(str, PyEnum):
     """Primary streaming protocol used for playback."""
-    HLS = "HLS"   # HTTP Live Streaming
-    DASH = "DASH" # MPEG-DASH
-    MP4 = "MP4"   # Progressive (direct file) — also used for downloads
+    HLS = "HLS"    # HTTP Live Streaming
+    DASH = "DASH"  # MPEG-DASH
+    MP4 = "MP4"    # Progressive (direct file) — also used for downloads
 
 
 class Container(str, PyEnum):
@@ -71,7 +71,7 @@ class AudioCodec(str, PyEnum):
 
 
 class DRMType(str, PyEnum):
-    """DRM system negotiated for playback."""
+    """DRM system associated with an asset/representation."""
     NONE = "NONE"
     WIDEVINE = "WIDEVINE"
     FAIRPLAY = "FAIRPLAY"
@@ -84,6 +84,16 @@ class HDRFormat(str, PyEnum):
     HDR10 = "HDR10"
     HLG = "HLG"
     DOLBY_VISION = "DOLBY_VISION"
+
+
+class StreamTier(str, PyEnum):
+    """
+    Allowed tiers when `StreamVariant.is_streamable == True`.
+    Use as a SQLAlchemy Enum and in API responses for stable values.
+    """
+    P1080 = "P1080"
+    P720 = "P720"
+    P480 = "P480"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -274,12 +284,89 @@ class EndReason(str, PyEnum):
     UNKNOWN   = "UNKNOWN"
 
 
+class DrmScheme(str, PyEnum):
+    """
+    MoviesNow — DRM scheme (session-level)
+
+    Values
+    ------
+    - NONE       : Unprotected content
+    - WIDEVINE   : Google Widevine (EME key system: com.widevine.alpha)
+    - FAIRPLAY   : Apple FairPlay Streaming (EME: com.apple.fps.1_0)
+    - PLAYREADY  : Microsoft PlayReady (EME: com.microsoft.playready)
+
+    Notes
+    -----
+    - Use alongside asset-level `DRMType` to describe the negotiated DRM
+      for a specific playback session (what the client actually used).
+    - String-backed enum for clean JSON/DB serialization.
+    """
+    NONE = "NONE"
+    WIDEVINE = "WIDEVINE"
+    FAIRPLAY = "FAIRPLAY"
+    PLAYREADY = "PLAYREADY"
+
+    def __str__(self) -> str:  # introspection
+        return self.value
+
+    @property
+    def is_drm(self) -> bool:
+        """True if any DRM was used."""
+        return self is not DrmScheme.NONE
+
+    @property
+    def key_system(self) -> Optional[str]:
+        """EME key-system identifier used by browsers/SDKs."""
+        return {
+            DrmScheme.NONE: None,
+            DrmScheme.WIDEVINE: "com.widevine.alpha",
+            DrmScheme.FAIRPLAY: "com.apple.fps.1_0",
+            DrmScheme.PLAYREADY: "com.microsoft.playready",
+        }[self]
+
+    @property
+    def vendor(self) -> Optional[str]:
+        """Human-friendly vendor label."""
+        return {
+            DrmScheme.NONE: None,
+            DrmScheme.WIDEVINE: "Google",
+            DrmScheme.FAIRPLAY: "Apple",
+            DrmScheme.PLAYREADY: "Microsoft",
+        }[self]
+
+    @classmethod
+    def from_key_system(cls, key_system: str) -> "DrmScheme":
+        """Map an EME key-system string to a DrmScheme."""
+        ks = (key_system or "").strip().lower()
+        if ks.startswith("com.widevine"):
+            return cls.WIDEVINE
+        if ks.startswith("com.apple.fps"):
+            return cls.FAIRPLAY
+        if ks.startswith("com.microsoft.playready"):
+            return cls.PLAYREADY
+        if ks in ("", "none"):
+            return cls.NONE
+        raise ValueError(f"Unrecognized DRM key system: {key_system!r}")
+
+    @classmethod
+    def parse(cls, name: str) -> "DrmScheme":
+        """Parse by loose name (e.g., 'widevine', 'fairplay', 'playready', 'none')."""
+        s = (name or "").strip().upper()
+        try:
+            return cls[s]
+        except KeyError as e:
+            aliases = {"WV": cls.WIDEVINE, "FP": cls.FAIRPLAY, "PR": cls.PLAYREADY}
+            if s in aliases:
+                return aliases[s]
+            raise ValueError(f"Unrecognized DRM scheme: {name!r}") from e
+
+
 class ProgressStatus(str, PyEnum):
     """High-level per-item progress state."""
     IN_PROGRESS = "IN_PROGRESS"
-    COMPLETED = "COMPLETED"
-    RESET = "RESET"           # user scrubbed back / started over
-    ABANDONED = "ABANDONED"   # explicitly abandoned or long-idle
+    COMPLETED   = "COMPLETED"
+    RESET       = "RESET"         # user scrubbed back / started over
+    ABANDONED   = "ABANDONED"     # explicitly abandoned or long-idle
 
 
 # ──────────────────────────────────────────────────────────────
@@ -287,10 +374,10 @@ class ProgressStatus(str, PyEnum):
 # ──────────────────────────────────────────────────────────────
 class ModerationStatus(str, PyEnum):
     """Lifecycle of a review in the moderation system."""
-    PENDING = "PENDING"
+    PENDING  = "PENDING"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
-    REMOVED = "REMOVED"  # admin hard-remove but keep row for audit
+    REMOVED  = "REMOVED"  # admin hard-remove but keep row for audit
 
 
 # ──────────────────────────────────────────────────────────────
@@ -298,12 +385,12 @@ class ModerationStatus(str, PyEnum):
 # ──────────────────────────────────────────────────────────────
 class SubtitleFormat(str, PyEnum):
     """Subtitle/caption file formats."""
-    SRT = "SRT"
-    VTT = "VTT"        # WebVTT
-    ASS = "ASS"
-    TTML = "TTML"      # IMSC/TTML/DFXP family
-    SCC = "SCC"
-    SMI = "SMI"
+    SRT  = "SRT"
+    VTT  = "VTT"    # WebVTT
+    ASS  = "ASS"
+    TTML = "TTML"   # IMSC/TTML/DFXP family
+    SCC  = "SCC"
+    SMI  = "SMI"
     UNKNOWN = "UNKNOWN"
 
 
@@ -316,19 +403,20 @@ class TitleType(str, PyEnum):
 
 
 class TitleStatus(str, PyEnum):
-    ANNOUNCED = "ANNOUNCED"
+    ANNOUNCED     = "ANNOUNCED"
     IN_PRODUCTION = "IN_PRODUCTION"
-    RELEASED = "RELEASED"
-    ENDED = "ENDED"
-    CANCELED = "CANCELED"
-    HIATUS = "HIATUS"
+    RELEASED      = "RELEASED"
+    ENDED         = "ENDED"
+    CANCELED      = "CANCELED"
+    HIATUS        = "HIATUS"
 
 
 __all__ = [
     # Auth / Org
     "LoginMode", "OrgRole", "ExportFormat",
     # Streaming
-    "StreamProtocol", "Container", "VideoCodec", "AudioCodec", "DRMType", "HDRFormat",
+    "StreamProtocol", "Container", "VideoCodec", "AudioCodec", "DRMType",
+    "HDRFormat", "StreamTier",
     # Artwork
     "ArtworkKind",
     # Rights
@@ -341,8 +429,8 @@ __all__ = [
     "CreditKind", "CreditRole", "PersonGender",
     # Assets
     "MediaAssetKind",
-    # Playback / Progress
-    "PlaybackStatus", "EndReason", "ProgressStatus",
+    # Playback / Telemetry
+    "PlaybackStatus", "EndReason", "DrmScheme", "ProgressStatus",
     # Moderation
     "ModerationStatus",
     # Subtitles

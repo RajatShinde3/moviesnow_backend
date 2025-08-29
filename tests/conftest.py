@@ -10,12 +10,8 @@ from tests.fixtures.db import *
 from tests.fixtures.app import *
 from tests.fixtures.auth import *
 from tests.fixtures.users import *
-from tests.fixtures.orgs import *
-from tests.fixtures.tokens import *
 from tests.fixtures.utils import *
-from tests.fixtures.audit import *
 from tests.fixtures.mocks.email import *
-from tests.fixtures.category import *
 import pytest
 
 @pytest.fixture()

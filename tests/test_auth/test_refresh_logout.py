@@ -11,7 +11,6 @@ from app.core.config import settings
 from app.core.security import create_access_token, create_refresh_token
 from app.db.models.token import RefreshToken
 from app.db.models.user import User
-from app.db.models.user_organization import UserOrganization
 from app.services.token_service import store_refresh_token
 
 

@@ -255,7 +255,7 @@ async def test_redeem_after_rotation_old_codes_invalid(async_client: AsyncClient
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.recovery_codes._incr_with_ttl", return_value=10_000)
+@patch("app.api.v1.routers.auth.recovery_codes._incr_with_ttl", return_value=10_000)
 async def test_redeem_rate_limited(mock_incr, async_client: AsyncClient, user_with_headers):
     """
     ❌ Anti-bruteforce counters exceeded → 429.

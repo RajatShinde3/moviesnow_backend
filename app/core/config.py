@@ -102,7 +102,7 @@ class Settings(BaseSettings):
 
     # ── CORS & Hosts ─────────────────────────────────────────
     BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = Field(
-        default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"]
+        default_factory=lambda: ["http://localhost:8000", "http://localhost:5173"]
     )
     TRUSTED_HOSTS: List[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
     FRONTEND_ORIGINS: Optional[str] = None  # CSV
@@ -162,7 +162,7 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: Optional[SecretStr] = None
     EMAIL_FROM: Optional[str] = None
     EMAIL_TEMPLATE_DIR: Path = Path("app/templates/emails")
-    FRONTEND_URL: AnyHttpUrl = "http://localhost:3000"
+    FRONTEND_URL: AnyHttpUrl = "http://localhost:8000"
     PUBLIC_BASE_URL: AnyHttpUrl = "http://localhost:8000"
     EMAIL_VERIFY_BASE_URL: Union[AnyHttpUrl, str] = "http://localhost:8000"
 

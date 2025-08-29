@@ -17,7 +17,7 @@ from app.core.security import generate_mfa_token
 # ─────────────────────────────────────────────────────────────
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deactivation.log_audit_event", new_callable=AsyncMock)
+@patch("app.api.v1.routers.auth.account_deactivation.log_audit_event", new_callable=AsyncMock)
 async def test_request_deactivation_otp_success(
     mock_log_audit,
     async_client: AsyncClient,
@@ -52,7 +52,7 @@ async def test_request_deactivation_otp_success(
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deactivation.redis_utils.enforce_rate_limit", side_effect=HTTPException(429, "Rate limit exceeded"))
+@patch("app.api.v1.routers.auth.account_deactivation.redis_utils.enforce_rate_limit", side_effect=HTTPException(429, "Rate limit exceeded"))
 async def test_request_deactivation_otp_rate_limited(
     mock_rate_limit,
     async_client: AsyncClient,
@@ -80,8 +80,8 @@ async def test_request_deactivation_otp_rate_limited(
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deactivation.redis_utils.enforce_rate_limit", side_effect=Exception("Redis error"))
-@patch("app.api.v1.auth.account_deactivation.BackgroundTasks.add_task")
+@patch("app.api.v1.routers.auth.account_deactivation.redis_utils.enforce_rate_limit", side_effect=Exception("Redis error"))
+@patch("app.api.v1.routers.auth.account_deactivation.BackgroundTasks.add_task")
 async def test_request_deactivation_otp_failure_logs_audit(
     mock_add_task,
     mock_rate_limit,
@@ -176,7 +176,7 @@ async def test_request_deactivation_otp_cleans_previous_unused(
 # ─────────────────────────────────────────────────────────────
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deactivation.log_audit_event", new_callable=AsyncMock)
+@patch("app.api.v1.routers.auth.account_deactivation.log_audit_event", new_callable=AsyncMock)
 async def test_deactivate_user_with_otp_success(
     mock_log_audit,
     async_client: AsyncClient,
@@ -208,7 +208,7 @@ async def test_deactivate_user_with_otp_success(
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deactivation.log_audit_event", new_callable=AsyncMock)
+@patch("app.api.v1.routers.auth.account_deactivation.log_audit_event", new_callable=AsyncMock)
 async def test_deactivate_user_with_totp_success(
     mock_log_audit,
     async_client: AsyncClient,
@@ -336,7 +336,7 @@ async def test_deactivate_already_deactivated_user(
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deactivation.redis_utils.enforce_rate_limit", side_effect=HTTPException(429, "Rate limit exceeded"))
+@patch("app.api.v1.routers.auth.account_deactivation.redis_utils.enforce_rate_limit", side_effect=HTTPException(429, "Rate limit exceeded"))
 async def test_deactivation_rate_limit_exceeded(
     mock_rate_limit,
     async_client: AsyncClient,
@@ -366,8 +366,8 @@ async def test_deactivation_rate_limit_exceeded(
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.account_deactivation.deactivate_user", side_effect=Exception("DB crash"))
-@patch("app.api.v1.auth.account_deactivation.BackgroundTasks.add_task")
+@patch("app.api.v1.routers.auth.account_deactivation.deactivate_user", side_effect=Exception("DB crash"))
+@patch("app.api.v1.routers.auth.account_deactivation.BackgroundTasks.add_task")
 async def test_deactivate_user_db_crash(
     mock_add_task,
     mock_deactivate_user,

@@ -65,7 +65,7 @@ async def test_reauth_password_requires_access_bearer(async_client: AsyncClient,
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.reauth._check_and_bump_fail_counters", side_effect=HTTPException(status_code=429, detail="Too many attempts"))
+@patch("app.api.v1.routers.auth.reauth._check_and_bump_fail_counters", side_effect=HTTPException(status_code=429, detail="Too many attempts"))
 async def test_reauth_password_rate_limited(mock_limiter, async_client: AsyncClient, user_with_headers):
     """
     ❌ If anti-bruteforce limiter trips, expect 429.
@@ -174,7 +174,7 @@ async def test_reauth_mfa_requires_access_bearer(async_client: AsyncClient, user
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.reauth._check_and_bump_fail_counters", side_effect=HTTPException(status_code=429, detail="Too many attempts"))
+@patch("app.api.v1.routers.auth.reauth._check_and_bump_fail_counters", side_effect=HTTPException(status_code=429, detail="Too many attempts"))
 async def test_reauth_mfa_rate_limited(mock_limiter, async_client: AsyncClient, user_with_headers):
     """
     ❌ If anti-bruteforce limiter trips during MFA step-up, expect 429.

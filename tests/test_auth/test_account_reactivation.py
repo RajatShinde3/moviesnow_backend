@@ -16,8 +16,8 @@ from app.services.audit_log_service import AuditEvent
 # ---------------------------------------------------------------------------
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.reactivation.send_password_reset_otp", new_callable=AsyncMock)
-@patch("app.api.v1.auth.reactivation.log_audit_event", new_callable=AsyncMock)
+@patch("app.api.v1.routers.auth.reactivation.send_password_reset_otp", new_callable=AsyncMock)
+@patch("app.api.v1.routers.auth.reactivation.log_audit_event", new_callable=AsyncMock)
 async def test_request_otp_for_inactive_user(
     mock_log_audit: AsyncMock,
     mock_send_email: AsyncMock,
@@ -65,7 +65,7 @@ async def test_request_reactivation_user_not_found(async_client: AsyncClient):
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.reactivation.send_password_reset_otp", new_callable=AsyncMock)
+@patch("app.api.v1.routers.auth.reactivation.send_password_reset_otp", new_callable=AsyncMock)
 async def test_request_reactivation_user_active(
     mock_send_email: AsyncMock,
     async_client: AsyncClient,
@@ -86,7 +86,7 @@ async def test_request_reactivation_user_active(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.reactivation.log_audit_event", new_callable=AsyncMock)
+@patch("app.api.v1.routers.auth.reactivation.log_audit_event", new_callable=AsyncMock)
 async def test_reactivate_successfully(
     mock_log_audit: AsyncMock,
     async_client: AsyncClient,
@@ -250,7 +250,7 @@ async def test_reactivation_clears_reactivation_token(
 
 
 @pytest.mark.anyio
-@patch("app.api.v1.auth.reactivation.log_audit_event", new_callable=AsyncMock, side_effect=Exception("Simulated log failure"))
+@patch("app.api.v1.routers.auth.reactivation.log_audit_event", new_callable=AsyncMock, side_effect=Exception("Simulated log failure"))
 async def test_audit_log_failure_handled(
     mock_log_audit: AsyncMock,
     async_client: AsyncClient,

@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient, ASGITransport
 
-from app.api.v1.auth import trusted_devices as td
+from app.api.v1.routers.auth import trusted_devices as td
 from app.core.dependencies import get_async_db
 from app.core.security import create_access_token
 from tests.fixtures.db import get_override_get_db
