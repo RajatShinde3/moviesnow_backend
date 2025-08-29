@@ -51,46 +51,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
-
-
-# ──────────────────────────────────────────────────────────────
-# 🔤 Enums
-# ──────────────────────────────────────────────────────────────
-class CreditKind(str, Enum):
-    """Top‑level credit category."""
-
-    CAST = "cast"
-    CREW = "crew"
-
-
-class CreditRole(str, Enum):
-    """Common credit roles (expand pragmatically as catalog grows).
-
-    We keep both `kind` and `role`: e.g., kind=CAST role=ACTOR; kind=CREW role=DIRECTOR.
-    """
-
-    # Cast
-    ACTOR = "actor"
-    VOICE = "voice"
-    GUEST_STAR = "guest_star"
-    CAMEO = "cameo"
-
-    # Crew
-    DIRECTOR = "director"
-    WRITER = "writer"
-    PRODUCER = "producer"
-    EXECUTIVE_PRODUCER = "executive_producer"
-    SHOWRUNNER = "showrunner"
-    CREATOR = "creator"
-    COMPOSER = "composer"
-    EDITOR = "editor"
-    CINEMATOGRAPHER = "cinematographer"
-    COSTUME_DESIGNER = "costume_designer"
-    VFX_SUPERVISOR = "vfx_supervisor"
-    SOUND_MIXER = "sound_mixer"
-    MUSIC_SUPERVISOR = "music_supervisor"
-    STUNT_COORDINATOR = "stunt_coordinator"
-    OTHER = "other"
+from app.schemas.enums import CreditKind, CreditRole 
 
 
 # ──────────────────────────────────────────────────────────────

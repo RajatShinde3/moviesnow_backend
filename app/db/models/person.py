@@ -46,20 +46,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
-
-
-# ──────────────────────────────────────────────────────────────
-# 🔤 Enum: PersonGender
-# ──────────────────────────────────────────────────────────────
-class PersonGender(str, Enum):
-    """Lightweight gender taxonomy for display and inclusive filtering."""
-
-    MALE = "male"
-    FEMALE = "female"
-    NON_BINARY = "non_binary"
-    OTHER = "other"
-    UNKNOWN = "unknown"
-
+from app.schemas.enums import PersonGender
 
 # ──────────────────────────────────────────────────────────────
 # 🧱 Model: Person

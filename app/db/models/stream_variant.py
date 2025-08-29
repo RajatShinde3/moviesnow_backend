@@ -49,52 +49,12 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from uuid import uuid4
 from app.db.base_class import Base
+from app.schemas.enums import( 
+    StreamProtocol, Container,
+    VideoCodec, AudioCodec,
+    DRMType, HDRFormat
 
-
-# ──────────────────────────────────────────────────────────────
-# 🔤 Enums
-# ──────────────────────────────────────────────────────────────
-class StreamProtocol(PyEnum):
-    HLS = "HLS"              # HTTP Live Streaming
-    DASH = "DASH"            # MPEG‑DASH
-    PROGRESSIVE = "PROGRESSIVE"  # direct MP4 (download/offline)
-
-
-class Container(PyEnum):
-    TS = "TS"                # MPEG‑TS (HLS legacy)
-    FMP4 = "FMP4"            # fragmented MP4 (HLS/DASH CMAF)
-    MP4 = "MP4"              # progressive MP4
-
-
-class VideoCodec(PyEnum):
-    H264 = "H264"
-    H265 = "H265"            # HEVC
-    VP9 = "VP9"
-    AV1 = "AV1"
-    NONE = "NONE"            # audio‑only
-
-
-class AudioCodec(PyEnum):
-    AAC = "AAC"
-    AC3 = "AC3"
-    EAC3 = "EAC3"            # Dolby Digital Plus
-    OPUS = "OPUS"
-    NONE = "NONE"            # video‑only (uncommon)
-
-
-class DRMType(PyEnum):
-    NONE = "NONE"
-    WIDEVINE = "WIDEVINE"
-    FAIRPLAY = "FAIRPLAY"
-    PLAYREADY = "PLAYREADY"
-
-
-class HDRFormat(PyEnum):
-    SDR = "SDR"
-    HDR10 = "HDR10"
-    HLG = "HLG"
-    DOLBY_VISION = "DOLBY_VISION"
-
+)
 
 # ──────────────────────────────────────────────────────────────
 # 🎬 Model

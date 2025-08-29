@@ -49,34 +49,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
+from app.schemas.enums import TerritoryMode, DistributionKind, DeviceClass
 from app.db.base_class import Base
-
-
-# ──────────────────────────────────────────────────────────────
-# 🔤 Enums
-# ──────────────────────────────────────────────────────────────
-class TerritoryMode(PyEnum):
-    GLOBAL = "GLOBAL"     # worldwide, no country filtering
-    INCLUDE = "INCLUDE"   # *only* in listed countries
-    EXCLUDE = "EXCLUDE"   # *everywhere except* listed countries
-
-
-class DistributionKind(PyEnum):
-    SVOD = "SVOD"         # subscription VOD
-    AVOD = "AVOD"         # ad‑supported VOD
-    TVOD = "TVOD"         # transactional (rental)
-    EST = "EST"           # electronic sell‑through (purchase)
-    FREE = "FREE"         # free (no login/payment), often with ads
-
-
-class DeviceClass(PyEnum):
-    WEB = "WEB"
-    MOBILE = "MOBILE"
-    TV = "TV"
-    TABLET = "TABLET"
-    CONSOLE = "CONSOLE"
-    OTHER = "OTHER"
-
 
 # ──────────────────────────────────────────────────────────────
 # 📦 Model

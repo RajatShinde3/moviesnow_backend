@@ -49,36 +49,9 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql.expression import nullslast
-
+from app.schemas.enums import CollectionVisibility, CollectionKind
 from app.db.base_class import Base
 
-
-# ──────────────────────────────────────────────────────────────
-# 🔤 Enums
-# ──────────────────────────────────────────────────────────────
-class CollectionVisibility(PyEnum):
-    """Visibility scope for a collection."""
-
-    PUBLIC = "PUBLIC"
-    UNLISTED = "UNLISTED"
-    PRIVATE = "PRIVATE"
-
-
-class CollectionKind(PyEnum):
-    """Semantic type of a collection.
-
-    • FRANCHISE  – grouped IP (e.g., "The Avengers Collection")
-    • THEME      – seasonal / genre mixes (e.g., "Holiday Classics")
-    • EDITORIAL  – curated storefront rows
-    • PLAYLIST   – user‑created lists
-    • SERIES_SET – grouped limited/anthology series
-    """
-
-    FRANCHISE = "FRANCHISE"
-    THEME = "THEME"
-    EDITORIAL = "EDITORIAL"
-    PLAYLIST = "PLAYLIST"
-    SERIES_SET = "SERIES_SET"
 
 
 # ──────────────────────────────────────────────────────────────

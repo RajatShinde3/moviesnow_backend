@@ -43,18 +43,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
-
-
-# ───────────────────────────────────────────────────────────────
-# Enums
-# ───────────────────────────────────────────────────────────────
-class ModerationStatus(PyEnum):
-    """Lifecycle of a review in the moderation system."""
-
-    PENDING = "PENDING"
-    APPROVED = "APPROVED"
-    REJECTED = "REJECTED"
-    REMOVED = "REMOVED"  # admin hard‑remove but keep row for audit
+from app.schemas.enums import ModerationStatus
 
 
 # ───────────────────────────────────────────────────────────────

@@ -48,21 +48,8 @@ from sqlalchemy.orm import relationship, backref
 from sqlalchemy.types import Numeric
 
 from app.db.base_class import Base
+from app.schemas.enums import ArtworkKind
 
-
-# ──────────────────────────────────────────────────────────────
-# 🔤 Enum: ArtworkKind
-# ──────────────────────────────────────────────────────────────
-class ArtworkKind(str, Enum):
-    """Classifier for image usage/placement."""
-
-    POSTER = "POSTER"        # portrait key art for detail pages
-    BACKDROP = "BACKDROP"    # wide hero / background
-    LOGO = "LOGO"            # transparent title treatment
-    THUMBNAIL = "THUMBNAIL"  # grid/list tiles
-    STILL = "STILL"          # episodic scene still / preview
-    BANNER = "BANNER"        # marketing banner (wider than backdrop)
-    CARD = "CARD"            # 2:3 or 3:2 editorial card
 
 
 # ──────────────────────────────────────────────────────────────

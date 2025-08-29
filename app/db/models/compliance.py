@@ -45,56 +45,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
-
+from app.schemas.enums import CertificationSystem, AdvisoryKind, AdvisorySeverity
 from app.db.base_class import Base
-
-
-# ──────────────────────────────────────────────────────────────
-# 📚 Enums
-# ──────────────────────────────────────────────────────────────
-class CertificationSystem(str, Enum):
-    """Common rating boards (extend as needed)."""
-
-    MPAA_US = "MPAA_US"         # G/PG/PG-13/R/NC-17 (films)
-    TVPG_US = "TVPG_US"         # TV-Y/TV-PG/TV-MA (TV)
-    BBFC_UK = "BBFC_UK"         # U/PG/12A/15/18
-    CBFC_IN = "CBFC_IN"         # U/U-A/A/S
-    FSK_DE = "FSK_DE"           # 0/6/12/16/18
-    ACB_AU = "ACB_AU"           # G/PG/M/MA15+/R18+
-    OFLC_NZ = "OFLC_NZ"
-    EIRIN_JP = "EIRIN_JP"
-    CNC_FR = "CNC_FR"
-    IFCO_IE = "IFCO_IE"
-    OTHER = "OTHER"
-
-
-class AdvisoryKind(str, Enum):
-    """High‑level advisory categories (concise & useful)."""
-
-    VIOLENCE = "VIOLENCE"
-    SEXUAL_CONTENT = "SEXUAL_CONTENT"
-    NUDITY = "NUDITY"
-    LANGUAGE = "LANGUAGE"
-    DRUGS = "DRUGS"
-    ALCOHOL_TOBACCO = "ALCOHOL_TOBACCO"
-    HORROR_FRIGHTENING = "HORROR_FRIGHTENING"
-    SUICIDE_SELF_HARM = "SUICIDE_SELF_HARM"
-    DISCRIMINATION = "DISCRIMINATION"
-    BLOOD_GORE = "BLOOD_GORE"
-    MATURE_THEMES = "MATURE_THEMES"
-    GAMBLING = "GAMBLING"
-    SPOILERS = "SPOILERS"
-    OTHER = "OTHER"
-
-
-class AdvisorySeverity(str, Enum):
-    """Simple, human‑readable intensity scale."""
-
-    NONE = "NONE"
-    MILD = "MILD"
-    MODERATE = "MODERATE"
-    SEVERE = "SEVERE"
-
 
 # ──────────────────────────────────────────────────────────────
 # 🧱 Model: Certification

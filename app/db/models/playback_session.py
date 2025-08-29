@@ -58,40 +58,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from uuid import uuid4
 from app.db.base_class import Base
-
-
-# ───────────────────────────────────────────────────────────────
-# Enums
-# ───────────────────────────────────────────────────────────────
-class PlaybackStatus(PyEnum):
-    INITIATED = "INITIATED"   # created, before first bytes rendered
-    PLAYING   = "PLAYING"     # actively rendering frames
-    PAUSED    = "PAUSED"      # paused by user/app
-    ENDED     = "ENDED"       # ended normally or with a reason
-    ABORTED   = "ABORTED"     # crashed/closed without graceful end
-
-
-class EndReason(PyEnum):
-    COMPLETED     = "COMPLETED"      # reached end of content
-    USER_EXIT     = "USER_EXIT"      # user navigated away/closed
-    ERROR         = "ERROR"          # unrecoverable playback error
-    TIMEOUT       = "TIMEOUT"        # idle/pause timeout
-    NETWORK       = "NETWORK"        # network loss or congestion
-    DRM           = "DRM"            # license/DRM failure
-    UNKNOWN       = "UNKNOWN"
-
-
-class DrmScheme(PyEnum):
-    NONE      = "NONE"
-    WIDEVINE  = "WIDEVINE"
-    FAIRPLAY  = "FAIRPLAY"
-    PLAYREADY = "PLAYREADY"
-
-
-class StreamProtocol(PyEnum):
-    HLS  = "HLS"
-    DASH = "DASH"
-    MP4  = "MP4"
+from app.schemas.enums import PlaybackStatus, EndReason, DrmScheme, StreamProtocol
 
 
 # ───────────────────────────────────────────────────────────────

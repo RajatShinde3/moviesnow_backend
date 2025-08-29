@@ -39,12 +39,6 @@ except Exception:
 
 # -- Middlewares & security ---------------------------------------------------
 from app.middleware.request_id import RequestIDMiddleware
-try:
-    # Optional: if you have org context middleware in your repo
-    from app.middleware.org_context_middleware import OrgContextMiddleware  # type: ignore
-except Exception:  # pragma: no cover
-    OrgContextMiddleware = None  # type: ignore
-
 from app.security_headers import install_security, configure_cors
 
 # -- Rate limiting ------------------------------------------------------------
@@ -150,19 +144,16 @@ def create_app() -> FastAPI:
     # ── Middlewares (order matters) ─────────────────────────────────────────
     app.add_middleware(RequestIDMiddleware)  # 1) Correlation ID
 
-    if OrgContextMiddleware:                 # 2) Optional org context
-        app.add_middleware(OrgContextMiddleware)
-
-    # 3) Security headers + HTTPS redirect (config via env)
+    # 2) Security headers + HTTPS redirect (config via env)
     install_security(app)
 
-    # 4) CORS (allow-list/regex via env; exposes X-Request-ID, ETag, etc.)
+    # 3) CORS (allow-list/regex via env; exposes X-Request-ID, ETag, etc.)
     configure_cors(app)
 
-    # 5) GZip (safe defaults)
+    # 4) GZip (safe defaults)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
-    # 6) Rate limiter (SlowAPI middleware + 429 handler)
+    # 5) Rate limiter (SlowAPI middleware + 429 handler)
     try:
         if install_rate_limiter:
             install_rate_limiter(app)
@@ -172,7 +163,7 @@ def create_app() -> FastAPI:
     except Exception:
         logger.exception("Failed to install rate limiter")
 
-    # 7) Strip/override Server header at the end of the chain
+    # 6) Strip/override Server header at the end of the chain
     @app.middleware("http")
     async def _strip_server_header(request: Request, call_next: Callable) -> Response:
         """Remove the `Server` header to avoid leaking implementation details."""
@@ -208,7 +199,7 @@ def create_app() -> FastAPI:
     # ── Routers (versioned API) ─────────────────────────────────────────────
     try:
         # Expect your aggregate v1 router to exist; skip gracefully if not yet added.
-        from app.api.v1 import router as api_v1_router  # type: ignore
+        from app.api.v1 import routers as api_v1_router  # type: ignore
         app.include_router(
             api_v1_router,
             prefix=getattr(settings, "API_V1_STR", "/api/v1"),

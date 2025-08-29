@@ -59,27 +59,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
-
-
-# ──────────────────────────────────────────────────────────────
-# 🔤 Enum: MediaAssetKind
-# ──────────────────────────────────────────────────────────────
-class MediaAssetKind(str, Enum):
-    """Classifier for asset kind (kept as an Enum for type‑safety)."""
-
-    POSTER = "poster"
-    BACKDROP = "backdrop"
-    BANNER = "banner"
-    THUMBNAIL = "thumbnail"
-    STILL = "still"
-    TRAILER = "trailer"
-    TEASER = "teaser"
-    CLIP = "clip"
-    VIDEO = "video"
-    IMAGE = "image"
-    SUBTITLE = "subtitle"
-    CAPTION = "caption"
-    AUDIO = "audio"
+from app.schemas.enums import MediaAssetKind
 
 
 # ──────────────────────────────────────────────────────────────

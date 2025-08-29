@@ -63,23 +63,7 @@ from sqlalchemy.dialects.postgresql import UUID, ARRAY, BIGINT
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
-
-
-# ──────────────────────────────────────────────────────────────
-# 📚 Enums
-# ──────────────────────────────────────────────────────────────
-class TitleType(str, Enum):
-    MOVIE = "MOVIE"
-    SERIES = "SERIES"
-
-
-class TitleStatus(str, Enum):
-    ANNOUNCED = "ANNOUNCED"
-    IN_PRODUCTION = "IN_PRODUCTION"
-    RELEASED = "RELEASED"
-    ENDED = "ENDED"
-    CANCELED = "CANCELED"
-    HIATUS = "HIATUS"
+from app.schemas.enums import TitleType, TitleStatus
 
 
 # ──────────────────────────────────────────────────────────────

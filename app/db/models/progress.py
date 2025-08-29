@@ -49,15 +49,8 @@ from sqlalchemy.orm import relationship
 from uuid import uuid4
 from app.db.base_class import Base
 from app.db.models.availability import DeviceClass  # share enum across models
+from app.schemas.enums import ProgressStatus
 
-
-class ProgressStatus(PyEnum):
-    """High‑level playback state."""
-
-    IN_PROGRESS = "IN_PROGRESS"
-    COMPLETED = "COMPLETED"
-    RESET = "RESET"          # user scrubbed back / started over
-    ABANDONED = "ABANDONED"  # explicitly abandoned or long‑idle
 
 
 class Progress(Base):

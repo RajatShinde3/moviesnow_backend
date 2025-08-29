@@ -54,20 +54,7 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
-
-
-# ──────────────────────────────────────────────────────────────
-# 🔤 Enum: SubtitleFormat
-# ──────────────────────────────────────────────────────────────
-class SubtitleFormat(PyEnum):
-    SRT = "SRT"
-    VTT = "VTT"          # WebVTT
-    ASS = "ASS"
-    TTML = "TTML"        # IMSC/TTML/DFXP family
-    SCC = "SCC"
-    SMI = "SMI"
-    UNKNOWN = "UNKNOWN"
-
+from app.schemas.enums import SubtitleFormat
 
 class Subtitle(Base):
     """Logical subtitle/caption track bound to a media asset and a catalog scope."""
