@@ -5,11 +5,18 @@ from httpx import AsyncClient
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 import pyotp
-
+import uuid
 from app.db.models import User
 
 BASE = "/api/v1/auth/mfa"  # change to "/api/v1/mfa" if that's how you mounted
 
+def _unique_email(tag: str = "mfa2") -> str:
+    return f"{tag}-{uuid.uuid4().hex[:10]}@example.com"
+
+def _with_ip(headers: dict, ip: str) -> dict:
+    h = dict(headers)
+    h["X-Forwarded-For"] = ip
+    return h
 
 @pytest.mark.anyio
 async def test_enable_returns_secret_and_qr_and_sets_pending_secret(
@@ -34,7 +41,6 @@ async def test_enable_returns_secret_and_qr_and_sets_pending_secret(
     assert refreshed.totp_secret is not None
     assert refreshed.mfa_enabled is False
 
-
 @pytest.mark.anyio
 async def test_verify_happy_path_enables_mfa(
     async_client: AsyncClient,
@@ -44,17 +50,17 @@ async def test_verify_happy_path_enables_mfa(
     """
     ✅ Verify with a correct TOTP code flips mfa_enabled=True.
     """
-    user, headers = await user_with_headers(email="mfa2@example.com", password="Secret123!")
+    user, headers = await user_with_headers(email=_unique_email("mfa2"), password="Secret123!")
 
-    # First, call /mfa/enable to create a secret
-    en = await async_client.post(f"{BASE}/enable", headers=headers)
-    assert en.status_code == 200
+    # Create a secret (use unique IP so per-IP limits never collide across tests)
+    en = await async_client.post(f"{BASE}/enable", headers=_with_ip(headers, "203.0.113.20"))
+    assert en.status_code == 200, en.text
     secret = en.json()["secret"]
 
     # Compute a valid code and verify
     code = pyotp.TOTP(secret).now()
     vr = await async_client.post(f"{BASE}/verify", headers=headers, json={"code": code})
-    assert vr.status_code == 200
+    assert vr.status_code == 200, vr.text
     payload = vr.json()
     assert payload["message"].lower().startswith("mfa enabled")
 

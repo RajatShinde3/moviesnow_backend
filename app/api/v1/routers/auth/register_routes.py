@@ -19,7 +19,9 @@ from . import (
     audit_log,
     recovery_codes,
     reauth,
-    trusted_devices
+    trusted_devices,
+    sessions,
+    activity
 )
 
 # Optional: add no-store headers to every auth response via dependency
@@ -60,9 +62,9 @@ def build_auth_router(
     }
 
     # ── [Step 4] Register core auth first (logical grouping) ──────────────────
-    router.include_router(signup.router,        responses=common_responses)          # /signup
-    router.include_router(login.router,         responses=common_responses)          # /login, /mfa-login, /switch-org, /my-orgs
-    router.include_router(refresh_logout.router, responses=common_responses)         # /refresh-token, /logout, /revoke-token
+    router.include_router(signup.router,              responses=common_responses)    # /signup
+    router.include_router(login.router,               responses=common_responses)    # /login, /mfa-login, /switch-org, /my-orgs
+    router.include_router(refresh_logout.router,      responses=common_responses)    # /refresh-token, /logout, /revoke-token
 
     # ── [Step 5] MFA & verification flows ─────────────────────────────────────
     router.include_router(mfa.router,                 responses=common_responses)    # /mfa/enable, /mfa/verify, /mfa/disable
@@ -80,7 +82,10 @@ def build_auth_router(
 
     router.include_router(recovery_codes.router,      responses=common_responses)    
     router.include_router(reauth.router,              responses=common_responses)    
-    router.include_router(trusted_devices.router,     responses=common_responses)    
+    router.include_router(trusted_devices.router,     responses=common_responses)
+    router.include_router(sessions.router,            responses=common_responses)    
+    router.include_router(activity.router,            responses=common_responses)    
+
 
     return router
 

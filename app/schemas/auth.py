@@ -1,7 +1,7 @@
 # app/schemas/auth.py
 
 from pydantic import BaseModel, EmailStr, Field, constr, SecretStr, ConfigDict
-from typing import Optional, Union, Dict, List
+from typing import Optional, Union, Dict, List, Any
 from uuid import UUID
 from app.schemas.enums import LoginMode, OrgRole
 from datetime import datetime, timezone
@@ -97,6 +97,85 @@ class TokenRevokeRequest(BaseModel):
     organization_id: Optional[UUID] = None
 
 
+# ─────────────────────────────────────────────────────────────
+# Activity feed models
+# ─────────────────────────────────────────────────────────────
+class ActivityItem(BaseModel):
+    """
+    One entry in a user's auth/security activity feed.
+
+    Notes
+    -----
+    - `ip` and `user_agent` are plain strings (not strict IP types) to avoid
+      validation issues when upstream provides bytes/IPv4Address, etc.
+    - `geo`, `device`, and `meta` are flexible maps so you can add fields
+      without breaking clients.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: Optional[str] = Field(
+        None, description="Source event identifier (DB id or ring-buffer uuid)."
+    )
+    at: datetime = Field(
+        ..., description="Event timestamp in UTC."
+    )
+    action: str = Field(
+        ..., min_length=1, description="Action name (e.g., LOGIN_SUCCESS, MFA_CHALLENGE)."
+    )
+    status: str = Field(
+        ..., min_length=1, description="Outcome/status (e.g., SUCCESS, FAILURE)."
+    )
+    ip: Optional[str] = Field(
+        None, description="Client IP address as a string."
+    )
+    user_agent: Optional[str] = Field(
+        None, description="Original or trimmed user agent string."
+    )
+    geo: Optional[Dict[str, Any]] = Field(
+        None, description="Geolocation data (e.g., country, region, city, lat/lon)."
+    )
+    device: Optional[Dict[str, Any]] = Field(
+        None, description="Device details (e.g., os, browser, model)."
+    )
+    meta: Optional[Dict[str, Any]] = Field(
+        None, description="Additional metadata; keys vary by event."
+    )
+
+
+class ActivityResponse(BaseModel):
+    """
+    Pageless response wrapper for the activity feed.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    total: int = Field(..., ge=0, description="Total number of items returned.")
+    items: List[ActivityItem] = Field(
+        default_factory=list, description="Activity items in reverse chronological order."
+    )
+
+
+class AlertsSubscription(BaseModel):
+    """
+    User's security alert preferences.
+
+    Defaults
+    --------
+    All flags default to True, so users receive alerts unless they opt out.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    new_device: bool = Field(
+        True, description="Alert on sign-in from a new device."
+    )
+    new_location: bool = Field(
+        True, description="Alert on sign-in from a new location."
+    )
+    impossible_travel: bool = Field(
+        True, description="Alert on sign-ins that imply impossible travel velocity."
+    )
+    email_notifications: bool = Field(
+        True, description="Send alerts via email."
+    )
 # ──────────────── General Purpose ────────────────
 class MessageResponse(BaseModel):
     message: str
@@ -207,6 +286,50 @@ class RevokeResult(BaseModel):
     revoked: int = Field(..., ge=0, description="How many trusted devices were revoked.")
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class SessionItem(BaseModel):
+    """
+    One active refresh-token session handle.
+
+    Fields
+    ------
+    jti:          Refresh token JTI (opaque identifier; never the token itself)
+    created_at:   When the refresh token was created (UTC)
+    expires_at:   When the refresh token expires (UTC)
+    ip_address:   Last known client IP (from metadata or DB)
+    user_agent:   Last known User-Agent (from metadata)
+    last_seen:    Best-effort last activity timestamp (from metadata)
+    session_id:   Logical session lineage ID (often equals first JTI in chain)
+    current:      Whether this entry represents the caller’s current session
+    """
+    jti: str = Field(..., description="Refresh token JTI")
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+    expires_at: datetime = Field(..., description="Expiry timestamp (UTC)")
+    ip_address: Optional[str] = Field(None, description="Client IP (best-effort)")
+    user_agent: Optional[str] = Field(None, description="User-Agent (best-effort)")
+    last_seen: Optional[datetime] = Field(None, description="Last activity (best-effort)")
+    session_id: Optional[str] = Field(None, description="Session lineage identifier")
+    current: bool = Field(False, description="True if this is the current session")
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True,
+        json_encoders={},  # FastAPI handles datetime → ISO-8601
+    )
+
+
+
+class SessionsListResponse(BaseModel):
+    """
+    Wrapper for session inventory responses.
+    """
+    total: int = Field(..., ge=0, description="Number of sessions returned")
+    sessions: List[SessionItem] = Field(default_factory=list, description="Session entries")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 
 
 # ──────────────── Current User Response ────────────────

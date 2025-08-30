@@ -1,83 +1,107 @@
 # app/api/v1/auth/sessions.py
+from __future__ import annotations
 
 """
-Enterprise-grade **Session Inventory & Revocation** Router
-=========================================================
+MoviesNow — Session Inventory & Revocation Router (prod-ready)
+=============================================================
 
-This router exposes **self-service session management** for users:
+Purpose
+-------
+Expose **self-service session management** for end users:
 
-Endpoints
----------
-- GET    /sessions            — list active sessions for the current user
+- GET    /sessions            — list active sessions (refresh handles) for current user
 - DELETE /sessions/{jti}      — revoke a specific session (device sign-out)
 - DELETE /sessions            — revoke **all** sessions (global sign-out)
 - DELETE /sessions/others     — revoke all sessions **except current** (best-effort)
 
-Design goals
-------------
-- **Authoritative**: intersect Redis `session:{user_id}` with DB `RefreshToken`
-- **Privacy-safe**: never return raw tokens; use metadata (IP/UA/created)
-- **No-store**: responses marked with cache-control hardening
-- **Rate-limited**: per-route limits with IP+user keying (from your limiter)
-- **Best-effort current session detection**:
-  - Prefer comparing access token `session_id` with `sessionmeta:{jti}.session_id`
-  - Fallback: if metadata is missing for a JTI but its value equals the access
-    token’s `session_id` or `jti`, treat it as **current** and keep it
-
-Integration notes
+Design Highlights
 -----------------
-When rotating refresh tokens, also record session metadata in Redis:
-`HSET sessionmeta:{jti} session_id <sid> ip <ip> ua <ua> created_at <iso> last_seen <iso>`
-and optionally `EXPIRE sessionmeta:{jti} <seconds_until_refresh_expiry>`.
+- **Authoritative**: Redis set `session:{user_id}` intersected with DB `RefreshToken`
+- **Privacy-safe**: never returns raw tokens; replies with metadata (IP/UA/timestamps)
+- **No-store**: responses hardened with `Cache-Control: no-store`
+- **Rate-limited**: per-route limits (user/IP keying; see `app.core.limiter`)
+- **Current session detection**:
+  1) Prefer `sessionmeta:{jti}.session_id` vs access token claim `session_id`
+  2) Fallback: if no metadata but JTI equals access bearer’s `session_id` **or** `jti`,
+     treat as **current**
+- **Idempotent** destructive ops; **reuse sentinel** `revoked:jti:{jti}` set in Redis
+- **Resilient**: DB/Redis best-effort, failures don’t leak cross-account data
+- **Audit**: structured events recorded via `log_audit_event(...)`
 
-Security
---------
-- All destructive operations are auditable and **idempotent**
-- Revocation also sets a Redis sentinel `revoked:jti:{jti}` for reuse detection
-- `DELETE /sessions/others` falls back to `DELETE /sessions` if we cannot
-  confidently keep the current session without leaking side-channel info
+Integration Notes
+-----------------
+When you mint/rotate refresh tokens, also write metadata:
+
+    HSET sessionmeta:{jti} session_id <sid> ip <ip> ua <ua> created_at <iso> last_seen <iso>
+    EXPIRE sessionmeta:{jti} <seconds_until_refresh_expiry>
 """
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
-from jose import jwt, JWTError
+from jose import JWTError, jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.redis_client import redis_wrapper
 from app.core.limiter import rate_limit
+from app.core.redis_client import redis_wrapper
 from app.core.security import get_current_user
-from app.db.session import get_async_db
-from app.security_headers import set_sensitive_cache
-from app.db.models.user import User
 from app.db.models.token import RefreshToken
-from app.schemas.auth import SessionItem, SessionsListResponse, RevokeResult
-from app.services.audit_log_service import log_audit_event
+from app.db.models.user import User
+from app.db.session import get_async_db
+from app.schemas.auth import RevokeResult, SessionItem, SessionsListResponse
+from app.security_headers import set_sensitive_cache
+from app.services.audit_log_service import AuditEvent, log_audit_event
 
 router = APIRouter()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 🔑 Redis keys
-# ──────────────────────────────────────────────────────────────────────────────
-SESSION_KEY = lambda user_id: f"session:{user_id}"           # Set of refresh JTIs for a user
-SESSION_META_KEY = lambda jti: f"sessionmeta:{jti}"          # Hash: session_id, ip, ua, created_at, last_seen
-REVOKED_KEY = lambda jti: f"revoked:jti:{jti}"               # String sentinel (TTL = time left until expiry)
+# ──────────────────────────────────────────────────────────────
+# 🔑 Redis key builders
+# ──────────────────────────────────────────────────────────────
+SESSION_KEY = lambda user_id: f"session:{user_id}"      # Set of refresh JTIs for a user
+SESSION_META_KEY = lambda jti: f"sessionmeta:{jti}"     # Hash: session_id, ip, ua, created_at, last_seen
+REVOKED_KEY = lambda jti: f"revoked:jti:{jti}"          # String sentinel (TTL = time left until expiry)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # 🧩 Small helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 def _b2s(v):
     return v.decode() if isinstance(v, (bytes, bytearray)) else v
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-async def _decode_access_claims(request: Request) -> dict:
-    """Decode Authorization bearer and return claims; 401 on failure."""
+
+def _as_str_or_none(value) -> Optional[str]:
+    """
+    Normalize possibly typed IP/UA fields (IPv4Address / IPv6Address / bytes / str) to plain str.
+    Returns None when not representable (keeps Pydantic happy).
+    """
+    if value is None:
+        return None
+    try:
+        return str(_b2s(value))
+    except Exception:
+        return None
+
+
+async def _decode_access_claims(request: Request) -> Dict:
+    """
+    Decode the Authorization bearer and return claims.
+
+    Security
+    --------
+    - Requires `sub` and `exp` claims.
+    - Uses HS* per settings (no audience or issuer checks here; add if you enforce them upstream).
+
+    Raises
+    ------
+    HTTPException(401) for missing/invalid token.
+    """
     authz = request.headers.get("authorization") or request.headers.get("Authorization")
     if not authz or not authz.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing credentials")
@@ -92,8 +116,15 @@ async def _decode_access_claims(request: Request) -> dict:
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
-async def _read_session_meta(jti: str) -> dict:
-    """Read optional session metadata for a JTI; normalize types."""
+
+async def _read_session_meta(jti: str) -> Dict:
+    """
+    Read optional Redis metadata for a JTI; normalize time fields and return {} when absent.
+
+    Keys
+    ----
+    - session_id, ip, ua, created_at, last_seen
+    """
     r = redis_wrapper.client
     try:
         meta = await r.hgetall(SESSION_META_KEY(jti))
@@ -110,8 +141,9 @@ async def _read_session_meta(jti: str) -> dict:
                 out[ts_key] = None
     return out
 
+
 async def _list_active_jtis(user_id: UUID) -> List[str]:
-    """Read the Redis set of active JTIs for a user (best-effort)."""
+    """Read the Redis set of active JTIs for a user (best-effort, not authoritative)."""
     r = redis_wrapper.client
     try:
         members = await r.smembers(SESSION_KEY(user_id))
@@ -119,16 +151,28 @@ async def _list_active_jtis(user_id: UUID) -> List[str]:
         members = set()
     return sorted({_b2s(m) for m in (members or set())})
 
+
 async def _delete_sessionmeta_safe(jti: str) -> None:
-    """Best-effort removal of per-JTI metadata on revocation."""
+    """Best-effort removal of per-JTI metadata on revocation (never raises)."""
     try:
         await redis_wrapper.client.delete(SESSION_META_KEY(jti))
     except Exception:
         pass
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+async def _set_reuse_sentinel(jti: str, ttl_seconds: int) -> None:
+    """Write a reuse-detection sentinel with a sane TTL floor (never raises)."""
+    try:
+        ttl = max(1, int(ttl_seconds))
+        await redis_wrapper.client.setex(REVOKED_KEY(jti), ttl, "revoked")
+    except Exception:
+        # Availability-first: don't throw from router
+        pass
+
+
+# ──────────────────────────────────────────────────────────────
 # 🔎 GET /sessions — list active sessions
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 @router.get(
     "/sessions",
     response_model=SessionsListResponse,
@@ -146,26 +190,24 @@ async def list_sessions(
 
     Behavior
     --------
-    - Reads Redis `session:{user_id}`; intersects with DB `RefreshToken` rows
-      that are not revoked and not expired.
-    - Enriches each item with optional Redis metadata (`sessionmeta:{jti}`) when present.
-    - Attempts to mark which entry is the **current** by comparing the access token
-      `session_id` with metadata `session_id`; also treats a JTI that equals the
-      access bearer’s `session_id`/`jti` as current if metadata is missing.
+    - Reads Redis `session:{user_id}` and intersects with DB `RefreshToken` rows
+      that are **not revoked** and **not expired**.
+    - Augments with optional Redis metadata (`sessionmeta:{jti}`).
+    - Marks which entry is **current** by comparing access token `session_id`
+      with metadata `session_id`; if metadata is absent but the access token’s
+      `session_id`/`jti` equals the JTI, treat as current.
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
     set_sensitive_cache(response)
 
-    # ── [Step 1] Identify caller + current access session lineage ────────────
     claims = await _decode_access_claims(request)
     user_id = current_user.id
     current_sid = claims.get("session_id") or claims.get("jti")
 
-    # ── [Step 2] Load candidate JTIs; fallback to DB when empty ──────────────
     jtis = await _list_active_jtis(user_id)
     now = _now_utc()
 
-    tokens_by_jti: dict[str, RefreshToken] = {}
+    # Load active rows either by JTIs from Redis, or fall back to recent DB rows
+    tokens_by_jti: Dict[str, RefreshToken] = {}
     if jtis:
         q = select(RefreshToken).where(
             RefreshToken.user_id == user_id,
@@ -176,7 +218,6 @@ async def list_sessions(
         results = (await db.execute(q)).scalars().all()
         tokens_by_jti = {t.jti: t for t in results}
     else:
-        # Fallback: recent active tokens from DB (no leakage of other users)
         q = (
             select(RefreshToken)
             .where(
@@ -191,20 +232,18 @@ async def list_sessions(
         tokens_by_jti = {t.jti: t for t in results}
         jtis = list(tokens_by_jti.keys())
 
-    # ── [Step 3] Build response list (augment with sessionmeta) ──────────────
     items: List[SessionItem] = []
     for jti in jtis:
         t = tokens_by_jti.get(jti)
         if not t:
-            # Not in DB or inactive — stale Redis; skip silently
+            # Stale Redis member; ignore silently
             continue
+
         meta = await _read_session_meta(jti)
-        # Best-effort "current" detection:
         is_current = False
         if meta.get("session_id"):
             is_current = (meta.get("session_id") == current_sid)
         else:
-            # Fallback: if access token's session_id/jti equals this JTI, treat as current
             if current_sid and str(current_sid) == jti:
                 is_current = True
 
@@ -213,21 +252,28 @@ async def list_sessions(
                 jti=jti,
                 created_at=t.created_at,
                 expires_at=t.expires_at,
-                ip_address=meta.get("ip") or getattr(t, "ip_address", None),
-                user_agent=meta.get("ua"),
+                ip_address=_as_str_or_none(meta.get("ip")) or _as_str_or_none(getattr(t, "ip_address", None)),
+                user_agent=_as_str_or_none(meta.get("ua")),
                 last_seen=meta.get("last_seen"),
                 session_id=meta.get("session_id"),
                 current=is_current,
             )
         )
 
-    # ── [Step 4] Audit read & respond ────────────────────────────────────────
-    await log_audit_event(db, action="SESSIONS_LIST", user=current_user, status="SUCCESS", request=request)
+    await log_audit_event(
+        db,
+        action=AuditEvent.SESSIONS_LIST,
+        status="SUCCESS",
+        user=current_user,
+        request=request,
+        meta_data={"returned": len(items)},
+    )
     return SessionsListResponse(total=len(items), sessions=items)
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────
 # ❌ DELETE /sessions/{jti} — revoke a specific session
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 @router.delete(
     "/sessions/{jti}",
     response_model=RevokeResult,
@@ -244,17 +290,18 @@ async def revoke_session(
     """
     Revoke a specific **refresh token session** by JTI.
 
-    Behavior
-    --------
-    - Idempotent: revoking an already revoked/nonexistent JTI returns `{revoked: 0}`.
-    - Only affects the **caller’s** sessions.
-    - Sets Redis sentinel `revoked:jti:{jti}` (with TTL until original expiry),
-      removes the JTI from `session:{user_id}`, and deletes `sessionmeta:{jti}`.
+    Idempotency
+    -----------
+    - If the JTI is unknown, already revoked, or expired, we still clean up Redis
+      (remove from `session:{user_id}`, delete `sessionmeta:{jti}`) and return `{revoked: 0}`.
+
+    Side-effects
+    ------------
+    - Sets Redis sentinel `revoked:jti:{jti}` (TTL = time remaining).
+    - Removes JTI from the user's Redis set; deletes metadata hash.
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
     set_sensitive_cache(response)
 
-    # ── [Step 1] Resolve token row for this user ─────────────────────────────
     now = _now_utc()
     token = (
         await db.execute(
@@ -266,33 +313,38 @@ async def revoke_session(
     ).scalar_one_or_none()
 
     if not token or token.is_revoked or token.expires_at <= now:
-        # Best-effort cleanup; no leakage beyond caller
+        # Best-effort Redis cleanup without leaking non-caller info
         try:
             r = redis_wrapper.client
             await r.srem(SESSION_KEY(current_user.id), jti)
             await _delete_sessionmeta_safe(jti)
         except Exception:
             pass
-        await log_audit_event(db, action="SESSION_REVOKE", user=current_user, status="SKIP", request=request, meta_data={"jti": jti})
+        await log_audit_event(
+            db, action=AuditEvent.SESSION_REVOKE, status="SKIP", user=current_user, request=request, meta_data={"jti": jti}
+        )
         return RevokeResult(revoked=0)
 
-    # ── [Step 2] Mark revoked in DB and set reuse sentinel ───────────────────
+    # Flip DB state
     token.is_revoked = True
     await db.commit()
 
-    ttl = max(0, int((token.expires_at - now).total_seconds()))
+    # Write sentinel + cleanup
+    ttl = max(1, int((token.expires_at - now).total_seconds()))
     r = redis_wrapper.client
-    await r.setex(REVOKED_KEY(jti), ttl, "revoked")
+    await _set_reuse_sentinel(jti, ttl)
     await r.srem(SESSION_KEY(current_user.id), jti)
     await _delete_sessionmeta_safe(jti)
 
-    # ── [Step 3] Audit & respond ─────────────────────────────────────────────
-    await log_audit_event(db, action="SESSION_REVOKE", user=current_user, status="SUCCESS", request=request, meta_data={"jti": jti})
+    await log_audit_event(
+        db, action=AuditEvent.SESSION_REVOKE, status="SUCCESS", user=current_user, request=request, meta_data={"jti": jti}
+    )
     return RevokeResult(revoked=1)
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────
 # 🔥 DELETE /sessions — revoke ALL sessions (global sign-out)
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 @router.delete(
     "/sessions",
     response_model=RevokeResult,
@@ -306,19 +358,16 @@ async def revoke_all_sessions(
     current_user: User = Depends(get_current_user),
 ) -> RevokeResult:
     """
-    Revoke **all** active refresh token sessions for the current user.
+    Revoke **all** active refresh sessions for the current user.
 
-    Behavior
-    --------
-    - Marks all DB rows `is_revoked=True` and clears `session:{user_id}` in Redis.
-    - Also writes `revoked:jti:{jti}` sentinels so token reuse is blocked.
-    - Deletes `sessionmeta:{jti}` entries for cleanliness.
-    - Idempotent; returns the number of rows flipped to revoked.
+    Implementation
+    --------------
+    - Flip DB rows `is_revoked=True` (idempotent).
+    - For each Redis JTI, write a reuse sentinel and delete metadata.
+    - Clear the Redis set `session:{user_id}`.
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
     set_sensitive_cache(response)
 
-    # ── [Step 1] DB mass update ──────────────────────────────────────────────
     rows = (
         await db.execute(
             select(RefreshToken).where(
@@ -327,44 +376,45 @@ async def revoke_all_sessions(
             )
         )
     ).scalars().all()
-    count = 0
+
     now = _now_utc()
+    count = 0
     for t in rows:
         t.is_revoked = True
         count += 1
     if count:
         await db.commit()
 
-    # ── [Step 2] Redis cleanup & reuse sentinels ─────────────────────────────
+    # Redis cleanup & sentinels
     try:
         r = redis_wrapper.client
         jtis = await r.smembers(SESSION_KEY(current_user.id))
+        # Fallback TTL if the row isn't found
         ttl_default = int(getattr(settings, "REFRESH_TOKEN_EXPIRE_DAYS", 7)) * 86400
         for j in (jtis or []):
             j_s = _b2s(j)
-            # Prefer exact TTL if we still have the row, else default
             row = next((t for t in rows if t.jti == j_s), None)
-            ttl = max(0, int((row.expires_at - now).total_seconds())) if row else ttl_default
-            await r.setex(REVOKED_KEY(j_s), ttl, "revoked")
+            ttl = max(1, int((row.expires_at - now).total_seconds())) if row else ttl_default
+            await _set_reuse_sentinel(j_s, ttl)
             await _delete_sessionmeta_safe(j_s)
         await r.delete(SESSION_KEY(current_user.id))
     except Exception:
         pass
 
-    # ── [Step 3] Audit & respond ─────────────────────────────────────────────
     await log_audit_event(
         db,
-        action="SESSIONS_REVOKE_ALL",
-        user=current_user,
+        action=AuditEvent.SESSIONS_REVOKE_ALL,
         status="SUCCESS",
+        user=current_user,
         request=request,
-        meta_data={"count": count},
+        meta_data={"revoked": count},
     )
     return RevokeResult(revoked=count)
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────
 # 🚪 DELETE /sessions/others — revoke all EXCEPT current (best-effort)
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 @router.delete(
     "/sessions/others",
     response_model=RevokeResult,
@@ -380,97 +430,129 @@ async def revoke_other_sessions(
     """
     Revoke all sessions **except the caller's current** session.
 
-    Behavior
-    --------
-    - Detects current session by reading the access token's `session_id` (or `jti`).
-    - Keeps JTIs whose `sessionmeta:{jti}.session_id` matches the current session.
-    - If metadata is missing for a JTI **but** that JTI equals the access token’s
-      `session_id`/`jti`, treat it as **current** and keep it.
-    - If metadata is missing for *all* JTIs, falls back to global sign-out to
-      avoid providing side-channel information.
+    Current detection
+    -----------------
+    - Prefer `sessionmeta:{jti}.session_id == <access session_id>`.
+    - If *no* metadata exists for any JTI, we **fall back to global sign-out**
+      to avoid side-channel leaks about which device is current.
+
+    Return value
+    ------------
+    - `revoked` counts DB rows toggled **plus** stale Redis JTIs removed.
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
     set_sensitive_cache(response)
 
-    # ── [Step 1] Determine current session lineage ───────────────────────────
     claims = await _decode_access_claims(request)
     current_sid = claims.get("session_id") or claims.get("jti")
-
-    # ── [Step 2] Load active JTIs and classify ───────────────────────────────
     user_id = current_user.id
+
     jtis = await _list_active_jtis(user_id)
     if not jtis:
-        await log_audit_event(db, action="SESSIONS_REVOKE_OTHERS", user=current_user, status="SKIP", request=request)
+        await log_audit_event(
+            db, action=AuditEvent.SESSIONS_REVOKE_OTHERS, status="SKIP",
+            user=current_user, request=request, meta_data={"reason": "no_jtis"}
+        )
         return RevokeResult(revoked=0)
+
+    # Load active rows for these JTIs
+    now = _now_utc()
+    rows = (
+        await db.execute(
+            select(RefreshToken).where(
+                RefreshToken.user_id == user_id,
+                RefreshToken.jti.in_(jtis),
+                RefreshToken.expires_at > now,
+            )
+        )
+    ).scalars().all()
+    rows_by_jti = {t.jti: t for t in rows if not t.is_revoked}
 
     keep: List[str] = []
     to_revoke: List[str] = []
     saw_any_meta = False
 
+    # Classify using metadata first; fall back to "access jti equals JTI"
     for j in jtis:
         meta = await _read_session_meta(j)
         sid = meta.get("session_id")
         if sid:
             saw_any_meta = True
-        # Keep if explicit session_id matches current
         if sid and current_sid and sid == current_sid:
             keep.append(j)
-            continue
-        # Fallback: if this JTI equals the access token’s session_id/jti, consider it current
-        if not sid and current_sid and str(current_sid) == j:
+        elif not sid and current_sid and str(current_sid) == j:
             keep.append(j)
-            continue
-        # Otherwise, candidate for revocation
-        to_revoke.append(j)
+        else:
+            to_revoke.append(j)
 
+    # If **no** sessions have metadata, safest is to revoke all (no side channels)
     if not saw_any_meta:
-        # Without any metadata, safest path is revoke all (no side-channel leaks)
-        return await revoke_all_sessions(request, response, db, current_user)
+        # Use the same DB session & user; this path must revoke & set sentinels.
+        result = await revoke_all_sessions(request, response, db, current_user)
+        await log_audit_event(
+            db,
+            action=AuditEvent.SESSIONS_REVOKE_OTHERS,
+            status="SUCCESS",
+            user=current_user,
+            request=request,
+            meta_data={"fallback": "revoke_all", "revoked": result.revoked},
+        )
+        return result
 
-    # If everything is kept, short-circuit
+    # If everything is kept, short-circuit (nothing to revoke)
     if not to_revoke:
         await log_audit_event(
-            db, action="SESSIONS_REVOKE_OTHERS", user=current_user, status="SUCCESS", request=request, meta_data={"revoked": 0, "kept": len(keep)}
+            db,
+            action=AuditEvent.SESSIONS_REVOKE_OTHERS,
+            status="SUCCESS",
+            user=current_user,
+            request=request,
+            meta_data={"revoked": 0, "kept": len(keep), "note": "nothing_to_revoke"},
         )
         return RevokeResult(revoked=0)
 
-    # ── [Step 3] Revoke selected JTIs in DB + Redis ──────────────────────────
-    now = _now_utc()
-    rows: List[RefreshToken] = []
-    if to_revoke:
-        rows = (
-            await db.execute(
-                select(RefreshToken).where(
-                    RefreshToken.user_id == user_id,
-                    RefreshToken.jti.in_(to_revoke),
-                )
-            )
-        ).scalars().all()
-
-    count = 0
-    for t in rows:
-        if not t.is_revoked and t.expires_at > now:
+    # Flip DB rows where present
+    revoked_db = 0
+    for j in to_revoke:
+        t = rows_by_jti.get(j)
+        if t and not t.is_revoked and t.expires_at > now:
             t.is_revoked = True
-            count += 1
-    if rows:
+            revoked_db += 1
+    if revoked_db:
         await db.commit()
 
+    # Redis cleanup + reuse sentinels for both DB-backed and stale JTIs
     r = redis_wrapper.client
     ttl_default = int(getattr(settings, "REFRESH_TOKEN_EXPIRE_DAYS", 7)) * 86400
+    revoked_redis_only = 0
     for j in to_revoke:
-        row = next((t for t in rows if t.jti == j), None)
-        ttl = max(0, int((row.expires_at - now).total_seconds())) if row else ttl_default
-        await r.setex(REVOKED_KEY(j), ttl, "revoked")
-        await r.srem(SESSION_KEY(user_id), j)
+        t = rows_by_jti.get(j)
+        ttl = max(1, int((t.expires_at - now).total_seconds())) if t else ttl_default
+        await _set_reuse_sentinel(j, ttl)
+        try:
+            await r.srem(SESSION_KEY(user_id), j)
+        except Exception:
+            # best effort; we still set the sentinel above
+            pass
         await _delete_sessionmeta_safe(j)
+        if not t:
+            revoked_redis_only += 1
 
-    # ── [Step 4] Audit & respond ─────────────────────────────────────────────
+    total_revoked = revoked_db + revoked_redis_only
+
     await log_audit_event(
         db,
-        action="SESSIONS_REVOKE_OTHERS",
-        user=current_user,
+        action=AuditEvent.SESSIONS_REVOKE_OTHERS,
         status="SUCCESS",
+        user=current_user,
         request=request,
-        meta_data={"revoked": count, "kept": len(keep)},
+        meta_data={
+            "current_sid": _as_str_or_none(current_sid),
+            "jtis": jtis,
+            "keep": keep,
+            "to_revoke": to_revoke,
+            "revoked_db": revoked_db,
+            "revoked_redis_only": revoked_redis_only,
+            "revoked": total_revoked,
+        },
     )
-    return RevokeResult(revoked=count)
+    return RevokeResult(revoked=total_revoked)
