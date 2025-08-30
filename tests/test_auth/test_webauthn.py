@@ -47,9 +47,13 @@ def create_reauth_token(user_id: str, session_id: str, mfa_authenticated: bool) 
     Creates a re-authentication (step-up) token for verifying sensitive operations.
     """
     expiration_time = datetime.utcnow() + timedelta(minutes=5)  
+    # Ensure all claim values are JSON serializable. PyJWT/json can't encode
+    # ``UUID`` objects directly, so cast anything passed in to ``str``. This
+    # allows tests to supply either UUIDs or raw strings without triggering
+    # ``TypeError: Object of type UUID is not JSON serializable``.
     claims = {
-        "sub": user_id,
-        "session_id": session_id,
+        "sub": str(user_id),
+        "session_id": str(session_id),
         "mfa_authenticated": mfa_authenticated,
         "exp": expiration_time,
         "typ": "reauth",
