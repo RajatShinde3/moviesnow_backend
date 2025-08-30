@@ -245,12 +245,12 @@ async def _read_recent_from_db(
                     status=str(getattr(r, "status", "") or ""),
                     ip=getattr(r, "ip_address", None),
                     user_agent=getattr(r, "user_agent", None),
-                    geo=(meta.get("geo") if isinstance(meta, dict) else None),
-                    device=(meta.get("device") if isinstance(meta, dict) else None),
+                    geo=(meta.get("geo") if isinstance(meta, dict) and isinstance(meta.get("geo"), dict) else None),
+                    device=(meta.get("device") if isinstance(meta, dict) and isinstance(meta.get("device"), dict) else None),
                     meta=meta if isinstance(meta, dict) else None,
                 )
             )
-        except Exception:
+        except Exception as e:
             # Skip malformed row
             continue
 
@@ -307,8 +307,13 @@ async def get_activity(
     # [Step 1] Query data sources
     tfilter = None if type == "all" else type
     items_db = await _read_recent_from_db(db, current_user.id, limit, tfilter)
-    items = items_db[:limit] if items_db else await _read_recent_from_redis(current_user.id, limit, tfilter)
+    items_rb = await _read_recent_from_redis(current_user.id, limit, tfilter)
 
+    # Prefer DB but include Redis fallback entries as well; then sort and limit
+    items_combined = (items_db or []) + (items_rb or [])
+    items = sorted(items_combined, key=lambda it: it.at, reverse=True)[:limit]
+
+    # Debug aid for tests: log selected actions (safe)
     # [Step 2] Audit (non-blocking)
     try:
         await log_audit_event(db, action=AuditEvent.ACTIVITY_VIEW, user=current_user, status="SUCCESS", request=request)
