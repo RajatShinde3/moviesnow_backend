@@ -1,13 +1,47 @@
-# app/core/limiter.py
 from __future__ import annotations
 
 """
-MoviesNow — Rate Limiting (SlowAPI, production-grade, org-free)
----------------------------------------------------------------
-- **User/IP-aware** key function (no org/tenant coupling)
-- Exemptions for health/docs/static and trusted IPs
-- Redis or in-memory storage (via `RATELIMIT_STORAGE_URI`)
-- Version-safe middleware installer
+MoviesNow — HTTP Rate Limiting (SlowAPI)
+========================================
+
+Highlights
+----------
+- **User/IP aware** keying: per-user when auth sets `request.state.user_id`,
+  else per-client-IP (using XFF/X-Real-IP/client.host).
+- **Production exemptions**: health/docs/static, configurable trusted IPs.
+- **Test/CI friendly**:
+    - `RATE_LIMIT_NAMESPACE`: prefixes keys so parallel runs don't collide.
+    - `RATE_LIMIT_TEST_BYPASS`: disables limits when truthy.
+    - `X-RateLimit-Bypass: 1` header can exempt a single request (opt-in).
+- **Backends**: Redis via `RATELIMIT_STORAGE_URI` or in-memory fallback.
+- **Version compatibility**: handles SlowAPI/limits API differences.
+
+Environment
+-----------
+RATE_LIMIT_ENABLED           default: "true"
+DEFAULT_RATE_LIMIT           default: "100/minute"
+RATELIMIT_STORAGE_URI        default: "" (falls back to "memory://")
+RATELIMIT_STRATEGY           default: "moving-window"  (ignored if unsupported)
+RATE_LIMIT_SKIP_PATHS        default: "/ping,/health,/metrics,/docs,/openapi.json,/static/,/favicon.ico"
+RATE_LIMIT_TRUSTED_IPS       default: "" (comma separated)
+RATE_LIMIT_NAMESPACE         default: "" (e.g., "pytest-<runid>")
+RATE_LIMIT_TEST_BYPASS       default: "" (truthy to bypass in tests/CI)
+RATE_LIMIT_BYPASS_HEADER     default: "X-RateLimit-Bypass"
+
+Usage
+-----
+    from app.core.limiter import install_rate_limiter, rate_limit, rate_limit_exempt
+
+    app = FastAPI()
+    install_rate_limiter(app)
+
+    @router.get("/expensive")
+    @rate_limit("5/second", "300/minute")
+    async def expensive(): ...
+
+    @router.get("/health")
+    @rate_limit_exempt()
+    async def health(): ...
 """
 
 import os
@@ -21,14 +55,14 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
 # ──────────────────────────────────────────────────────────────
-# ⚙️ Env & defaults
+# ⚙️ Environment & defaults
 # ──────────────────────────────────────────────────────────────
 load_dotenv()
 
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
-DEFAULT_LIMIT = os.getenv("DEFAULT_RATE_LIMIT", "100/minute").strip()            # e.g. "100/minute,1000/hour"
-STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", "").strip()                     # e.g. "redis://localhost:6379/1" or "memory://"
-STRATEGY = os.getenv("RATELIMIT_STRATEGY", "moving-window").strip()              # "fixed-window" or "moving-window"
+DEFAULT_LIMIT = os.getenv("DEFAULT_RATE_LIMIT", "100/minute").strip()
+STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", "").strip()               # e.g. "redis://localhost:6379/1" or "memory://"
+STRATEGY = os.getenv("RATELIMIT_STRATEGY", "moving-window").strip()        # "fixed-window" or "moving-window"
 
 SKIP_PATHS: List[str] = [
     p.strip()
@@ -41,59 +75,109 @@ SKIP_PATHS: List[str] = [
 
 TRUSTED_IPS: Set[str] = {ip.strip() for ip in os.getenv("RATE_LIMIT_TRUSTED_IPS", "").split(",") if ip.strip()}
 
+# Test/CI knobs
+NAMESPACE = os.getenv("RATE_LIMIT_NAMESPACE", "").strip()
+TEST_BYPASS = os.getenv("RATE_LIMIT_TEST_BYPASS", "").strip().lower() in {"1", "true", "yes", "on"}
+BYPASS_HEADER = os.getenv("RATE_LIMIT_BYPASS_HEADER", "X-RateLimit-Bypass")
 
 # ──────────────────────────────────────────────────────────────
-# 🔑 Keying & exemptions (user/ip only — org removed)
+# 🧠 Keying & exemptions (org-free)
 # ──────────────────────────────────────────────────────────────
 def _client_ip(request: Request) -> str:
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        ip = xff.split(",")[0].strip()
-        if ip:
-            return ip
-    xri = request.headers.get("x-real-ip")
-    if xri:
-        return xri.strip()
-    return get_remote_address(request) or "unknown"
+    """
+    Best-effort client IP:
+    1) X-Forwarded-For (first hop)
+    2) X-Real-IP
+    3) ASGI client.host
+    """
+    try:
+        xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+        if xff:
+            ip = xff.split(",")[0].strip()
+            if ip:
+                return ip
+        xri = request.headers.get("x-real-ip") or request.headers.get("X-Real-IP")
+        if xri:
+            return xri.strip()
+        ip = get_remote_address(request)
+        return ip or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _with_namespace(key: str) -> str:
+    """Prefix the limiter key with a namespace (useful for CI/pytest isolation)."""
+    return f"{NAMESPACE}:{key}" if NAMESPACE else key
 
 
 def get_user_rate_limit_key(request: Request) -> str:
     """
-    Key priority (org-free):
-      1) user:<user_id>   (if `request.state.user_id` is set by auth)
-      2) ip:<addr>        (fallback)
+    Build a limiter key. Priority:
+      1) user:<user_id>  (when auth sets `request.state.user_id`)
+      2) ip:<addr>       (fallback)
+    Always prefixed with RATE_LIMIT_NAMESPACE when set.
     """
     try:
         user_id = getattr(request.state, "user_id", None)
         if user_id:
-            return f"user:{user_id}"
+            return _with_namespace(f"user:{user_id}")
     except Exception as e:
         logger.warning(f"[RateLimit] key_func error; falling back to IP | err={e}")
-    return f"ip:{_client_ip(request)}"
+    return _with_namespace(f"ip:{_client_ip(request)}")
 
 
-def should_exempt_request(request: Request) -> bool:
+def _path_is_skipped(path: str) -> bool:
+    """Return True when the path should be exempt from rate limiting."""
+    # Exact or prefix matches for common static/docs paths
+    for prefix in SKIP_PATHS:
+        if not prefix:
+            continue
+        if prefix.endswith("/"):
+            if path.startswith(prefix):
+                return True
+        else:
+            if path == prefix or path.startswith(prefix):
+                return True
+    return False
+
+
+def should_exempt_request(request: Optional[Request]) -> bool:
     """
-    Exempt when:
-    - global switch is off
-    - path starts with any SKIP_PATHS
-    - client IP is in TRUSTED_IPS
+    Exempt a request when:
+      - global switch is off, or
+      - path is in SKIP_PATHS, or
+      - client IP is TRUSTED, or
+      - test bypass is enabled (env) or header indicates bypass.
     """
     if not RATE_LIMIT_ENABLED:
         return True
+    if request is None:  # defensive
+        return False
+
     try:
-        path = request.url.path
-        if any(path.startswith(prefix) for prefix in SKIP_PATHS):
+        # Explicit one-off bypass header (opt-in; useful for e2e/setup)
+        if request.headers.get(BYPASS_HEADER, "").strip() in {"1", "true", "yes", "on"}:
             return True
-        if _client_ip(request) in TRUSTED_IPS:
+
+        path = request.url.path
+        if _path_is_skipped(path):
+            return True
+
+        ip = _client_ip(request)
+        if ip in TRUSTED_IPS:
+            return True
+
+        if TEST_BYPASS:
+            # Safe default for big test suites; set RATE_LIMIT_TEST_BYPASS=""
+            # in tests that specifically assert rate limiting behavior.
             return True
     except Exception as e:
-        logger.warning(f"[RateLimit] exemption check failed; enforce limits | err={e}")
+        logger.warning(f"[RateLimit] exemption check failed; enforcing limits | err={e}")
     return False
 
 
 # ──────────────────────────────────────────────────────────────
-# 🚦 Limiter instance (Redis/memory)
+# 🧰 Limiter instance (Redis / memory)
 # ──────────────────────────────────────────────────────────────
 def _build_default_limits() -> List[str]:
     return [chunk.strip() for chunk in DEFAULT_LIMIT.split(",") if chunk.strip()]
@@ -108,19 +192,20 @@ def _make_limiter() -> Optional[Limiter]:
                 default_limits=_build_default_limits(),
                 headers_enabled=True,
                 storage_uri=storage_uri,
-                strategy=STRATEGY,  # not available in some slowapi versions
+                strategy=STRATEGY,  # ignored by older slowapi
             )
         except TypeError:
-            # Fallback for older slowapi that lacks `strategy`
+            # SlowAPI w/o `strategy` kw
             limiter = Limiter(
                 key_func=get_user_rate_limit_key,
                 default_limits=_build_default_limits(),
                 headers_enabled=True,
                 storage_uri=storage_uri,
             )
+
         logger.info(
-            "✅ RateLimiter ready | enabled=%s | default=%s | storage=%s | skip=%s | trusted_ips=%d",
-            RATE_LIMIT_ENABLED, _build_default_limits(), storage_uri, SKIP_PATHS, len(TRUSTED_IPS)
+            "✅ RateLimiter ready | enabled=%s | default=%s | storage=%s | skip=%s | trusted_ips=%d | ns=%s | test_bypass=%s",
+            RATE_LIMIT_ENABLED, _build_default_limits(), storage_uri, SKIP_PATHS, len(TRUSTED_IPS), NAMESPACE, TEST_BYPASS
         )
         return limiter
     except Exception as e:
@@ -130,38 +215,39 @@ def _make_limiter() -> Optional[Limiter]:
 
 limiter: Optional[Limiter] = _make_limiter()
 
-
 # ──────────────────────────────────────────────────────────────
-# 🎯 Route decorators
+# 🎛 Decorators
 # ──────────────────────────────────────────────────────────────
 def _exempt_noarg() -> bool:
     """
-    Adapter for SlowAPI versions that call `exempt_when()` with no arguments.
-    Pull the current Request from Limiter's internal request context.
+    Adapter for SlowAPI versions that call `exempt_when()` with no args.
+    Pull the current Request from Limiter's context if available.
     """
+    if limiter is None:
+        return False
     try:
-        req = limiter._request_context.get() if limiter is not None else None  # type: ignore[attr-defined]
+        req = limiter._request_context.get()  # type: ignore[attr-defined]
     except Exception:
         req = None
     return should_exempt_request(req) if req is not None else False
 
 
-def _chain_decorators(decorators: List[Callable]) -> Callable:
+def _chain(decorators: List[Callable]) -> Callable:
     def _apply(fn: Callable) -> Callable:
         for deco in reversed(decorators):
             fn = deco(fn)
         return fn
-
     return _apply
 
 
 def rate_limit(*limits: str) -> Callable:
     """
-    Apply per-route limits with our standard exemptions.
+    Apply per-route limits with MoviesNow exemptions.
 
-    Examples:
-        @rate_limit("10/minute")
-        @rate_limit("5/second", "100/minute")
+    Examples
+    --------
+    @rate_limit("10/minute")
+    @rate_limit("5/second", "100/minute")
     """
     if limiter is None:
         def _noop(fn: Callable) -> Callable:
@@ -173,13 +259,14 @@ def rate_limit(*limits: str) -> Callable:
         limiter.limit(limit_value, exempt_when=_exempt_noarg)
         for limit_value in selected
     ]
-    return _chain_decorators(decorators)
+    return _chain(decorators)
 
 
 def rate_limit_exempt() -> Callable:
     """Explicitly exempt a route from limiting."""
     if limiter is None:
-        def _noop(fn: Callable) -> Callable: return fn
+        def _noop(fn: Callable) -> Callable:
+            return fn
         return _noop
     return limiter.exempt
 
@@ -188,7 +275,14 @@ def rate_limit_exempt() -> Callable:
 # 🔧 Installer
 # ──────────────────────────────────────────────────────────────
 def install_rate_limiter(app) -> None:
-    """Attach SlowAPI middleware in a version-compatible way."""
+    """
+    Attach SlowAPI middleware.
+
+    Notes
+    -----
+    - Uses compat mode (no kwargs) to support older SlowAPI.
+    - Honors RATE_LIMIT_ENABLED: middleware is not installed when disabled.
+    """
     if not limiter:
         logger.warning("RateLimiter not initialized; middleware not installed")
         return
@@ -197,6 +291,5 @@ def install_rate_limiter(app) -> None:
         return
 
     app.state.limiter = limiter
-    # Add WITHOUT kwargs for maximum compatibility
-    app.add_middleware(SlowAPIMiddleware)
+    app.add_middleware(SlowAPIMiddleware)  # compatible signature
     logger.info("✅ SlowAPI middleware installed (compat mode)")

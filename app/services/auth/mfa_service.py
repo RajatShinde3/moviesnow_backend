@@ -1,37 +1,38 @@
+# app/services/auth/mfa_service.py
 from __future__ import annotations
 
 """
-MFA service — hardened, production-grade
-=======================================
+MFA Service — production-grade, test-friendly
+=============================================
 
 Responsibilities
 ----------------
 - Enable MFA: issue a **new TOTP secret** and provisioning URI (QR).
-- Verify MFA: validate a TOTP code; **flip mfa_enabled** to True; (optionally)
-  generate **recovery codes** and return them once.
-- Disable MFA: verify password (timing-safe) and clear secret.
+- Verify MFA: validate a TOTP code; flip `mfa_enabled=True`; optionally
+  include **recovery codes** once (if the recovery-code service is wired).
+- Disable MFA: verify password in a timing-safe way and clear the secret.
 
-Security properties
--------------------
-- **No secrets in logs**; clear audit trail for success/failure.
-- **Redis-backed throttling** to rate-limit sensitive actions.
-- **Idempotent** where safe (verify/disable tolerate current state).
-- **No-store** is handled by the router; services only return data.
-- **Best-effort** cache invalidation on auth state changes.
+Security & Reliability
+----------------------
+- **No secrets in logs**; all audit records are scrubbed.
+- **Per-user throttling** via Redis (service-level) + route-level limits.
+- **Idempotency** where safe (verify/disable tolerate current state).
+- **Cache no-store** is set by the router; service never returns headers.
+- **Test-friendly**: explicit `await db.refresh(...)` avoids stale state
+  across shared sessions used by tests.
 
 Integration points
 ------------------
-- Recovery codes: If `settings.AUTO_GENERATE_RECOVERY_CODES_ON_VERIFY` is True
-  and a `generate_initial_recovery_codes(user, db)` function is available, the
-  service will include plaintext codes **once** in the verify response.
-  (They are not logged or persisted in plaintext; your recovery service must
-  hash+pepper and store digests only.)
+- If `settings.AUTO_GENERATE_RECOVERY_CODES_ON_VERIFY` is True and a
+  coroutine `generate_initial_recovery_codes(user, db)` is available,
+  this service will include plaintext recovery codes **once** in the
+  verify response (hashing/persistence must be done in that service).
 
 Assumptions
 -----------
-- ``generate_totp(secret)`` returns a pyotp.TOTP-compatible object.
-- ``generate_mfa_token(user_id)`` issues a short-lived token (optional).
-- ``enforce_rate_limit`` raises HTTPException(429) on excess; we propagate it.
+- `generate_totp(secret)` returns a `pyotp.TOTP` object.
+- `generate_mfa_token(user_id)` creates a short-lived confirmation token.
+- `redis_utils.enforce_rate_limit(...)` raises HTTPException(429) when exceeded.
 """
 
 from typing import Optional, List, Dict
@@ -48,10 +49,11 @@ import app.utils.redis_utils as redis_utils
 
 
 # ─────────────────────────────────────────────────────────────
-# 🔧 Small helpers
+# 🔧 Helpers
 # ─────────────────────────────────────────────────────────────
 
 def _client_ip(request: Optional[Request]) -> str:
+    """Best-effort client IP extraction (safe for tests & prod)."""
     try:
         if not request:
             return "-"
@@ -66,15 +68,28 @@ def _client_ip(request: Optional[Request]) -> str:
 
 
 def _normalize_code(code: str) -> str:
+    """
+    Strict TOTP format guard.
+
+    Standard TOTP codes are 6 digits. Accept 6–8 to allow minor variants,
+    but never accept non-digits.
+    """
     c = (code or "").strip()
-    # Standard TOTP is 6 digits; accept 6–8 if you support steam/alt lengths.
     if not c.isdigit() or not (6 <= len(c) <= 8):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid MFA code format.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid MFA code format.",
+        )
     return c
 
 
 def _invalidate_user_caches_safe(user_id) -> None:
-    """Best-effort invalidation of user-scoped caches; never raises."""
+    """
+    Best-effort invalidation of user-scoped caches; never raises.
+
+    Called when enabling/disabling MFA to ensure downstream auth state
+    (e.g., session overviews) reflects changes quickly.
+    """
     tags = [f"user:{user_id}", f"user:{user_id}:auth", f"user:{user_id}:permissions"]
     try:
         try:
@@ -102,8 +117,8 @@ def _invalidate_user_caches_safe(user_id) -> None:
 
 async def _throttle(key_suffix: str, seconds: int, max_calls: int, error_message: str) -> None:
     """
-    Call the Redis rate limiter. **Propagate** HTTPException (e.g., 429).
-    Swallow only unexpected infra errors for availability (best effort).
+    Per-user throttle via Redis. Propagates HTTPException(429) from the
+    limiter; swallows only infra errors for availability.
     """
     try:
         await redis_utils.enforce_rate_limit(
@@ -113,26 +128,38 @@ async def _throttle(key_suffix: str, seconds: int, max_calls: int, error_message
             error_message=error_message,
         )
     except HTTPException:
-        # do NOT swallow 429 or other HTTPExceptions
         raise
     except Exception:
-        # availability-first fallback (e.g., Redis down). Log externally if desired.
+        # Availability-first fallback (e.g., Redis outage): do not block.
         pass
 
 
 # ─────────────────────────────────────────────────────────────
-# 🔐 Enable MFA for Current User
+# 🔐 Enable MFA (provision secret & QR)
 # ─────────────────────────────────────────────────────────────
 async def enable_mfa(current_user: User, db: AsyncSession, request: Optional[Request]) -> Dict:
     """
     Generate and persist a **new TOTP secret** for the current user.
 
-    Behavior
-    --------
-    - Refuses if MFA already enabled.
-    - Overwrites any pending secret if user re-runs enable (rate-limited).
-    - Returns provisioning URI and base32 secret for client-side QR rendering.
+    Returns
+    -------
+    dict
+        `{ "qr_code_url": str, "secret": str }` — the provisioning URI for QR
+        and the base32 secret. **Do not log or persist the plaintext secret.**
+
+    Raises
+    ------
+    HTTPException(400)
+        If MFA is already enabled.
+    HTTPException(429)
+        If rate limit is exceeded (per-user).
     """
+    # ── [Step 0] Ensure we see the latest DB state (fixes test flake) ────────
+    try:
+        await db.refresh(current_user)
+    except Exception:
+        pass
+
     # ── [Step 1] State gate ──────────────────────────────────────────────────
     if getattr(current_user, "mfa_enabled", False):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is already enabled.")
@@ -147,17 +174,17 @@ async def enable_mfa(current_user: User, db: AsyncSession, request: Optional[Req
 
     # ── [Step 3] Generate secret and persist (pending) ───────────────────────
     secret = pyotp.random_base32()
-    tx_ctx = db.begin_nested() if db.in_transaction() else db.begin()
-    async with tx_ctx:
+    tx = db.begin_nested() if db.in_transaction() else db.begin()
+    async with tx:
         current_user.totp_secret = secret
         # keep mfa_enabled = False until verification
         db.add(current_user)
 
     # ── [Step 4] Build provisioning URI (QR) ─────────────────────────────────
     totp = generate_totp(secret)
-    provisioning_uri = totp.provisioning_uri(name=current_user.email, issuer_name="CareerOS")
+    provisioning_uri = totp.provisioning_uri(name=current_user.email, issuer_name="MoviesNow")
 
-    # ── [Step 5] Audit success ───────────────────────────────────────────────
+    # ── [Step 5] Audit success (no secret logged) ────────────────────────────
     await log_audit_event(
         db=db,
         user=current_user,
@@ -172,20 +199,34 @@ async def enable_mfa(current_user: User, db: AsyncSession, request: Optional[Req
 
 
 # ─────────────────────────────────────────────────────────────
-# ✅ Verify MFA Code and Finalize Setup
+# ✅ Verify MFA Code and finalize setup
 # ─────────────────────────────────────────────────────────────
 async def verify_mfa(code: str, current_user: User, db: AsyncSession, request: Optional[Request]) -> Dict:
     """
-    Verify a TOTP code and set ``mfa_enabled=True``.
+    Verify a TOTP code against the stored secret and enable MFA.
 
-    Behavior
-    --------
-    - Per-user throttling of attempts.
-    - Accepts small clock skew via ``valid_window=1``.
-    - Never logs the submitted code.
-    - Idempotent: if already enabled, returns success message.
-    - Optional: generate **recovery codes** immediately after enabling.
+    Returns
+    -------
+    dict
+        `{ "message": "MFA enabled successfully.", "mfa_token": str, ... }`
+        Optionally includes `"recovery_codes": [..]` once if the recovery
+        service is enabled.
+
+    Raises
+    ------
+    HTTPException(400)
+        If MFA is not set up (missing secret).
+    HTTPException(401)
+        If the provided TOTP code is invalid.
+    HTTPException(429)
+        If rate limit is exceeded (per-user).
     """
+    # ── [Step 0] See latest DB state (fixes shared-session staleness in tests) ─
+    try:
+        await db.refresh(current_user)
+    except Exception:
+        pass
+
     # ── [Step 1] Idempotent short-circuit ────────────────────────────────────
     if getattr(current_user, "mfa_enabled", False):
         return {"message": "MFA is already enabled."}
@@ -216,25 +257,23 @@ async def verify_mfa(code: str, current_user: User, db: AsyncSession, request: O
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code.")
 
     # ── [Step 4] Persist enabled state ───────────────────────────────────────
-    tx_ctx = db.begin_nested() if db.in_transaction() else db.begin()
-    async with tx_ctx:
+    tx = db.begin_nested() if db.in_transaction() else db.begin()
+    async with tx:
         current_user.mfa_enabled = True
         db.add(current_user)
 
     _invalidate_user_caches_safe(current_user.id)
 
-    # ── [Step 5] Optional: generate initial recovery codes ───────────────────
+    # ── [Step 5] Optional: recovery codes (best-effort, never logs plaintext) ─
     recovery_codes: Optional[List[str]] = None
     try:
         if bool(getattr(settings, "AUTO_GENERATE_RECOVERY_CODES_ON_VERIFY", False)):
-            # Try dynamic import to avoid hard dependency if the module isn't present.
-            from app.api.v1.mfa.recovery_codes import generate_initial_recovery_codes  # type: ignore
+            # Dynamic import so the project can opt-in without hard dependency.
+            # Adjust the path to your router/service location.
+            from app.api.v1.routers.auth.recovery_codes import generate_initial_recovery_codes  # type: ignore
             recovery_codes = await generate_initial_recovery_codes(current_user, db)
-            # `generate_initial_recovery_codes` must hash+pepper and store digests,
-            # returning plaintext codes ONCE. We do not log or persist plaintext here.
     except Exception:
-        # If recovery code service isn't present, skip silently.
-        recovery_codes = None
+        recovery_codes = None  # Skip silently if not available
 
     # ── [Step 6] Audit success ───────────────────────────────────────────────
     await log_audit_event(
@@ -256,29 +295,35 @@ async def verify_mfa(code: str, current_user: User, db: AsyncSession, request: O
         "mfa_token": generate_mfa_token(str(current_user.id)),
     }
     if recovery_codes:
-        # Only include if you updated your response model to allow it.
         payload["recovery_codes"] = recovery_codes
     return payload
 
 
 # ─────────────────────────────────────────────────────────────
-# ❌ Disable MFA with Password Verification
+# ❌ Disable MFA (password-gated)
 # ─────────────────────────────────────────────────────────────
 async def disable_mfa(password: str, current_user: User, db: AsyncSession, request: Optional[Request]) -> Dict:
     """
     Disable MFA after verifying the user's password.
 
-    Behavior
-    --------
-    - Per-user throttling for disable action.
-    - Timing-safe password verification via helper.
-    - Idempotent: if already disabled, returns success message.
+    Returns
+    -------
+    dict
+        `{ "message": "MFA disabled successfully" }`
 
-    Side-effects
-    ------------
-    - Clears user's TOTP secret and flips `mfa_enabled` to False.
-    - Best-effort cache invalidation.
+    Raises
+    ------
+    HTTPException(403)
+        If the password is invalid.
+    HTTPException(429)
+        If rate limit is exceeded (per-user).
     """
+    # ── [Step 0] Refresh to avoid stale state in tests ───────────────────────
+    try:
+        await db.refresh(current_user)
+    except Exception:
+        pass
+
     # ── [Step 1] Idempotent short-circuit ────────────────────────────────────
     if not getattr(current_user, "mfa_enabled", False):
         return {"message": "MFA is already disabled."}
@@ -304,8 +349,8 @@ async def disable_mfa(password: str, current_user: User, db: AsyncSession, reque
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid password")
 
     # ── [Step 4] Persist disabled state ──────────────────────────────────────
-    tx_ctx = db.begin_nested() if db.in_transaction() else db.begin()
-    async with tx_ctx:
+    tx = db.begin_nested() if db.in_transaction() else db.begin()
+    async with tx:
         current_user.totp_secret = None
         current_user.mfa_enabled = False
         db.add(current_user)

@@ -1,48 +1,50 @@
 # app/api/v1/auth/recovery_codes.py
 
 """
-Enterprise‑grade **MFA Recovery Codes** Router — MoviesNow
-=========================================================
+Enterprise-grade **MFA Recovery Codes** Router — MoviesNow (org-free)
+====================================================================
 
-Production‑ready recovery codes for MFA fallback and **step‑up** flows.
-Users can generate a one‑time **batch** of single‑use codes, preview masked
+Production-ready recovery codes for MFA fallback and **step-up** flows.
+Users can generate a one-time **batch** of single-use codes, preview masked
 metadata, and **redeem** a code to satisfy MFA for sensitive operations when
 TOTP is unavailable.
 
 MoviesNow variant
 -----------------
-- **Org‑free**: no tenant/org claims are minted or stored.
-- **Session‑bound reauth**: redeeming a code mints a short‑lived **reauth** JWT
+- **Org-free**: no tenant/org claims are minted or stored.
+- **Session-bound reauth**: redeeming a code mints a short-lived **reauth** JWT
   (`token_type="reauth"`) tied to the caller's session.
-- **Hardened**: `Cache‑Control: no-store`, per‑route rate limits, Redis
-  brute‑force counters, and neutral error messages.
+- **Hardened**: `Cache-Control: no-store`, route-local anti-abuse counters,
+  Redis brute-force protection, and neutral error messages.
 
 Endpoints
 ---------
-- **POST** `/mfa/recovery-codes/generate` — (MFA‑gated) rotate and issue a new batch; return raw codes **once**
+- **POST** `/mfa/recovery-codes/generate` — (MFA-gated) rotate and issue a new batch; return raw codes **once**
 - **GET**  `/mfa/recovery-codes`          — masked preview of current batch + remaining count
-- **POST** `/mfa/recovery-codes/redeem`   — consume one code and **mint a short‑lived reauth token**
+- **POST** `/mfa/recovery-codes/redeem`   — consume one code and **mint a short-lived reauth token**
 
 Security & Design
 -----------------
-- **Zero plaintext at rest**: only SHA‑256 digests are stored; raw codes are never persisted.
-- **Single‑view**: raw codes are returned **only** at generation time.
+- **Zero plaintext at rest**: only SHA-256 digests are stored; raw codes are never persisted.
+- **Single-view**: raw codes are returned **only** at generation time.
 - **Rotation**: generating a new batch invalidates all previous codes.
-- **Rate‑limited + anti‑bruteforce**: Redis counters (atomic `INCR+EXPIRE` via Lua) per user/IP.
-- **Cache hardening**: responses are marked **no‑store**.
+- **Anti-abuse**:
+  - Generate: per-IP & per-user counters (3/hour each) enforced *inside* the route.
+  - Redeem: Redis counters (atomic `INCR+EXPIRE` via Lua) per user/IP.
+- **Cache hardening**: responses are marked **no-store**.
 
 Storage model (Redis)
 ---------------------
 Per user keys:
 - `recov:{user_id}:batch`  — Hash with metadata: `batch_id`, `created_at`, `preview_json`
-- `recov:{user_id}:codes`  — **SET** of SHA‑256 digests (remaining, unused)
-- `recov:{user_id}:used`   — **SET** of SHA‑256 digests (consumed)
+- `recov:{user_id}:codes`  — **SET** of SHA-256 digests (remaining, unused)
+- `recov:{user_id}:used`   — **SET** of SHA-256 digests (consumed)
 
 Integration notes
 -----------------
-- Protect high‑risk routes with a **fresh step‑up** dependency that accepts a
+- Protect high-risk routes with a **fresh step-up** dependency that accepts a
   `token_type="reauth"` JWT (e.g., `require_step_up()`).
-- This router relies on Redis; if Redis is unavailable, anti‑abuse counters
+- This router relies on Redis; if Redis is unavailable, anti-abuse counters
   degrade **open** (do not block the user) to favor availability.
 """
 
@@ -83,7 +85,7 @@ router = APIRouter(tags=["MFA Recovery Codes"])  # grouped under MFA
 BATCH_SIZE = 10
 CODE_LEN = 10                # raw characters before hyphenation
 GROUP = 5                    # XXXXX-XXXXX layout
-REDEEM_WINDOW_SECONDS = 900  # 15‑minute window for brute‑force counters
+REDEEM_WINDOW_SECONDS = 900  # 15-minute window for brute-force counters
 MAX_REDEEM_FAILS_USER = 10
 MAX_REDEEM_FAILS_IP = 20
 REAUTH_TTL_SECONDS = int(getattr(settings, "REAUTH_TOKEN_EXPIRE_MINUTES", 5)) * 60
@@ -91,6 +93,11 @@ ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
 
 # Optional maximum age for a batch (0/None = never expire)
 RECOVERY_CODES_MAX_AGE_DAYS = int(getattr(settings, "RECOVERY_CODES_MAX_AGE_DAYS", 0) or 0)
+
+# Generate anti-abuse (enforced *inside* the route to avoid flaky global limiter)
+GEN_WINDOW_SECONDS = 3600
+MAX_GENERATE_PER_USER = 3
+MAX_GENERATE_PER_IP = 3
 
 
 def _pepper() -> str:
@@ -117,10 +124,17 @@ def _k_redeem_user(user_id: UUID) -> str:
     return f"recov:redeem:user:{user_id}"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 🔐 Token helper (mint short‑lived **reauth** JWT)
-# ──────────────────────────────────────────────────────────────────────────────
+def _k_gen_ip(ip: str) -> str:
+    return f"recov:gen:ip:{ip or 'unknown'}"
 
+
+def _k_gen_user(user_id: UUID) -> str:
+    return f"recov:gen:user:{user_id}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🔐 Token helper (mint short-lived **reauth** JWT)
+# ──────────────────────────────────────────────────────────────────────────────
 def _mint_reauth_token(*, user_id: UUID, session_id: Optional[str], mfa_authenticated: bool) -> Tuple[str, int]:
     """Create a signed **reauth** token with a short TTL.
 
@@ -128,7 +142,7 @@ def _mint_reauth_token(*, user_id: UUID, session_id: Optional[str], mfa_authenti
     ------
     - `sub`: user id
     - `token_type`: `"reauth"`
-    - `mfa_authenticated`: whether the step‑up used MFA (true for recovery code)
+    - `mfa_authenticated`: whether the step-up used MFA (true for recovery code)
     - `session_id`: session lineage (if known)
     - Standard JWT dates: `iat`, `nbf`, `exp`, plus `jti` for traceability
 
@@ -174,7 +188,7 @@ return v
 async def _incr_with_ttl(key: str, ttl_seconds: int) -> int:
     """Atomically `INCR` and set TTL on first increment via Redis Lua.
 
-    Falls back to non‑atomic behavior if scripting is unavailable.
+    Falls back to non-atomic behavior if scripting is unavailable.
     """
     r = getattr(redis_wrapper, "client", None)
     if r is None:
@@ -192,9 +206,8 @@ async def _incr_with_ttl(key: str, ttl_seconds: int) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilities (format, hash, generate, normalize)
+# Utilities (format, hash, generate, normalize, client IP)
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _format_code(raw: str) -> str:
     return f"{raw[:GROUP]}-{raw[GROUP:GROUP*2]}" if len(raw) >= GROUP * 2 else raw
 
@@ -216,7 +229,7 @@ def _normalize_user_code(code: str) -> str:
     if not c or any(ch not in ALPHABET for ch in c):
         # Keep error neutral; detailed format checks can leak patterns
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid recovery code format")
-    return _format_code(c)  # return re‑hyphenated for consistent hashing/view
+    return _format_code(c)  # return re-hyphenated for consistent hashing/view
 
 
 def _client_ip(request: Optional[Request]) -> str:
@@ -241,29 +254,41 @@ def _client_ip(request: Optional[Request]) -> str:
     response_model=RecoveryCodesGenerateResponse,
     summary="Generate a new batch of MFA recovery codes (displayed once)",
 )
-@rate_limit("3/hour")
+@rate_limit("1000/hour")  # keep global limiter lenient; enforce strict caps below
 async def generate_recovery_codes(
     request: Request,
     response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user_with_mfa),
 ) -> RecoveryCodesGenerateResponse:
-    """Generate **BATCH_SIZE** single‑use recovery codes.
+    """Generate **BATCH_SIZE** single-use recovery codes.
 
     The **raw codes are returned only once** and will never be retrievable later.
     Generating a new batch **invalidates** any previously issued codes.
 
     Security
     --------
-    - Requires an MFA‑authenticated user (`get_current_user_with_mfa`).
-    - Stores only **SHA‑256 digests**; raw codes are not persisted.
-    - Marks responses **no‑store** to avoid leaks.
+    - Requires an MFA-authenticated user (`get_current_user_with_mfa`).
+    - Stores only **SHA-256 digests**; raw codes are not persisted.
+    - Per-IP and per-user **3/hour** caps enforced via Redis counters.
+    - Marks responses **no-store** to avoid leaks.
     """
-    # [Step 0] Cache hardening
+    # [0] Cache hardening
     set_sensitive_cache(response)
 
-    # [Step 1] Create batch + codes (ensure uniqueness)
+    # [1] Per-IP and per-user generate budgets
+    r = getattr(redis_wrapper, "client", None)
+    if r is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Recovery storage unavailable")
+
     user_id = current_user.id
+    ip = _client_ip(request)
+    ip_tries = await _incr_with_ttl(_k_gen_ip(ip), GEN_WINDOW_SECONDS)
+    user_tries = await _incr_with_ttl(_k_gen_user(user_id), GEN_WINDOW_SECONDS)
+    if ip_tries > MAX_GENERATE_PER_IP or user_tries > MAX_GENERATE_PER_USER:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Please wait before generating more codes")
+
+    # [2] Create batch + codes (ensure uniqueness)
     batch_id = str(uuid4())
     created_at = datetime.now(timezone.utc)
 
@@ -277,14 +302,9 @@ async def generate_recovery_codes(
     def _mask(c: str) -> str:
         flat = c.replace("-", "")
         return f"{'*' * (len(flat) - 2)}{flat[-2:]}"
-
     preview = [f"{m[:GROUP]}-{m[GROUP:]}" for m in map(_mask, raw_codes)]
 
-    # [Step 2] Store in Redis atomically (rotate previous batch)
-    r = getattr(redis_wrapper, "client", None)
-    if r is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Recovery storage unavailable")
-
+    # [3] Store in Redis atomically (rotate previous batch)
     meta = {"batch_id": batch_id, "created_at": created_at.isoformat(), "preview_json": json.dumps(preview)}
 
     async def _sequential_write() -> None:
@@ -320,7 +340,7 @@ async def generate_recovery_codes(
         # Fallback path if pipeline isn't supported by the mock/driver
         await _sequential_write()
 
-    # [Step 3] Respond
+    # [4] Respond
     return RecoveryCodesGenerateResponse(
         batch_id=batch_id,
         created_at=created_at,
@@ -349,14 +369,14 @@ async def list_recovery_codes(
     Raw codes are **never** returned here; users must download/store them at
     generation time.
     """
-    # [Step 0] Cache hardening
+    # [0] Cache hardening
     set_sensitive_cache(response)
 
     r = getattr(redis_wrapper, "client", None)
     if r is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Recovery storage unavailable")
 
-    # [Step 1] Fetch metadata and counts
+    # [1] Fetch metadata and counts
     meta = await r.hgetall(_k_batch(current_user.id))
     created_at: Optional[datetime] = None
     batch_id: Optional[str] = None
@@ -386,7 +406,7 @@ async def list_recovery_codes(
     except Exception:
         remaining = 0
 
-    # [Step 2] Respond
+    # [2] Respond
     return RecoveryCodesPreview(batch_id=batch_id, created_at=created_at, remaining=remaining, preview=preview)
 
 
@@ -396,7 +416,7 @@ async def list_recovery_codes(
 @router.post(
     "/mfa/recovery-codes/redeem",
     response_model=RecoveryCodeRedeemResponse,
-    summary="Redeem a recovery code and receive a short‑lived reauth token",
+    summary="Redeem a recovery code and receive a short-lived reauth token",
 )
 @rate_limit("30/hour")
 async def redeem_recovery_code(
@@ -406,7 +426,7 @@ async def redeem_recovery_code(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> RecoveryCodeRedeemResponse:
-    """Consume a valid recovery code as a **step‑up factor** and mint a short‑lived
+    """Consume a valid recovery code as a **step-up factor** and mint a short-lived
     **reauth** token.
 
     This allows the user to proceed with sensitive operations even if TOTP is
@@ -414,18 +434,18 @@ async def redeem_recovery_code(
 
     Security
     --------
-    - Rate‑limited with Redis **anti‑bruteforce** counters (per user & per IP).
-    - Codes are single‑use; successful redemption removes them from the active set.
-    - Responses are **no‑store**.
+    - Rate-limited with Redis **anti-bruteforce** counters (per user & per IP).
+    - Codes are single-use; successful redemption removes them from the active set.
+    - Responses are **no-store**.
     """
-    # [Step 0] Cache hardening
+    # [0] Cache hardening
     set_sensitive_cache(response)
 
     r = getattr(redis_wrapper, "client", None)
     if r is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Recovery storage unavailable")
 
-    # [Step 1] Anti‑bruteforce budget check
+    # [1] Anti-bruteforce budget check
     ip = _client_ip(request)
     user_key = _k_redeem_user(current_user.id)
     ip_key = _k_redeem_ip(ip)
@@ -434,7 +454,7 @@ async def redeem_recovery_code(
     if user_tries > MAX_REDEEM_FAILS_USER or ip_tries > MAX_REDEEM_FAILS_IP:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts")
 
-    # [Step 2] Resolve batch and hash input code
+    # [2] Resolve batch and hash input code
     meta = await r.hget(_k_batch(current_user.id), "batch_id")
     if not meta:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No recovery codes available")
@@ -448,7 +468,7 @@ async def redeem_recovery_code(
 
     digest = _hash_code(current_user.id, normalized_display, batch_id)
 
-    # [Step 3] Verify membership and consume atomically
+    # [3] Verify membership and consume atomically
     removed = await r.srem(_k_codes(current_user.id), digest)
     if removed != 1:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid recovery code")
@@ -457,13 +477,13 @@ async def redeem_recovery_code(
     except Exception:
         pass
 
-    # Reset per‑user failure counter on success (keep IP counter for network‑level abuse)
+    # Reset per-user failure counter on success (keep IP counter for network-level abuse)
     try:
         await r.delete(user_key)
     except Exception:
         pass
 
-    # [Step 4] Extract session_id from the current bearer (best‑effort)
+    # [4] Extract session_id from the current bearer (best-effort)
     session_id: Optional[str] = None
     authz = request.headers.get("authorization") or request.headers.get("Authorization")
     if authz and authz.lower().startswith("bearer "):
@@ -475,15 +495,15 @@ async def redeem_recovery_code(
                 algorithms=[settings.JWT_ALGORITHM],
                 options={"require": ["sub", "exp"]},
             )
-            # Accept any bearer type here; step‑up itself will be minted as reauth
+            # Accept any bearer type here; step-up itself will be minted as reauth
             session_id = str(claims.get("session_id") or claims.get("jti") or "") or None
         except JWTError:
             session_id = None
 
-    # [Step 5] Mint a **reauth** token bound to this session
+    # [5] Mint a **reauth** token bound to this session
     reauth_token, ttl = _mint_reauth_token(user_id=current_user.id, session_id=session_id, mfa_authenticated=True)
 
-    # [Step 6] Respond
+    # [6] Respond
     return RecoveryCodeRedeemResponse(reauth_token=reauth_token, expires_in=ttl)
 
 

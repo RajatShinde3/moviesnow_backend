@@ -5,6 +5,7 @@ from httpx import AsyncClient
 from unittest.mock import patch
 import pyotp
 from fastapi import HTTPException
+import uuid
 
 BASE_REAUTH = "/api/v1/auth/reauth"
 BASE_MFA = "/api/v1/auth/mfa"
@@ -14,6 +15,11 @@ def _with_ip(headers: dict, ip: str) -> dict:
     h["X-Forwarded-For"] = ip
     return h
 
+def _unique_email(tag: str = "reauth") -> str:
+    """
+    Return a unique, deterministic test email to avoid cross-test DB collisions.
+    """
+    return f"{tag}-{uuid.uuid4().hex[:10]}@example.com"
 # ─────────────────────────────────────────────────────────────
 # /reauth/password
 # ─────────────────────────────────────────────────────────────
@@ -79,30 +85,38 @@ async def test_reauth_password_rate_limited(mock_limiter, async_client: AsyncCli
 # /reauth/mfa
 # ─────────────────────────────────────────────────────────────
 
+def _with_ip(headers: dict, ip: str) -> dict:
+    h = dict(headers)
+    h["X-Forwarded-For"] = ip
+    return h
+
+
 @pytest.mark.anyio
 async def test_reauth_mfa_happy_path(async_client: AsyncClient, user_with_headers):
     """
     ✅ Step-up with TOTP when MFA is enabled returns a reauth token.
     All calls are under the same ACCESS bearer.
     """
-    _, headers = await user_with_headers(email="reauth3@example.com", password="Secret123!")
+    # Use a unique email so previous tests can't pre-enable MFA for this user
+    _, headers = await user_with_headers(email=_unique_email("reauth3"), password="Secret123!")
 
-    # Enroll MFA
+    # Enroll MFA (unique IP so per-IP limiters never interfere across tests)
     en = await async_client.post(
         f"{BASE_MFA}/enable",
         headers=_with_ip(headers, "203.0.113.50"),
     )
+    assert en.status_code == 200, en.text
 
-    assert en.status_code == 200
     secret = en.json()["secret"]
     code = pyotp.TOTP(secret).now()
+
     ver = await async_client.post(f"{BASE_MFA}/verify", headers=headers, json={"code": code})
-    assert ver.status_code == 200
+    assert ver.status_code == 200, ver.text
 
     # Step-up via TOTP
     new_code = pyotp.TOTP(secret).now()
     resp = await async_client.post(f"{BASE_REAUTH}/mfa", headers=headers, json={"code": new_code})
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     data = resp.json()
     assert "reauth_token" in data and data["expires_in"] > 0
 
