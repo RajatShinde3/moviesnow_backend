@@ -57,11 +57,7 @@ class User(Base):
 
     hashed_password = Column(String, nullable=False, doc="BCrypt (or argon2) hash")
 
-    role = Column(
-        Enum(OrgRole, name="org_role"),
-        nullable=False,
-        server_default=text("'USER'"),
-    )
+    role = Column(Enum(OrgRole, name="org_role"), default=OrgRole.USER, nullable=False)
 
     # ── Verification / security ─────────────────────────────────────────────
     is_active = Column(Boolean, nullable=False, server_default=text("true"))

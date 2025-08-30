@@ -26,6 +26,7 @@ class LoginMode(str, PyEnum):
 class OrgRole(str, PyEnum):
     """User role within an organization."""
     ADMIN = "ADMIN"
+    SUPERUSER = "SUPERUSER"
     USER = "USER"
 
 
