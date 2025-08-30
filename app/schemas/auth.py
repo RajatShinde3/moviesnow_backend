@@ -266,7 +266,6 @@ class TrustedDeviceItem(BaseModel):
     model_config = ConfigDict(
         from_attributes=True,
         ser_json_timedelta="iso8601",  # for timedelta fields if any
-        json_encoders={datetime: lambda v: v.isoformat()},
     )
 
 
@@ -278,7 +277,6 @@ class TrustedDevicesList(BaseModel):
 
     model_config = ConfigDict(
         from_attributes=True,
-        json_encoders={datetime: lambda v: v.isoformat()},
     )
 
 
@@ -315,7 +313,6 @@ class SessionItem(BaseModel):
     model_config = ConfigDict(
         from_attributes=True,
         populate_by_name=True,
-        json_encoders={},  # FastAPI handles datetime → ISO-8601
     )
 
 
@@ -458,3 +455,5 @@ class CredentialItem(BaseModel):
 class CredentialsListResponse(BaseModel):
     total: int
     credentials: List[CredentialItem]
+
+

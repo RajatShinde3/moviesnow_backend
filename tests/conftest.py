@@ -13,6 +13,8 @@ import os
 import random
 import importlib
 import pytest
+import warnings
+from sqlalchemy.exc import SAWarning
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 🌱 Test env for rate limiting (fast, isolated, bypassed by default)
@@ -37,6 +39,13 @@ except Exception:
 from app.core.redis_client import redis_wrapper
 from tests.fixtures.mocks.redis import MockRedisClient
 redis_wrapper._client = MockRedisClient()   # make the app use the mock client
+
+# Silence relationship overlap SAWarnings from SQLAlchemy during tests
+warnings.filterwarnings(
+    "ignore",
+    category=SAWarning,
+    message=r".*conflicts with relationship\(s\):.*",
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 📦 Pull in the rest of your fixtures (db, app, auth, etc.)

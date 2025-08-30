@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     ENABLE_DOCS: bool = True  # you can flip to False in prod if desired
 
     # ── Security / JWT ────────────────────────────────────────
-    JWT_SECRET_KEY: SecretStr = Field(..., env="JWT_SECRET_KEY")
+    JWT_SECRET_KEY: SecretStr = Field(...)
     JWT_ALGORITHM: Literal["HS256", "HS384", "HS512"] = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(60, ge=5, le=24 * 60)
     REFRESH_TOKEN_EXPIRE_DAYS: int = Field(7, ge=1, le=365)
@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     POSTGRES_SERVER: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_USER: str = "postgres"
-    POSTGRES_PASSWORD: SecretStr = Field(..., env="POSTGRES_PASSWORD")
+    POSTGRES_PASSWORD: SecretStr = Field(...)
     POSTGRES_DB: str = "moviesnow"
 
     # ── CORS & Hosts ─────────────────────────────────────────
