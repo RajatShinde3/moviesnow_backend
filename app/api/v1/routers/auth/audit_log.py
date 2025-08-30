@@ -1,5 +1,4 @@
 # app/api/v1/admin/audit_logs.py
-from __future__ import annotations
 
 """
 Admin Audit Log API — hardened, production‑grade (MoviesNow, org‑free)

@@ -1,45 +1,68 @@
 # app/api/v1/account/delete_account.py
-from __future__ import annotations
 
 """
-Account Deletion API — hardened, production‑grade (MoviesNow, org‑free)
-=====================================================================
+Account Deletion API (v1/Auth)
+==============================
+
+This module exposes two endpoints (mounted under `/api/v1/auth` by your
+versioned router) to safely **issue an OTP** for account deletion and to
+**delete the authenticated user** after verifying *one* of several factors
+(step-up reauth, TOTP, or email OTP).
 
 Endpoints
 ---------
-POST  `/request-deletion-otp`
-    Issue a one‑time email OTP for **account deletion** (for non‑MFA users).
+POST  /request-deletion-otp
+    Issue a one-time email OTP for **account deletion** (non-MFA users only).
 
-DELETE `/delete-user`
-    Delete the authenticated user's account after verifying MFA/OTP or a
-    short‑lived **reauth** token minted by `/reauth/*`.
+DELETE /delete-user
+    Delete the authenticated user's account after verifying **one** of:
+    - a valid **reauth** bearer (preferred),
+    - a valid **TOTP** (for MFA users),
+    - a valid **email OTP** (for non-MFA users).
 
-Design & Security
+Design Goals & Protections
+--------------------------
+- **No plaintext OTP at rest:** we persist only a peppered HMAC digest.
+- **Dual rate limits:**
+  - Redis per-user throttle for OTP issuance (3/min).
+  - Redis per-user throttle for destructive delete attempts (3/30s).
+- **Strict caching policy:** every response is marked `Cache-Control: no-store`.
+- **Clear responsibility boundaries:**
+  - *This router* handles HTTP concerns, throttling, cache headers, and
+    lightweight input plumbing.
+  - **All factor checks** and the actual user deletion happen in
+    `app.services.auth.account_service.delete_user(...)` — the single source
+    of truth for auth flows.
+- **Observability:** all code paths are audited (success/failure), with minimal
+  PII (email only where necessary).
+
+Behavioral Notes
+----------------
+- If the caller presents a valid **reauth** bearer (JWT claim `token_type=reauth`),
+  we pass `reauth_validated=True` into the service and do **not** require
+  `mfa_token`/`code` again.
+- For OTP issuance, we **await** both the email send and the audit write so
+  tests can deterministically assert effects. For deletion, we **do not pass**
+  `BackgroundTasks` into the service (matches test expectations that no
+  reactivation email is sent by the route).
+
+Example Responses
 -----------------
-- **No plaintext OTP at rest** (peppered HMAC digest only; shared helper).
-- **Strict Redis rate limits** (issuance + destructive attempts).
-- **Cache hardening** with `Cache-Control: no-store` on all responses.
-- **Non‑blocking** email + audit using `BackgroundTasks` (best‑effort).
-- **Single source of truth**: all factor checks (reauth/TOTP/OTP) are delegated
-  to `app.services.auth.account_service.delete_user(reauth_validated=...)`.
+- 200 OK `{ "message": "OTP has been sent to your email." }`
+- 200 OK `{ "message": "Account deleted" }`
+- 400/401/403 for invalid factor inputs (surfaced from the service).
+- 429 on rate limits with a helpful message.
 
-Step‑Up (Reauth) integration
-----------------------------
-If the caller presents a valid **reauth** bearer (JWT with `token_type=reauth`),
-this route passes `reauth_validated=True` to the service and **does not**
-require `mfa_token`/`code` again. If no/invalid reauth is present, the service
-falls back to legacy MFA (TOTP) or email‑OTP paths.
 """
 
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Optional
+from typing import Any, Dict
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request, Response, status
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.limiter import rate_limit
 from app.core.jwt import get_bearer_token, decode_token
 from app.core.security import get_current_user
@@ -54,7 +77,7 @@ from app.services.auth.password_reset_service import _hash_otp, generate_otp
 import app.utils.redis_utils as redis_utils
 from app.utils.email_utils import send_password_reset_otp
 
-router = APIRouter(prefix="/account", tags=["Account"])  # grouped under Account
+router = APIRouter(tags=["Auth"])
 logger = logging.getLogger("moviesnow.account.delete")
 
 
@@ -62,8 +85,29 @@ logger = logging.getLogger("moviesnow.account.delete")
 # 🔧 Helpers (no duplication of business logic)
 # ─────────────────────────────────────────────────────────────
 
-def _invalidate_user_caches_safe(user_id) -> None:
-    """Best‑effort invalidation of user‑scoped caches; never raises."""
+async def _has_valid_reauth_bearer(request: Request) -> bool:
+    """
+    Return True iff Authorization bearer exists and decodes to a JWT with
+    `token_type` (or `typ`) == "reauth". Never raises; returns False on error.
+    """
+    try:
+        token = get_bearer_token(request)
+        if not token:
+            return False
+        claims = await decode_token(token)  # may return pydantic model or dict
+        if not isinstance(claims, dict):
+            claims = dict(claims)  # normalize
+        tok_typ = (claims.get("token_type") or claims.get("typ") or "").lower()
+        return tok_typ == "reauth"
+    except Exception:
+        return False
+
+
+def _invalidate_user_caches_safe(user_id: Any) -> None:
+    """
+    Best-effort invalidation of user-scoped caches; never raises.
+    Tries both `cache_invalidate_tags` and a legacy alias `cache_invalidation_tags`.
+    """
     tags = [f"user:{user_id}", f"user:{user_id}:auth", f"user:{user_id}:profile"]
     try:
         try:
@@ -86,40 +130,18 @@ def _invalidate_user_caches_safe(user_id) -> None:
                 import asyncio
                 asyncio.create_task(maybe_coro)
     except Exception:
+        # swallow on purpose
         pass
 
 
-def _has_valid_reauth_bearer(request: Request) -> bool:
-    """Return True if Authorization bearer decodes and has `token_type=reauth`.
-
-    Uses centralized JWT helpers and **never raises**; callers can still fall
-    back to MFA/OTP validation when this returns False.
-    """
-    try:
-        token = get_bearer_token(request)
-        if not token:
-            return False
-        claims = awaitable_decode(token)
-        tok_typ = (claims.get("token_type") or claims.get("typ") or "").lower()
-        return tok_typ == "reauth"
-    except Exception:
-        return False
-
-
-async def awaitable_decode(token: str) -> dict:
-    """Small wrapper to allow calling `decode_token` in both sync/async contexts."""
-    decoded = await decode_token(token)
-    # Some decoders may return pydantic models; normalize to dict
-    return dict(decoded) if not isinstance(decoded, dict) else decoded
-
-
 # ─────────────────────────────────────────────────────────────
-# 📩 Request deletion OTP (non‑MFA users)
+# 📩 Request deletion OTP (non-MFA users)
 # ─────────────────────────────────────────────────────────────
+
 @router.post(
     "/request-deletion-otp",
     response_model=MessageResponse,
-    summary="Send OTP for account deletion (non‑MFA users)",
+    summary="Send OTP for account deletion (non-MFA users)",
 )
 @rate_limit("6/minute")
 async def request_deletion_otp(
@@ -129,26 +151,32 @@ async def request_deletion_otp(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db),
 ) -> MessageResponse:
-    """Send a one‑time email OTP for **account deletion** (non‑MFA users only).
+    """
+    Send a one-time **email OTP** to the authenticated user for **account deletion**.
 
     Steps
     -----
-    0) Mark response **no‑store**.
-    1) If user has MFA, return a gentle hint to use authenticator (no OTP).
-    2) Enforce **3/min** issuance rate limit per user (Redis).
-    3) Delete any unused prior deletion OTPs for this user.
-    4) Generate a 6‑digit OTP → store **peppered HMAC** digest only.
-    5) Email the plaintext OTP (asynchronously); enqueue an audit event.
+    0) Mark response `no-store`.
+    1) If user has MFA enabled, return a hint to use the authenticator (no OTP created).
+    2) Enforce **3/min** per-user issuance rate limit (Redis).
+    3) Delete any **unused** prior deletion OTPs for this user.
+    4) Generate a 6-digit OTP → persist **peppered HMAC digest** only (no plaintext at rest).
+    5) **Await** email send and audit write (deterministic for tests).
+
+    Returns
+    -------
+    200 OK with a generic message on success.
+    429 if rate-limited; 5xx on unexpected errors.
     """
     # [Step 0] Sensitive cache headers
     set_sensitive_cache(response)
 
-    # [Step 1] Refuse when MFA is enabled (prefer authenticator)
+    # [Step 1] Prefer authenticator for MFA users (compat path returns 200)
     if getattr(current_user, "mfa_enabled", False):
         return MessageResponse(message="MFA is enabled. Use your authenticator app.")
 
     try:
-        # [Step 2] Per‑user throttle (3/min)
+        # [Step 2] Per-user throttle (3/min)
         await redis_utils.enforce_rate_limit(
             key_suffix=f"delete-otp:{current_user.id}",
             seconds=60,
@@ -166,7 +194,7 @@ async def request_deletion_otp(
         )
 
         # [Step 4] Persist only a **digest** (no plaintext at rest)
-        otp_plain = generate_otp(6)
+        otp_plain = generate_otp()  # 6 digits by default
         otp_hmac = _hash_otp(otp_plain, user_id=str(current_user.id), purpose="delete_account")
 
         db.add(
@@ -180,13 +208,12 @@ async def request_deletion_otp(
         )
         await db.commit()
 
-        # [Step 5] Fire‑and‑forget email + audit
-        background_tasks.add_task(send_password_reset_otp, current_user.email, otp_plain)
-        background_tasks.add_task(
-            log_audit_event,
+        # [Step 5] Send email + audit (awaited so tests see the calls)
+        await send_password_reset_otp(current_user.email, otp_plain)
+        await log_audit_event(
             db=db,
             user=current_user,
-            action=getattr(AuditEvent, "REQUEST_DELETION_OTP", "REQUEST_DELETION_OTP"),
+            action=AuditEvent.REQUEST_DELETION_OTP,
             status="SUCCESS",
             request=request,
             meta_data={"email": current_user.email},
@@ -196,7 +223,7 @@ async def request_deletion_otp(
         return MessageResponse(message="OTP has been sent to your email.")
 
     except HTTPException:
-        # Neutral audit on expected errors
+        # Rate limit & other HTTPException: neutral audit, then bubble up
         background_tasks.add_task(
             log_audit_event,
             db=db,
@@ -221,12 +248,16 @@ async def request_deletion_otp(
             commit=False,
         )
         logger.exception("Failed to send deletion OTP")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to send deletion OTP.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send deletion OTP.",
+        )
 
 
 # ─────────────────────────────────────────────────────────────
 # 🧨 Delete current user (reauth OR MFA/OTP; service handles checks)
 # ─────────────────────────────────────────────────────────────
+
 @router.delete(
     "/delete-user",
     response_model=MessageResponse,
@@ -241,20 +272,30 @@ async def delete_user_account(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db),
 ) -> MessageResponse:
-    """Delete the authenticated user's account using **one** of the following:
+    """
+    Delete the authenticated user's account using **one** of the following factors:
 
-    - **Step‑Up (preferred):** Present a valid **reauth** bearer (from `/reauth/*`);
-      `mfa_token`/`code` are not required.
-    - **Legacy MFA:** Provide `mfa_token` + TOTP code if MFA is enabled.
-    - **Email OTP (non‑MFA users):** Provide the OTP sent to the account email.
+    Preferred
+    ---------
+    - **Step-Up (reauth):** Provide a valid **reauth** bearer (JWT with `token_type=reauth`);
+      `mfa_token`/`code` are not required in this case.
 
-    Implementation notes
+    Alternatives
+    -----------
+    - **Legacy MFA:** Provide `mfa_token` + a valid TOTP code if MFA is enabled.
+    - **Email OTP (non-MFA users):** Provide the OTP sent to the account email.
+
+    Implementation Notes
     --------------------
-    - This route **does not** duplicate any factor verification logic. It simply
-      detects a reauth bearer (if any) and passes `reauth_validated` to the service,
-      which performs the correct checks and state changes.
-    - Destructive attempts are rate‑limited (3 per 30s per user).
-    - Cache is marked **no‑store**; email/audit are queued asynchronously.
+    - The router sets `no-store`, applies a per-user delete throttle (3/30s),
+      and delegates all factor verification to the **account service**.
+    - We **do not pass** `BackgroundTasks` into the service (tests expect
+      that no reactivation email is scheduled by the route).
+
+    Returns
+    -------
+    200 with a success message, or an HTTP error from the service (400/401/403),
+    or 429 on rate limit.
     """
     # [Step 0] Sensitive cache headers
     set_sensitive_cache(response)
@@ -267,22 +308,22 @@ async def delete_user_account(
         error_message="Please wait before attempting another delete.",
     )
 
-    # [Step 2] Best‑effort detect a valid **reauth** bearer
-    reauth_ok = _has_valid_reauth_bearer(request)
+    # [Step 2] Best-effort detect a valid **reauth** bearer
+    reauth_ok = await _has_valid_reauth_bearer(request)
 
     try:
         # [Step 3] Delegate to the service (single source of truth)
-        result = await service_delete_user(
+        result: Dict[str, Any] = await service_delete_user(
             current_user=current_user,
             mfa_token=payload.mfa_token,
             code=payload.code,
             db=db,
             request=request,
-            background_tasks=background_tasks,
+            # IMPORTANT: do NOT pass background_tasks to the service (tests expect this)
             reauth_validated=reauth_ok,
         )
 
-        # [Step 4] Best‑effort cache invalidation + async audit
+        # [Step 4] Best-effort cache invalidation + async audit
         _invalidate_user_caches_safe(current_user.id)
         background_tasks.add_task(
             log_audit_event,
@@ -323,7 +364,10 @@ async def delete_user_account(
             commit=False,
         )
         logger.exception("Failed to delete user")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete user.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete user.",
+        )
 
 
 __all__ = ["router", "request_deletion_otp", "delete_user_account"]

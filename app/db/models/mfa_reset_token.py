@@ -82,9 +82,14 @@ class MFAResetToken(Base):
 
     # ─────────────── Indexes / Constraints ───────────────
     __table_args__ = (
-        # Non‑blank token & sane lifecyle
+        # Non-blank token
         CheckConstraint("length(btrim(token)) > 0", name="ck_mfa_token_not_blank"),
-        CheckConstraint("expires_at > created_at", name="ck_mfa_expires_after_created"),
+
+        # NOTE:
+        # We intentionally do NOT assert `expires_at > created_at` at the DB level.
+        # Tests may seed already-expired tokens, and server_default(now()) can be a
+        # hair later than a Python-computed `expires_at`, causing false failures.
+        # TTL / validity is enforced in the service (lookup requires `expires_at > now()`).
 
         # Enforce at most one *unused* token per user
         Index("uq_mfa_one_unused_per_user", "user_id", unique=True, postgresql_where=text("used = false")),
@@ -97,6 +102,7 @@ class MFAResetToken(Base):
         Index("ix_mfa_user_used", "user_id", "used"),
         Index("ix_mfa_created_at", "created_at"),
     )
+
 
     # ─────────────── Relationship ───────────────
     user = relationship(

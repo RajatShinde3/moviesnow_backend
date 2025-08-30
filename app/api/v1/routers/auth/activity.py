@@ -1,5 +1,4 @@
 # app/api/v1/auth/activity.py
-from __future__ import annotations
 
 """
 Enterprise‑grade Login Activity & Security Alerts API — MoviesNow (org‑free)
@@ -46,7 +45,7 @@ from app.schemas.auth import ActivityItem, ActivityResponse, AlertsSubscription
 from app.services.audit_log_service import log_audit_event
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/auth", tags=["Activity & Alerts"])  # grouped with auth
+router = APIRouter(tags=["Activity & Alerts"])  # grouped with auth
 
 # ──────────────────────────────────────────────────────────────
 # Redis keys

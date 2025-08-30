@@ -1,52 +1,68 @@
 # app/api/v1/auth/refresh_logout.py
-from __future__ import annotations
 
 """
-Refresh & Logout API — hardened, production‑grade (MoviesNow, org‑free)
+Refresh & Logout API — hardened, production-grade (MoviesNow, org-free)
 =====================================================================
+
+Overview
+--------
+This router exposes endpoints to **rotate refresh tokens**, **revoke tokens**,
+and **log out** users. It emphasizes token-reuse detection, bounded session
+fan-out, consistent auditing, and strict “no-store” cache headers.
 
 Endpoints
 ---------
-POST `/refresh-token`
-    Rotate a valid refresh token, issue a new access token, and register the
-    new refresh token (rotation). Detects reuse via Redis + DB and blocks it.
+POST /refresh-token
+    Rotate a valid refresh token, mint a new access token, and register a new
+    refresh token (rotation). Detects reuse via Redis + DB and blocks it.
 
-POST `/revoke-token`
+POST /revoke-token
     Revoke refresh tokens for a target user (self or **superuser**).
 
-POST `/logout`
+POST /logout
     Revoke the provided refresh token (or **all** sessions) and log out.
 
 Security & Hardening
 --------------------
-- **Token reuse detection** with Redis keys `revoked:jti:*` and authoritative DB checks.
-- **Per‑user session cap** (default 5; configurable) with automatic eviction.
-- **Sensitive cache headers** set (`no-store`) on token‑bearing responses.
-- Centralized JWT decoding helpers; neutral, consistent errors.
-- Defensive Redis usage: failures won't crash requests; best‑effort cleanup.
-- **Session metadata** in Redis (`sessionmeta:{jti}`) for /sessions UX.
-- Audit trail (best‑effort) for success/failure and suspicious events.
+- **Token reuse detection:** Redis keys `revoked:jti:*` (fast path) plus
+  authoritative DB checks. Reuse events are *audited* and blocked.
+- **Per-user session cap:** Configurable (default 5) with eviction of surplus.
+- **Sensitive cache headers:** `Cache-Control: no-store` on token-bearing responses.
+- **Centralized JWT decoding:** Neutral, consistent error semantics.
+- **Defensive Redis usage:** Fail-safe wrappers; outages don’t break requests.
+- **Session metadata:** `sessionmeta:{jti}` stored in Redis for `/sessions` UX.
+- **Audit trail:** Best-effort success/failure records with IP/User-Agent.
 
-MoviesNow variant (org‑free)
+MoviesNow Variant (org-free)
 ----------------------------
-- **No tenant/org logic**: access tokens do not carry org claims and admin
-  actions are **superuser‑only**.
-- Reuses `app.core.jwt.decode_token` and `app.core.security` helpers where possible.
+- No tenant/org claims; admin operations are **superuser-only**.
+- Uses shared helpers from `app.core.jwt` and `app.core.security`.
 """
 
-from datetime import datetime, timezone
-from uuid import UUID
-from typing import Optional
+# ──────────────────────────────────────────────────────────────────────────────
+# 📦 Imports
+# ──────────────────────────────────────────────────────────────────────────────
+
 import logging
+from datetime import datetime, timezone
+from ipaddress import ip_address
+from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from jose import jwt as jose_jwt
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.jwt import decode_token
 from app.core.limiter import rate_limit
-from app.core.security import create_access_token, create_refresh_token, get_current_user
-from app.core.jwt import decode_token  # centralized decoding/validation
+from app.core.redis_client import redis_wrapper
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    get_current_user,
+)
 from app.db.models.token import RefreshToken
 from app.db.models.user import User
 from app.db.session import get_async_db
@@ -60,9 +76,8 @@ from app.schemas.auth import (
 from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import AuditEvent, log_audit_event
 from app.services.token_service import revoke_all_refresh_tokens, store_refresh_token
-from app.core.redis_client import redis_wrapper
 
-router = APIRouter(tags=["Tokens & Sessions"])  # grouped under tokens
+router = APIRouter(tags=["Tokens & Sessions"])
 logger = logging.getLogger("moviesnow.auth.refresh_logout")
 
 # Tunables
@@ -70,13 +85,36 @@ MAX_SESSIONS = getattr(settings, "MAX_CONCURRENT_SESSIONS", 5)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Redis helpers (best‑effort; tolerate Redis outages gracefully)
+# 🧰 Helpers (Redis + safe request for audit)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _rc():
-    """Return the shared Redis client (mock or real)."""
+    """Return the shared Redis client (mock or real), or None."""
     try:
         return getattr(redis_wrapper, "client", None)
+    except Exception:
+        return None
+
+
+def _safe_request(request: Optional[Request]) -> Optional[Request]:
+    """
+    Return the request only if the IPs look valid; otherwise, return None.
+
+    We validate both X-Forwarded-For/X-Real-IP (first hop) and client.host,
+    because the audit DB may store an inet field and explode on bad inputs
+    like "127.0.0.300".
+    """
+    try:
+        if not request:
+            return None
+        # Validate forwarded header first (what audit code typically prefers)
+        fwd = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip")
+        if fwd:
+            ip_address(fwd.split(",")[0].strip())
+        # Validate ASGI client host if present
+        if getattr(request, "client", None) and getattr(request.client, "host", None):
+            ip_address(request.client.host)
+        return request
     except Exception:
         return None
 
@@ -98,7 +136,7 @@ async def _redis_sadd(key: str, *values: str) -> None:
         return
     try:
         for v in values:
-            await rc.sadd(key, v)  # mock supports single value
+            await rc.sadd(key, v)  # some mocks support only single-arg sadd
     except Exception:
         pass
 
@@ -145,7 +183,7 @@ async def _redis_del(key: str) -> None:
         if hasattr(rc, "delete"):
             await rc.delete(key)
             return
-        # mock fallback: try to clear set or set tiny ttl
+        # mock fallback: clear a set or poison with tiny TTL
         if hasattr(rc, "smembers") and hasattr(rc, "srem"):
             members = await rc.smembers(key)
             for m in list(members):
@@ -167,6 +205,7 @@ def _exp_to_ttl(exp: Optional[int]) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 # 🔄 POST /refresh-token — Rotate Access/Refresh Tokens
 # ──────────────────────────────────────────────────────────────────────────────
+
 @router.post(
     "/refresh-token",
     response_model=TokenResponse,
@@ -179,27 +218,49 @@ async def refresh_token_route(
     response: Response,
     db: AsyncSession = Depends(get_async_db),
 ) -> TokenResponse:
-    """Rotate a valid **refresh token** and issue a **new access token** (plus a new refresh token).
+    """
+    Rotate a valid **refresh token** and issue a **new access token** plus a **new
+    refresh token** bound to the same session lineage.
 
     Behavior
     --------
     - **Validates** incoming refresh token (signature, required claims, `typ/token_type == "refresh"`).
-    - **Reuse detection**: denies if the JTI is already revoked (`revoked:jti:{jti}`) or DB shows revoked/expired.
-    - **Revokes** the presented refresh token (DB + Redis) and **mints** a new refresh token bound to the same `session_id`.
-    - **Registers** the new refresh JTI in the user's session set and **enforces session caps** by evicting surplus.
+    - **Reuse detection**: denies if JTI is already revoked (`revoked:jti:{jti}`) or DB shows revoked/expired.
+    - **Revokes** the presented refresh token (DB + Redis) and **mints** a replacement bound to the same `session_id`.
+    - **Registers** the new refresh JTI and **enforces session caps** by evicting surplus.
     - **Writes session metadata** into Redis (`sessionmeta:{jti}`) for session inventory UX.
-    - **Issues** a short‑lived **access token** (org‑free) with `mfa_authenticated=True`.
-    - **Audits** success/failure with IP and User‑Agent metadata.
-    - **Prevents caching** of token material (Cache‑Control: no‑store).
+    - **Issues** a short-lived **access token** (org-free) with `mfa_authenticated=True`.
+    - **Audits** success/failure with IP and User-Agent metadata.
+    - **Prevents caching** of token material (`Cache-Control: no-store`).
 
     Returns
     -------
-    TokenResponse
-        `{ access_token, refresh_token, token_type="bearer" }`
+    TokenResponse: `{ access_token, refresh_token, token_type="bearer" }`
     """
-    # [Step 0] Cache hardening
-    set_sensitive_cache(request)
+    # Harden response caching
     set_sensitive_cache(response)
+
+    # [Step 0A] Pre-decode fast path: if JTI appears revoked in Redis → "reused"
+    try:
+        unverified = jose_jwt.get_unverified_claims(payload.refresh_token)
+        pre_jti = str(unverified.get("jti") or "")
+        pre_sub = unverified.get("sub")
+        if pre_jti and await _redis_exists(f"revoked:jti:{pre_jti}"):
+            await _redis_srem(f"session:{pre_sub}", pre_jti)
+            try:
+                await log_audit_event(
+                    db,
+                    action=AuditEvent.REFRESH_TOKEN,
+                    status="REUSE_DETECTED",
+                    request=_safe_request(request),
+                    meta_data={"jti": pre_jti},
+                )
+            except Exception:
+                pass
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token was reused")
+    except Exception:
+        # Not a JWT or no jti → continue to normal flow
+        pass
 
     # [Step 1] Decode & validate incoming refresh token (centralized helper)
     try:
@@ -209,30 +270,52 @@ async def refresh_token_route(
         parent_jti = decoded.get("parent_jti")
         session_id = decoded.get("session_id") or jti  # lineage fallback
     except Exception:
-        await log_audit_event(
-            db,
-            action=AuditEvent.REFRESH_TOKEN,
-            status="FAILURE",
-            request=request,
-            meta_data={"reason": "decode/claims"},
-        )
+        # Try a second chance reuse detection on decode failure
+        try:
+            unverified = jose_jwt.get_unverified_claims(payload.refresh_token)
+            ujti = str(unverified.get("jti") or "")
+            if ujti and await _redis_exists(f"revoked:jti:{ujti}"):
+                try:
+                    await log_audit_event(
+                        db,
+                        action=AuditEvent.REFRESH_TOKEN,
+                        status="REUSE_DETECTED",
+                        request=_safe_request(request),
+                        meta_data={"jti": ujti, "decode_failed": True},
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token was reused")
+        except Exception:
+            pass
+        try:
+            await log_audit_event(
+                db,
+                action=AuditEvent.REFRESH_TOKEN,
+                status="FAILURE",
+                request=_safe_request(request),
+                meta_data={"reason": "decode/claims"},
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
-    # [Step 2] Reuse detection (Redis fast‑path)
+    # [Step 2] Reuse detection (Redis fast-path after decode)
     redis_jti_key = f"revoked:jti:{jti}"
     if await _redis_exists(redis_jti_key):
         await _redis_srem(f"session:{user_id}", jti)
-        await log_audit_event(
-            db,
-            action=AuditEvent.REFRESH_TOKEN,
-            status="REUSE_DETECTED",
-            request=request,
-            meta_data={
-                "ip": getattr(request.client, "host", None),
-                "user_agent": request.headers.get("User-Agent"),
-                "jti": jti,
-            },
-        )
+        try:
+            await log_audit_event(
+                db,
+                action=AuditEvent.REFRESH_TOKEN,
+                status="REUSE_DETECTED",
+                request=_safe_request(request),
+                meta_data={
+                    "jti": jti,
+                },
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token was reused")
 
     # [Step 3] DB validity check (exists, not revoked, not expired)
@@ -243,14 +326,44 @@ async def refresh_token_route(
             )
         ).scalar_one_or_none()
     except Exception:
+        try:
+            await log_audit_event(
+                db,
+                action=AuditEvent.REFRESH_TOKEN,
+                status="FAILURE",
+                request=_safe_request(request),
+                meta_data={"reason": "db_error_lookup"},
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invalid or reused")
 
     if not db_token or db_token.is_revoked:
         await _redis_srem(f"session:{user_id}", jti)
+        try:
+            await log_audit_event(
+                db,
+                action=AuditEvent.REFRESH_TOKEN,
+                status="FAILURE",
+                request=_safe_request(request),
+                meta_data={"reason": "missing_or_revoked"},
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invalid or reused")
 
     now_utc = datetime.now(timezone.utc)
     if db_token.expires_at <= now_utc:
+        try:
+            await log_audit_event(
+                db,
+                action=AuditEvent.REFRESH_TOKEN,
+                status="FAILURE",
+                request=_safe_request(request),
+                meta_data={"reason": "expired"},
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
 
     # [Step 4] Revoke the presented refresh token (DB + Redis)
@@ -267,7 +380,7 @@ async def refresh_token_route(
     session_key = f"session:{user_id}"
     await _redis_sadd(session_key, refresh_data["jti"])
 
-    # [Step 6A] Write session metadata (for /sessions UX)
+    # [Step 6A] Write session metadata (for /sessions UX) — best-effort
     try:
         rc = _rc()
         if rc:
@@ -279,26 +392,28 @@ async def refresh_token_route(
                 f"sessionmeta:{new_jti}",
                 mapping={
                     "session_id": session_id or new_jti,
-                    "ip": getattr(request.client, "host", "") or "",
-                    "ua": request.headers.get("User-Agent", "") or "",
+                    "ip": (getattr(request.client, "host", "") or ""),
+                    "ua": (request.headers.get("User-Agent", "") or ""),
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "last_seen": datetime.now(timezone.utc).isoformat(),
                 },
             )
             await rc.expire(f"sessionmeta:{new_jti}", ttl_seconds_to_refresh_expiry)
     except Exception:
-        # metadata is best‑effort; never fail the rotation on this
-        pass
+        pass  # never fail rotation on metadata issues
 
-    # [Step 7] Enforce per‑user session cap
+    # [Step 7] Enforce per-user session cap (evict surplus)
     session_jtis = await _redis_smembers_str(session_key)
     if len(session_jtis) > MAX_SESSIONS:
         surplus = len(session_jtis) - MAX_SESSIONS
         evict_candidates = [sid for sid in session_jtis if sid != refresh_data["jti"]][:surplus]
         for sid in evict_candidates:
-            await _redis_setex(f"revoked:jti:{sid}", int(getattr(settings, "REFRESH_TOKEN_EXPIRE_DAYS", 7)) * 86400, "revoked")
+            await _redis_setex(
+                f"revoked:jti:{sid}",
+                int(getattr(settings, "REFRESH_TOKEN_EXPIRE_DAYS", 7)) * 86400,
+                "revoked",
+            )
             await _redis_srem(session_key, sid)
-            # best‑effort: remove orphaned sessionmeta
             try:
                 rc = _rc()
                 if rc:
@@ -317,7 +432,7 @@ async def refresh_token_route(
         ip_address=getattr(request.client, "host", None),
     )
 
-    # [Step 9] Mint org‑free access token
+    # [Step 9] Mint org-free access token
     access_token = await create_access_token(
         user_id=user_id,
         mfa_authenticated=True,
@@ -325,15 +440,18 @@ async def refresh_token_route(
     )
 
     # [Step 10] Audit & respond
-    user = await db.get(User, user_id)
-    await log_audit_event(
-        db,
-        action=AuditEvent.REFRESH_TOKEN,
-        user=user,
-        status="SUCCESS",
-        request=request,
-        meta_data={"new_jti": refresh_data["jti"], "parent_jti": parent_jti, "session_id": session_id},
-    )
+    try:
+        user = await db.get(User, user_id)
+        await log_audit_event(
+            db,
+            action=AuditEvent.REFRESH_TOKEN,
+            user=user,
+            status="SUCCESS",
+            request=_safe_request(request),
+            meta_data={"new_jti": refresh_data["jti"], "parent_jti": parent_jti, "session_id": session_id},
+        )
+    except Exception:
+        pass
 
     return TokenResponse(access_token=access_token, refresh_token=refresh_data["token"], token_type="bearer")
 
@@ -341,6 +459,7 @@ async def refresh_token_route(
 # ──────────────────────────────────────────────────────────────────────────────
 # 🚪 POST /revoke-token — Revoke Tokens (Self or Superuser)
 # ──────────────────────────────────────────────────────────────────────────────
+
 @router.post("/revoke-token", response_model=MessageResponse, summary="Revoke refresh tokens for a user")
 @rate_limit("10/minute")
 async def revoke_token(
@@ -350,46 +469,60 @@ async def revoke_token(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> MessageResponse:
-    """Revoke refresh tokens for the target user.
+    """
+    Revoke refresh tokens for the target user.
 
     Authorization
     -------------
     - The **user themselves** can revoke their own tokens.
     - A **superuser** may revoke tokens for any user.
     """
-    # [Step 0] AuthZ check (org‑free)
+    set_sensitive_cache(response)
+
+    # [Step 0] AuthZ check (org-free)
     if payload.user_id != current_user.id and not getattr(current_user, "is_superuser", False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
 
-    # [Step 1] Revoke via service (org‑free; ignore organization_id if present)
+    # [Step 1] Revoke via service (org-free)
     revoked_count = await revoke_all_refresh_tokens(db=db, user_id=payload.user_id)
 
-    actor = await db.get(User, current_user.id)
+    try:
+        actor = await db.get(User, current_user.id)
+    except Exception:
+        actor = None
+
     if revoked_count == 0:
+        try:
+            await log_audit_event(
+                db,
+                user=actor,
+                action=AuditEvent.REVOKE_TOKEN,
+                status="NO_ACTIVE_TOKENS",
+                request=_safe_request(request),
+                meta_data={"target_user_id": str(payload.user_id)},
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active refresh tokens found")
+
+    try:
         await log_audit_event(
             db,
             user=actor,
             action=AuditEvent.REVOKE_TOKEN,
-            status="NO_ACTIVE_TOKENS",
-            request=request,
-            meta_data={"target_user_id": str(payload.user_id)},
+            status="SUCCESS",
+            request=_safe_request(request),
+            meta_data={"target_user_id": str(payload.user_id), "revoked_count": revoked_count},
         )
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active refresh tokens found")
-
-    await log_audit_event(
-        db,
-        user=actor,
-        action=AuditEvent.REVOKE_TOKEN,
-        status="SUCCESS",
-        request=request,
-        meta_data={"target_user_id": str(payload.user_id), "revoked_count": revoked_count},
-    )
+    except Exception:
+        pass
     return MessageResponse(message=f"{revoked_count} refresh token(s) revoked")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 🚪 POST /logout — Logout (Single or All Sessions)
 # ──────────────────────────────────────────────────────────────────────────────
+
 @router.post("/logout", response_model=MessageResponse, summary="Logout by revoking one or all sessions")
 @rate_limit("20/minute")
 async def logout(
@@ -398,27 +531,37 @@ async def logout(
     response: Response,
     db: AsyncSession = Depends(get_async_db),
 ) -> MessageResponse:
-    """Log out by revoking the presented refresh token or **all** sessions.
-
-    Best‑effort Redis cleanup is combined with authoritative DB revocation.
     """
-    set_sensitive_cache(request)
+    Log out by revoking the presented refresh token or **all** sessions.
+
+    Best-effort Redis cleanup is combined with authoritative DB revocation.
+    """
     set_sensitive_cache(response)
 
-    # [Step 1] Decode refresh token (for user/jti/exp if single‑logout)
+    # [Step 1] Decode refresh token (for user/jti/exp if single-logout)
     try:
         decoded = await decode_token(payload.refresh_token, expected_types=["refresh"])  # type: ignore[arg-type]
         user_id = UUID(str(decoded.get("sub")))
         jti = str(decoded.get("jti"))
         exp = decoded.get("exp")
     except Exception:
+        try:
+            await log_audit_event(
+                db,
+                action=AuditEvent.LOGOUT,
+                status="FAILURE",
+                request=_safe_request(request),
+                meta_data={"reason": "decode/claims"},
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
     session_key = f"session:{user_id}"
     rc = _rc()
 
     if payload.revoke_all:
-        # [Step 2A] Revoke ALL: compute per‑token TTLs from DB
+        # [Step 2A] Revoke ALL: compute per-token TTLs from DB
         now_utc = datetime.now(timezone.utc)
         rows = (
             await db.execute(
@@ -445,26 +588,45 @@ async def logout(
             row.is_revoked = True
         await db.commit()
 
-        await log_audit_event(db, action=AuditEvent.LOGOUT, user=await db.get(User, user_id), status="SUCCESS", request=request)
-        return MessageResponse(message="Logged out from all sessions")
-
-    else:
-        # [Step 2B] Revoke ONLY the presented token
-        ttl = _exp_to_ttl(exp)
-        await _redis_setex(f"revoked:jti:{jti}", ttl, "revoked")
-        await _redis_srem(session_key, jti)
         try:
-            if rc:
-                await rc.delete(f"sessionmeta:{jti}")
+            await log_audit_event(
+                db,
+                action=AuditEvent.LOGOUT,
+                user=await db.get(User, user_id),
+                status="SUCCESS",
+                request=_safe_request(request),
+                meta_data={"scope": "all_sessions"},
+            )
         except Exception:
             pass
+        return MessageResponse(message="Logged out from all sessions")
 
-        # DB: mark the single token revoked
-        await db.execute(update(RefreshToken).where(RefreshToken.jti == jti).values(is_revoked=True))
-        await db.commit()
+    # [Step 2B] Revoke ONLY the presented token
+    ttl = _exp_to_ttl(exp)
+    await _redis_setex(f"revoked:jti:{jti}", ttl, "revoked")
+    await _redis_srem(session_key, jti)
+    try:
+        if rc:
+            await rc.delete(f"sessionmeta:{jti}")
+    except Exception:
+        pass
 
-        await log_audit_event(db, action=AuditEvent.LOGOUT, user=await db.get(User, user_id), status="SUCCESS", request=request)
-        return MessageResponse(message="Logged out successfully")
+    # DB: mark the single token revoked
+    await db.execute(update(RefreshToken).where(RefreshToken.jti == jti).values(is_revoked=True))
+    await db.commit()
+
+    try:
+        await log_audit_event(
+            db,
+            action=AuditEvent.LOGOUT,
+            user=await db.get(User, user_id),
+            status="SUCCESS",
+            request=_safe_request(request),
+            meta_data={"scope": "single_session", "jti": jti},
+        )
+    except Exception:
+        pass
+    return MessageResponse(message="Logged out successfully")
 
 
 __all__ = ["router", "refresh_token_route", "revoke_token", "logout"]

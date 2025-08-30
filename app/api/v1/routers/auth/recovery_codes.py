@@ -1,5 +1,4 @@
 # app/api/v1/auth/recovery_codes.py
-from __future__ import annotations
 
 """
 Enterprise‑grade **MFA Recovery Codes** Router — MoviesNow

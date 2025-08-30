@@ -1,36 +1,51 @@
+# app/services/auth/mfa_reset_service.py
 from __future__ import annotations
 
 """
 MFA Reset Service — hardened, production-grade
 =============================================
 
-What this module does
----------------------
-1) **Request reset**: Issue a one-time, short-lived email link. Stores only a
-   **peppered HMAC digest** of the token (never plaintext).
-2) **Confirm reset**: Validate token (digest+TTL), **disable MFA**, mark token
-   **used**, and **invalidate any existing recovery codes** for that user.
+Overview
+--------
+This service implements a two-step, email-based MFA reset flow:
 
-Security properties
+1) **Request reset** (`request_mfa_reset`)
+   - No account enumeration (always returns a generic message).
+   - Per-email and per-IP Redis rate limits.
+   - CSPRNG token; DB stores **peppered HMAC digest** only (never plaintext).
+   - Prior unused tokens are cleared before issuing a new one.
+   - Email + audit are queued via `BackgroundTasks` (best-effort).
+
+2) **Confirm reset** (`confirm_mfa_reset`)
+   - Validates token by **digest** within TTL (single-use semantics).
+   - On success: **disable MFA**, **consume token**, and **invalidate recovery codes**.
+   - Best-effort cache invalidation (user-scoped tags).
+
+Security Properties
 -------------------
-- **No enumeration** on request (generic response).
-- **Redis-backed rate limits** per normalized email and per IP (Lua / atomic).
-- **Short TTL**, **single-use** tokens; prior tokens cleared on issuance.
-- **Best-effort** cache invalidation on success (user-scoped tags).
-- Clear audit trail (SUCCESS/FAILURE), rich docstrings, defensive validation.
+- **No enumeration** on request.
+- **Scoped rate limits** (per normalized email + per IP).
+- **Short TTL**, **single-use** tokens; previous tokens are revoked on issuance.
+- **Digest-only storage** (peppered HMAC-SHA256).
+- **Background safety**: audit/email failures do not break responses.
 
 Assumptions
 -----------
-- Email helper `send_email(to, subject, body)` exists.
-- Redis helper `enforce_rate_limit(key_suffix, seconds, max_calls, error_message)`.
-- Cache invalidation helper may exist at
-  `app.utils.cache.cache_invalidate_tags` (fallback to `cache_invalidation_tags`).
+- Email helper: `send_email(to, subject, body)`
+- Redis limiter: `enforce_rate_limit(key_suffix, seconds, max_calls, error_message)`
+- Optional cache invalidation helpers:
+  `app.utils.cache.cache_invalidate_tags` or `cache_invalidation_tags`
 """
+
+# ─────────────────────────────────────────────────────────────
+# 📦 Imports
+# ─────────────────────────────────────────────────────────────
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 
@@ -47,19 +62,21 @@ from app.schemas.auth import MFAResetConfirm, MFAResetRequest
 from app.services.audit_log_service import AuditEvent, log_audit_event
 from app.utils.redis_utils import enforce_rate_limit
 
+logger = logging.getLogger("moviesnow.auth.mfa_reset")
+
 # ─────────────────────────────────────────────────────────────
 # ⚙️ Configuration / constants
 # ─────────────────────────────────────────────────────────────
 
-# Token TTL (minutes) constrained to a safe range
+# Token TTL (minutes), constrained to a safe range
 MFA_RESET_TTL_MINUTES: int = int(getattr(settings, "MFA_RESET_TTL_MINUTES", 30) or 30)
 MFA_RESET_TTL_MINUTES = max(5, min(MFA_RESET_TTL_MINUTES, 60 * 24))  # [5m, 24h]
 
 # Frontend base used to craft the reset link
 FRONTEND_BASE: str = str(getattr(settings, "FRONTEND_URL", "http://localhost:3000"))
 
-# Accept URL-safe tokens (e.g., base64url). token_urlsafe yields [-_A-Za-z0-9]
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-\.~]+=*$")
+# URL-safe token regex (secrets.token_urlsafe → base64url). Accept 16..512 chars.
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,512}$")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -67,19 +84,21 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-\.~]+=*$")
 # ─────────────────────────────────────────────────────────────
 
 def _norm_email(email: str) -> str:
+    """Return trimmed, lower-cased email."""
     return (email or "").strip().lower()
 
 
 def _token_digest(token: str) -> str:
-    """Hex HMAC-SHA256 of token with server-side pepper (SECRET_KEY)."""
+    """Hex HMAC-SHA256 digest of token with server-side pepper (JWT_SECRET_KEY)."""
     if not token:
         raise ValueError("token required")
-    key = settings.SECRET_KEY.get_secret_value().encode("utf-8")
+    key = settings.JWT_SECRET_KEY.get_secret_value().encode("utf-8")
     msg = f"mfa_reset:{token}".encode("utf-8")
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
 def _client_ip(request: Optional[Request]) -> str:
+    """Best-effort client IP for throttling/auditing."""
     try:
         if request is None:
             return "-"
@@ -125,30 +144,97 @@ async def _invalidate_recovery_codes(user_id) -> None:
     Best-effort invalidation of any existing **recovery code** batch
     so stale codes cannot be redeemed after an email-based MFA reset.
 
-    Key layout (see recovery_codes router):
+    Key layout:
       recov:{user_id}:batch  — batch metadata (hash)
       recov:{user_id}:codes  — active digests (set)
       recov:{user_id}:used   — consumed digests (set)
     """
     try:
-        rc = redis_wrapper.client
+        rc = getattr(redis_wrapper, "client", None)
+        if not rc:
+            return
         keys = [f"recov:{user_id}:batch", f"recov:{user_id}:codes", f"recov:{user_id}:used"]
-        await rc.unlink(*keys)  # UNLINK (non-blocking) → DEL fallback handled by client
+        if hasattr(rc, "unlink"):
+            await rc.unlink(*keys)  # non-blocking deletion
+        else:
+            for k in keys:
+                try:
+                    await rc.delete(k)
+                except Exception:
+                    pass
     except Exception:
         # non-fatal; continue
         pass
 
 
+async def _commit_or_flush(db: AsyncSession, used_nested: bool) -> None:
+    """
+    Commit when we opened our own transaction; flush when we nested inside
+    an outer transaction (leaving final commit to the caller).
+    """
+    try:
+        if used_nested:
+            await db.flush()
+        else:
+            await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:  # pragma: no cover
+            pass
+        raise
+
+
+# Background wrappers that **never bubble** exceptions back into Starlette.
+async def _audit_safely(
+    *,
+    db: AsyncSession,
+    user: Optional[User],
+    action: AuditEvent,
+    status: str,
+    request: Optional[Request],
+    meta_data: Optional[dict],
+    commit: bool = False,
+) -> None:
+    try:
+        await log_audit_event(
+            db=db,
+            user=user,
+            action=action,
+            status=status,
+            request=request,
+            meta_data=meta_data,
+            commit=commit,
+        )
+    except Exception:
+        try:
+            logger.warning("Background audit failed", exc_info=True)
+        except Exception:
+            pass
+
+
+async def _send_email_safely(*, to: str, subject: str, body: str) -> None:
+    try:
+        await send_email(to=to, subject=subject, body=body)
+    except Exception:
+        try:
+            logger.warning("Background email send failed", exc_info=True)
+        except Exception:
+            pass
+
+
 # ─────────────────────────────────────────────────────────────
 # 🔁 Request MFA Reset (Send Email Link)
 # ─────────────────────────────────────────────────────────────
+
 async def request_mfa_reset(
     payload: MFAResetRequest,
     db: AsyncSession,
     request: Optional[Request],
     background_tasks: Optional[BackgroundTasks],
 ) -> dict:
-    """Initiate an MFA reset: create a one-time token and email a link.
+    """
+    Initiate an MFA reset: create a one-time token and email a link.
 
     Security
     --------
@@ -156,9 +242,9 @@ async def request_mfa_reset(
     - Rate-limited per normalized email and per IP.
     - CSPRNG token; only **digest** stored at rest.
     - Clears old unused tokens for the user on issuance.
-    - Non-blocking email + audit dispatch via BackgroundTasks.
+    - Non-blocking email + audit dispatch via `BackgroundTasks`.
     """
-    # ── [Step 1] Normalize + rate-limit ──────────────────────────────────────
+    # [1] Normalize + rate-limit
     ip = _client_ip(request)
     email_norm = _norm_email(payload.email)
 
@@ -175,43 +261,60 @@ async def request_mfa_reset(
         error_message="Too many attempts. Please try again later.",
     )
 
-    # ── [Step 2] Silent lookup (no enumeration) ──────────────────────────────
+    # [2] Silent lookup (no enumeration)
     user = (await db.execute(select(User).where(User.email == email_norm))).scalar_one_or_none()
     generic = {"message": "If an account with that email exists, an MFA reset link has been sent."}
 
-    # If user missing OR MFA not enabled → generic 200 OK (audit as NOT_FOUND)
+    # User missing OR MFA not enabled → generic 200 OK (audit as NOT_FOUND)
     if not user or not getattr(user, "mfa_enabled", False):
         if background_tasks:
             background_tasks.add_task(
-                log_audit_event,
-                db,
-                None,
-                AuditEvent.MFA_RESET_REQUESTED,
-                "NOT_FOUND",
-                request,
-                {"email_hash": hashlib.sha256(email_norm.encode()).hexdigest(), "ip": ip},
-                False,
+                _audit_safely,
+                db=db,
+                user=None,
+                action=AuditEvent.MFA_RESET_REQUESTED,
+                status="NOT_FOUND",
+                request=request,
+                meta_data={
+                    "email_hash": hashlib.sha256(email_norm.encode()).hexdigest(),
+                    "ip": ip,
+                },
+                commit=False,
             )
         return generic
 
-    # ── [Step 3] Generate token + digest ─────────────────────────────────────
+    # [3] Generate token + digest
     token = secrets.token_urlsafe(32)
     digest = _token_digest(token)
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=MFA_RESET_TTL_MINUTES)
+    created_at = datetime.now(timezone.utc)
+    expires_at = created_at + timedelta(minutes=MFA_RESET_TTL_MINUTES)
 
-    # ── [Step 4] Persist atomically: clear prior unused, insert new ──────────
-    tx_ctx = db.begin_nested() if db.in_transaction() else db.begin()
+    # [4] Persist atomically: clear prior unused, insert new
+    used_nested = db.in_transaction()
+    tx_ctx = db.begin_nested() if used_nested else db.begin()
     async with tx_ctx:
         await db.execute(
-            delete(MFAResetToken).where(MFAResetToken.user_id == user.id, MFAResetToken.used == False)  # noqa: E712
+            delete(MFAResetToken).where(
+                MFAResetToken.user_id == user.id,
+                MFAResetToken.used == False,  # noqa: E712
+            )
         )
-        db.add(MFAResetToken(user_id=user.id, token=digest, expires_at=expires_at, used=False))
+        db.add(
+            MFAResetToken(
+                user_id=user.id,
+                token=digest,
+                created_at=created_at,   # ensure DB row uses the same base time
+                expires_at=expires_at,   # guaranteed > created_at
+                used=False,
+            )
+        )
 
-    # ── [Step 5] Send email + audit (background) ─────────────────────────────
+
+    # [5] Send email + audit (background, error-safe)
     if background_tasks is not None:
         reset_url = f"{FRONTEND_BASE.rstrip('/')}/reset-mfa?token={token}"
         background_tasks.add_task(
-            send_email,
+            _send_email_safely,
             to=user.email,
             subject="🔐 MFA Reset Request",
             body=(
@@ -222,30 +325,32 @@ async def request_mfa_reset(
             ),
         )
         background_tasks.add_task(
-            log_audit_event,
-            db,
-            user,
-            AuditEvent.MFA_RESET_REQUESTED,
-            "SUCCESS",
-            request,
-            {"expires_at": expires_at.isoformat(), "ip": ip},
-            False,
+            _audit_safely,
+            db=db,
+            user=user,
+            action=AuditEvent.MFA_RESET_REQUESTED,
+            status="SUCCESS",
+            request=request,
+            meta_data={"expires_at": expires_at.isoformat(), "ip": ip},
+            commit=False,
         )
 
-    # ── [Step 6] Always neutral response ─────────────────────────────────────
+    # [6] Always neutral response
     return generic
 
 
 # ─────────────────────────────────────────────────────────────
 # ✅ Confirm MFA Reset (Token Verification)
 # ─────────────────────────────────────────────────────────────
+
 async def confirm_mfa_reset(
     payload: MFAResetConfirm,
     db: AsyncSession,
     request: Optional[Request],
     background_tasks: Optional[BackgroundTasks],
 ) -> dict:
-    """Confirm an MFA reset via token; disable MFA and mark token used.
+    """
+    Confirm an MFA reset via token; disable MFA and mark token used.
 
     Security
     --------
@@ -254,7 +359,7 @@ async def confirm_mfa_reset(
     - **Atomic** update: disables MFA, consumes the token.
     - **Invalidates recovery codes** so stale codes can’t be used post-reset.
     """
-    # ── [Step 1] Rate-limit verification ─────────────────────────────────────
+    # [1] Rate-limit verification
     ip = _client_ip(request)
     await enforce_rate_limit(
         key_suffix=f"mfa-reset:confirm:{ip}",
@@ -263,12 +368,12 @@ async def confirm_mfa_reset(
         error_message="Too many attempts. Please try again shortly.",
     )
 
-    # ── [Step 2] Token sanity ────────────────────────────────────────────────
+    # [2] Token sanity
     token_str = (payload.token or "").strip()
-    if not token_str or len(token_str) > 512 or not _TOKEN_RE.match(token_str):
+    if not token_str or not _TOKEN_RE.match(token_str):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired token")
 
-    # ── [Step 3] Lookup by digest with TTL ───────────────────────────────────
+    # [3] Lookup by digest with TTL (legacy plaintext tolerated)
     digest = _token_digest(token_str)
     now = datetime.now(timezone.utc)
 
@@ -277,7 +382,7 @@ async def confirm_mfa_reset(
             select(MFAResetToken).where(
                 MFAResetToken.used == False,  # noqa: E712
                 MFAResetToken.expires_at > now,
-                or_(MFAResetToken.token == digest, MFAResetToken.token == token_str),  # tolerate legacy/plain
+                or_(MFAResetToken.token == digest, MFAResetToken.token == token_str),  # legacy/plain fallback
             )
         )
     ).scalar_one_or_none()
@@ -285,59 +390,73 @@ async def confirm_mfa_reset(
     if not reset_row:
         if background_tasks:
             background_tasks.add_task(
-                log_audit_event,
-                db,
-                None,
-                AuditEvent.MFA_RESET_CONFIRMED,
-                "FAILURE",
-                request,
-                {"reason": "invalid_or_expired", "ip": ip},
-                False,
+                _audit_safely,
+                db=db,
+                user=None,
+                action=AuditEvent.MFA_RESET_CONFIRMED,
+                status="FAILURE",
+                request=request,
+                meta_data={"reason": "invalid_or_expired", "ip": ip},
+                commit=False,
             )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired token")
 
-    # ── [Step 4] Fetch user ──────────────────────────────────────────────────
+    # [4] Fetch user
     user: User | None = (await db.execute(select(User).where(User.id == reset_row.user_id))).scalar_one_or_none()
     if not user:
         if background_tasks:
             background_tasks.add_task(
-                log_audit_event,
-                db,
-                None,
-                AuditEvent.MFA_RESET_CONFIRMED,
-                "FAILURE",
-                request,
-                {"reason": "user_not_found", "user_id": str(reset_row.user_id), "ip": ip},
-                False,
+                _audit_safely,
+                db=db,
+                user=None,
+                action=AuditEvent.MFA_RESET_CONFIRMED,
+                status="FAILURE",
+                request=request,
+                meta_data={"reason": "user_not_found", "user_id": str(reset_row.user_id), "ip": ip},
+                commit=False,
             )
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid or expired token")
 
-    # ── [Step 5] Atomically disable MFA and consume token ────────────────────
-    tx_ctx = db.begin_nested() if db.in_transaction() else db.begin()
+    # [5] Atomically disable MFA and consume token (+ clear other unused)
+    used_nested = db.in_transaction()
+    tx_ctx = db.begin_nested() if used_nested else db.begin()
     async with tx_ctx:
         user.totp_secret = None
         user.mfa_enabled = False
         reset_row.used = True
-        # Clear any other outstanding (unused) reset tokens
-        await db.execute(delete(MFAResetToken).where(MFAResetToken.user_id == user.id, MFAResetToken.used == False))
+        db.add_all([user, reset_row])
+        await db.execute(
+            delete(MFAResetToken).where(
+                MFAResetToken.user_id == user.id,
+                MFAResetToken.used == False,  # noqa: E712
+            )
+        )
+    await _commit_or_flush(db, used_nested)
 
-    # ── [Step 6] Invalidate recovery codes for this user ─────────────────────
+    # [6] Invalidate recovery codes (best-effort)
     await _invalidate_recovery_codes(user.id)
 
-    # ── [Step 7] Best-effort cache invalidation ──────────────────────────────
+    # [7] Best-effort cache invalidation
     _invalidate_user_caches_safe(user.id)
 
-    # (Optional) ─ Revoke sessions/trusted devices here if you have a helper:
+    # (Optional) Revoke sessions/trusted devices here if desired.
     # from app.core.sessions import revoke_all_sessions_for_user
     # await revoke_all_sessions_for_user(user.id)
 
-    # ── [Step 8] Audit success ───────────────────────────────────────────────
+    # [8] Audit success (background)
     if background_tasks:
         background_tasks.add_task(
-            log_audit_event, db, user, AuditEvent.MFA_RESET_CONFIRMED, "SUCCESS", request, {"ip": ip}, False
+            _audit_safely,
+            db=db,
+            user=user,
+            action=AuditEvent.MFA_RESET_CONFIRMED,
+            status="SUCCESS",
+            request=request,
+            meta_data={"ip": ip},
+            commit=False,
         )
 
-    # ── [Step 9] Respond ─────────────────────────────────────────────────────
+    # [9] Respond
     return {
         "message": "MFA has been reset. Please reconfigure your authenticator and generate new recovery codes.",
     }

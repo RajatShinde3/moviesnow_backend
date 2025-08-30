@@ -1,5 +1,4 @@
 # app/api/v1/auth/authentication.py
-from __future__ import annotations
 
 """
 Authentication API — MoviesNow (org‑free, production‑grade)
@@ -43,7 +42,7 @@ from app.security_headers import set_sensitive_cache
 from app.services.auth.login_service import login_user, login_with_mfa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-router = APIRouter(prefix="/auth", tags=["Authentication"])  # org‑free auth
+router = APIRouter(tags=["Authentication"])  # org‑free auth
 
 
 # ──────────────────────────────────────────────────────────────

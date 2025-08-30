@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 """
 Email verification API — hardened, production‑grade

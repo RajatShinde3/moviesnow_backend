@@ -70,12 +70,11 @@ class OTP(Base):
 
     # ─────────────── Indexes ───────────────
     __table_args__ = (
-        # One *active* OTP per user/purpose
+        # Fast lookup for currently-unused OTPs (filtered, **non-unique**)
         Index(
-            "uq_otps_one_active_per_user_purpose",
+            "ix_otps_active_by_user_purpose",
             "user_id",
             "purpose",
-            unique=True,
             postgresql_where=text("used = false"),
         ),
         # Fast validation lookups
@@ -84,6 +83,7 @@ class OTP(Base):
         Index("ix_otps_expires_at", "expires_at"),
         Index("ix_otps_user_used", "user_id", "used"),
     )
+
 
     # ─────────────── Relationships ───────────────
     user = relationship(

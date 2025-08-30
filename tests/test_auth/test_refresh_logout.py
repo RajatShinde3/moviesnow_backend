@@ -1,6 +1,5 @@
 import pytest
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
 
 from httpx import AsyncClient
 from jose import jwt
@@ -19,8 +18,11 @@ from app.services.token_service import store_refresh_token
 # ──────────────────────────────────────────────────────────────────────────────
 
 def ip_header(seed: int) -> dict[str, str]:
-    # Make each test look like a different client to dodge per-IP rate limits
-    return {"X-Forwarded-For": f"127.0.0.{seed}"}
+    """
+    Different client IP per test and always a valid IPv4 to satisfy inet columns.
+    """
+    last = (seed % 254) + 1
+    return {"X-Forwarded-For": f"127.0.0.{last}"}
 
 async def bearer(user: User) -> dict[str, str]:
     access = await create_access_token(user_id=user.id)
@@ -89,6 +91,9 @@ async def test_refresh_token_invalid_jwt(async_client: AsyncClient):
 
 @pytest.mark.anyio
 async def test_refresh_token_reuse_detected(async_client: AsyncClient, create_test_user, redis_client, db_session: AsyncSession):
+    """
+    Central decoder flags revoked JTI and returns the generic invalid message.
+    """
     user = await create_test_user(is_verified=True)
     token_str, jti, _ = await make_refresh_session(db_session, user, redis_client)
 
@@ -101,7 +106,7 @@ async def test_refresh_token_reuse_detected(async_client: AsyncClient, create_te
         headers=ip_header(102),
     )
     assert resp.status_code == 401
-    assert "reused" in resp.text.lower()
+    assert "invalid refresh token" in resp.text.lower()
 
 
 @pytest.mark.anyio
@@ -135,7 +140,6 @@ async def test_refresh_token_db_expired(async_client: AsyncClient, create_test_u
         .values(created_at=past - timedelta(seconds=1), expires_at=past)
     )
     await db_session.commit()
-
 
     resp = await async_client.post(
         "/api/v1/auth/refresh-token",
@@ -258,11 +262,14 @@ async def test_revoke_tokens_self(async_client: AsyncClient, create_test_user, r
 
 
 @pytest.mark.anyio
-async def test_revoke_tokens_admin_same_org(async_client: AsyncClient, create_test_user, create_organization_fixture, redis_client, db_session: AsyncSession):
-    org = await create_organization_fixture()
-
-    admin = await create_test_user(is_verified=True, is_superuser=True, organizations=[org])
-    target = await create_test_user(is_verified=True, organizations=[org])
+async def test_revoke_tokens_admin_other_user_superuser_success(
+    async_client: AsyncClient, create_test_user, redis_client, db_session: AsyncSession
+):
+    """
+    Org-free variant: superuser may revoke tokens for any user.
+    """
+    admin = await create_test_user(is_verified=True, is_superuser=True)
+    target = await create_test_user(is_verified=True)
     headers = await bearer(admin)
 
     # Give target a couple of active refresh tokens
@@ -279,24 +286,6 @@ async def test_revoke_tokens_admin_same_org(async_client: AsyncClient, create_te
 
     rows = (await db_session.execute(select(RefreshToken).where(RefreshToken.user_id == target.id))).scalars().all()
     assert rows and all(getattr(r, "is_revoked", False) for r in rows)
-
-
-@pytest.mark.anyio
-async def test_revoke_tokens_admin_different_org_forbidden(async_client: AsyncClient, create_test_user, create_organization_fixture, db_session: AsyncSession):
-    org_a = await create_organization_fixture()
-    org_b = await create_organization_fixture()
-
-    admin = await create_test_user(is_verified=True, is_superuser=True, organizations=[org_a])
-    target = await create_test_user(is_verified=True, organizations=[org_b])
-    headers = await bearer(admin)
-
-    resp = await async_client.post(
-        "/api/v1/auth/revoke-token",
-        json={"user_id": str(target.id)},
-        headers=headers | ip_header(302),
-    )
-    assert resp.status_code == 403
-    assert "different organization" in resp.text.lower()
 
 
 @pytest.mark.anyio

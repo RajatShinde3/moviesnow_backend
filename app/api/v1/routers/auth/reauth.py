@@ -1,6 +1,4 @@
 # app/api/v1/auth/reauth.py
-from __future__ import annotations
-
 """
 Enterprise‑grade **Step‑Up (Re‑Auth)** Router — MoviesNow
 =========================================================
