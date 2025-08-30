@@ -194,7 +194,7 @@ def begin_assertion(
             "rpId": rp_id,
             "timeout": 60000,
             "allowCredentials": allow,
-            "userVerification": user_verification,
+            "userVerification": user_verification, 
         }
 
     from fido2.server import Fido2Server

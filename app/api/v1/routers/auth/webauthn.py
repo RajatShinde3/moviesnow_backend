@@ -1,5 +1,4 @@
 # app/api/v1/auth/webauthn.py
-from __future__ import annotations
 
 """
 MoviesNow — WebAuthn (Passkeys) API
