@@ -23,7 +23,8 @@ from app.api.v1.routers.auth import (
     signup, login, refresh_logout, account_deactivation,
     email_verification, password_reset, mfa, mfa_reset,
     account_deletion, reactivation, reauth, recovery_codes,
-    trusted_devices, sessions, activity
+    trusted_devices, sessions, activity, credentials,
+    
 )
 
 @pytest.fixture()
@@ -58,6 +59,7 @@ async def app(db_session: AsyncSession) -> FastAPI:
     app.include_router(trusted_devices.router, prefix="/api/v1/auth")
     app.include_router(sessions.router, prefix="/api/v1/auth")
     app.include_router(activity.router, prefix="/api/v1/auth")
+    app.include_router(credentials.router, prefix="/api/v1/auth")
 
 
     # 🔁 Override DB dependency with isolated test session

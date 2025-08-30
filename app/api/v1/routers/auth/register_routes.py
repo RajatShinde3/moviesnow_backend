@@ -21,7 +21,8 @@ from . import (
     reauth,
     trusted_devices,
     sessions,
-    activity
+    activity,
+    credentials,
 )
 
 # Optional: add no-store headers to every auth response via dependency
@@ -85,6 +86,7 @@ def build_auth_router(
     router.include_router(trusted_devices.router,     responses=common_responses)
     router.include_router(sessions.router,            responses=common_responses)    
     router.include_router(activity.router,            responses=common_responses)    
+    router.include_router(credentials.router,         responses=common_responses)    
 
 
     return router

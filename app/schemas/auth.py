@@ -1,7 +1,7 @@
 # app/schemas/auth.py
 
 from pydantic import BaseModel, EmailStr, Field, constr, SecretStr, ConfigDict
-from typing import Optional, Union, Dict, List, Any
+from typing import Optional, Union, Dict, List, Any, Literal
 from uuid import UUID
 from app.schemas.enums import LoginMode, OrgRole
 from datetime import datetime, timezone
@@ -397,3 +397,64 @@ class OrgInviteInfoResponse(BaseModel):
     model_config = {
         "from_attributes": True
     }
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8, description="At least 8 chars; enforce org policy as needed")
+
+class EmailChangeStartIn(BaseModel):
+    new_email: EmailStr
+    current_password: Optional[str] = Field(None, description="Optional extra check; recommended to include")
+
+class EmailChangeConfirmIn(BaseModel):
+    token: str = Field(..., min_length=16, max_length=512)
+
+
+class PublicKeyCredential(BaseModel):
+    """Generic WebAuthn credential envelope from browser."""
+    id: str
+    rawId: str
+    type: Literal["public-key"]
+    response: Dict[str, Any]
+    clientExtensionResults: Optional[Dict[str, Any]] = None
+    authenticatorAttachment: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
+
+class RegistrationOptionsResponse(BaseModel):
+    publicKey: Dict[str, Any]  # The actual options object; property name matches WebAuthn spec.
+
+class RegistrationVerifyRequest(BaseModel):
+    credential: PublicKeyCredential
+    nickname: Optional[str] = Field(None, description="Optional display name for this passkey")
+
+class RegistrationVerifyResponse(BaseModel):
+    id: str
+    nickname: Optional[str] = None
+    aaguid: Optional[str] = None
+    transports: Optional[List[str]] = None
+    sign_count: int
+    created_at: datetime
+
+class AssertionOptionsRequest(BaseModel):
+    username: Optional[str] = Field(None, description="Email/username to narrow allowCredentials; omit for discoverable")
+    discoverable: bool = Field(True, description="Allow discoverable credentials (allowCredentials empty)")
+    user_verification: Literal["required", "preferred", "discouraged"] = "preferred"
+
+class AssertionOptionsResponse(BaseModel):
+    publicKey: Dict[str, Any]
+
+class AssertionVerifyRequest(BaseModel):
+    credential: PublicKeyCredential
+
+class CredentialItem(BaseModel):
+    id: str
+    nickname: Optional[str] = None
+    aaguid: Optional[str] = None
+    transports: Optional[List[str]] = None
+    sign_count: int
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+
+class CredentialsListResponse(BaseModel):
+    total: int
+    credentials: List[CredentialItem]
