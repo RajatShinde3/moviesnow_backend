@@ -21,7 +21,6 @@ from app.db.models.otp import OTP
 from app.db.models.mfa_reset_token import MFAResetToken
 from app.db.models.profile import Profile
 from app.db.models.audit_log import AuditLog
-from app.db.models.webauthn import WebAuthnCredential
 # ───────────────────────────────────────────────────────────────
 # Catalog: Titles, Structure, Media, People, Credits
 # ───────────────────────────────────────────────────────────────

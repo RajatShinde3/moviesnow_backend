@@ -46,9 +46,13 @@ from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
 try:
     # Preferred: use your installer (handles storage/compat)
-    from app.core.limiter import install_rate_limiter
+    from app.core.limiter import install_rate_limiter, rate_limit_exempt
 except Exception:  # pragma: no cover
     install_rate_limiter = None  # type: ignore
+    def rate_limit_exempt():  # type: ignore
+        def _noop(fn):
+            return fn
+        return _noop
 
 # -- Settings & optional custom exception handlers ----------------------------
 from app.core.config import settings
@@ -209,7 +213,8 @@ def create_app() -> FastAPI:
         logger.warning("No v1 router found at app.api.v1; continuing without API routes")
 
     # ── Meta endpoints ──────────────────────────────────────────────────────
-    @app.get("/healthz", tags=["meta"])
+    @app.get("/healthz", tags=["meta"])  # health endpoints should not be rate limited
+    @rate_limit_exempt()
     async def healthz() -> dict[str, bool]:
         """
         Liveness probe.
@@ -219,7 +224,8 @@ def create_app() -> FastAPI:
         """
         return {"ok": True}
 
-    @app.get("/readyz", tags=["meta"])
+    @app.get("/readyz", tags=["meta"])  # readiness should not be rate limited
+    @rate_limit_exempt()
     async def readyz() -> dict[str, object]:
         """
         Readiness probe (quick DB + Redis checks, best-effort).

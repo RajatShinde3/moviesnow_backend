@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-
+from sqlalchemy import select
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,7 +47,6 @@ def _iso_now(delta: Optional[int] = None) -> str:
 # ─────────────────────────────────────────────────────────────
 # GET /auth/activity
 # ─────────────────────────────────────────────────────────────
-
 @pytest.mark.anyio
 async def test_activity_fallbacks_to_redis_when_db_empty(
     async_client: AsyncClient, create_test_user, redis_client, db_session: AsyncSession
@@ -88,15 +87,24 @@ async def test_activity_fallbacks_to_redis_when_db_empty(
             "user_agent": "pytest/ua",
         },
     ]
+
+    # Insert entries into Redis
     for e in entries:
         await redis_client.rpush(key, json.dumps(e))
 
+    # Ensure Redis entries are inserted
+    assert await redis_client.llen(key) == len(entries), "Redis entries not inserted correctly"
+
+    # Send the request
     r = await async_client.get(ACTIVITY, headers=headers | ip_header(40))
+    
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["total"] == len(entries)
+
+    # Ensure the correct number of items are returned from Redis
+    assert body["total"] == len(entries), f"Expected {len(entries)} entries, got {body['total']}"
+
     actions = [it["action"] for it in body["items"]]
-    # Ensure we see the actions we inserted
     assert {"LOGIN_SUCCESS", "ACCOUNT_PASSWORD_CHANGED", "MFA_CHALLENGE"}.issubset(set(actions))
 
 
@@ -161,7 +169,7 @@ async def test_activity_db_first_when_auditlog_available(
     except Exception:
         pytest.skip("AuditLog model not available in this deployment")
 
-    # Insert a couple of rows
+    # Insert AuditLog entries into DB
     row1 = AuditLog(
         user_id=user.id,
         action="LOGIN_SUCCESS",
@@ -183,11 +191,18 @@ async def test_activity_db_first_when_auditlog_available(
     db_session.add_all([row1, row2])
     await db_session.commit()
 
+    # Ensure the DB has the data
+    assert await db_session.execute(select(AuditLog).filter_by(user_id=user.id)).count() == 2, "DB query failed"
+
+    # Send the request
     r = await async_client.get(ACTIVITY, headers=headers | ip_header(44))
     assert r.status_code == 200
     body = r.json()
+
+    # Ensure that both actions are returned
     acts = [it["action"] for it in body["items"]]
     assert {"LOGIN_SUCCESS", "ACCOUNT_PASSWORD_CHANGED"}.issubset(set(acts))
+
 
 
 # ─────────────────────────────────────────────────────────────

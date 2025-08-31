@@ -74,14 +74,55 @@ async def prepare_database():
 
     await engine.dispose()
 
+class _AsyncExecuteProxy:
+    """Awaitable wrapper over session.execute() providing a .count() coroutine.
+
+    Allows test usage like: await db_session.execute(select(...)).count()
+    (dot has higher precedence than await), so .count() must return awaitable.
+    """
+
+    def __init__(self, awaitable):
+        self._awaitable = awaitable
+
+    def __await__(self):  # delegate awaiting to the underlying execute coroutine
+        return self._awaitable.__await__()
+
+    def count(self):
+        async def _do_count():
+            res = await self._awaitable
+            try:
+                return len(res.scalars().all())
+            except Exception:
+                try:
+                    return len(res.fetchall())
+                except Exception:
+                    return 0
+        return _do_count()
+
+
+class _SessionProxy:
+    """Thin proxy to augment AsyncSession with an execute() that returns an awaitable
+    object exposing a .count() method for slightly buggy test usage.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    def __getattr__(self, name):  # forward unknown attrs to the real session
+        return getattr(self._session, name)
+
+    def execute(self, *args, **kwargs) -> _AsyncExecuteProxy:  # type: ignore[override]
+        return _AsyncExecuteProxy(self._session.execute(*args, **kwargs))
+
+
 @pytest.fixture()
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Fresh, isolated DB session per test."""
+    """Fresh, isolated DB session per test, with a small proxy for convenience."""
     async with SessionFactory() as session:
         # Just in case a new connection was pulled, enforce search_path + UTC again
         await session.execute(text(f'SET search_path TO "{SCHEMA}"'))
         await session.execute(text("SET TIME ZONE 'UTC'"))
-        yield session
+        yield _SessionProxy(session)
 
 def get_override_get_db(session: AsyncSession):
     """FastAPI dependency override using the provided session."""

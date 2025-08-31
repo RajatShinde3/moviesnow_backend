@@ -59,17 +59,81 @@ def _ensure_text(v) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────
 
 class MockRedisClient:
+    
     def __init__(self) -> None:
         # Simple key spaces by type
         self.store: Dict[str, Any] = {}               # strings / bytes
         self.expirations: Dict[str, Optional[float]] = {}  # epoch seconds or None
         self.sets: Dict[str, set] = {}
         self.hashes: Dict[str, Dict[str, Any]] = {}
+        self.lists: Dict[str, List[Any]] = {}
         # Lua registry for script_load/evalsha
         self._sha_to_script: Dict[str, str] = {}
         # Tiny in-memory locks
         self._locks: Dict[str, str] = {}  # key -> token
         self._closed = False
+
+    async def rpush(self, key: str, value: str) -> int:
+        """Simulate RPUSH for adding elements to a Redis list."""
+        if key not in self.lists:
+            self.lists[key] = []  # Create list if it doesn't exist
+        self.lists[key].append(value)  # Append to the list
+        return len(self.lists[key])  # Return the new length of the list
+
+    async def llen(self, key: str) -> int:
+        """Simulate LLEN to return the length of a Redis list."""
+        return len(self.lists.get(key, []))  # Return length of the list
+
+    async def lrange(self, key: str, start: int, end: int) -> List[Any]:
+        """Simulate LRANGE with Redis semantics (inclusive end, supports negatives)."""
+        lst = self.lists.get(key, [])
+        n = len(lst)
+        # Normalize negative indices
+        if start < 0:
+            start = n + start
+        if end < 0:
+            end = n + end
+        # Clamp bounds
+        if start < 0:
+            start = 0
+        if end < 0 or start >= n:
+            return []
+        if end >= n:
+            end = n - 1
+        if start > end:
+            return []
+        # Inclusive end
+        return list(lst[start:end + 1])
+
+    async def ltrim(self, key: str, start: int, end: int) -> bool:
+        """Simulate LTRIM keeping only the specified inclusive range."""
+        lst = self.lists.get(key, [])
+        n = len(lst)
+        if n == 0:
+            self.lists[key] = []
+            return True
+        # Normalize negative indices
+        if start < 0:
+            start = n + start
+        if end < 0:
+            end = n + end
+        # Clamp bounds similar to Redis behavior
+        if start < 0:
+            start = 0
+        if end < 0:
+            # Entire list trimmed away
+            self.lists[key] = []
+            return True
+        if start >= n:
+            self.lists[key] = []
+            return True
+        if end >= n:
+            end = n - 1
+        if start > end:
+            self.lists[key] = []
+            return True
+        self.lists[key] = list(lst[start:end + 1])
+        return True
 
     # ── housekeeping ──────────────────────────────────────────
     async def ping(self) -> bool:
@@ -83,8 +147,13 @@ class MockRedisClient:
         self.expirations.clear()
         self.sets.clear()
         self.hashes.clear()
+        self.lists.clear()
         self._locks.clear()
         self._sha_to_script.clear()
+
+    # Some test suites call flushall; treat it as flushdb in this mock
+    async def flushall(self) -> None:
+        await self.flushdb()
 
     async def info(self) -> Dict[str, Any]:
         return {"redis_version": "mock", "connected_clients": 1}

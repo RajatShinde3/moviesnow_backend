@@ -188,6 +188,48 @@ class AssignSuperadminResponse(BaseModel):
     user: SimpleUserResponse
     role: str
 
+# ---------------------------------------------------------------------------
+# Admin role assignment response (ADMIN)
+# ---------------------------------------------------------------------------
+class AssignADMINResponse(BaseModel):
+    """Response model for assigning the ADMIN role to a user.
+
+    Mirrors AssignSuperadminResponse shape for consistency across admin actions.
+    """
+    message: str
+    user: SimpleUserResponse
+    role: str
+
+# ---------------------------------------------------------------------------
+# Admin role revocation response (USER after revoke)
+# ---------------------------------------------------------------------------
+class RevokeADMINResponse(BaseModel):
+    """Response model for revoking the ADMIN role (demote to USER)."""
+    message: str
+    user: SimpleUserResponse
+    role: str
+
+
+# ---------------------------------------------------------------------------
+# Admin list item (org-free)
+# ---------------------------------------------------------------------------
+class AdminUserItem(BaseModel):
+    id: UUID
+    email: EmailStr
+    full_name: Optional[str] = None
+    is_active: bool
+    role: str
+
+# ---------------------------------------------------------------------------
+# Role update request (org-free)
+# ---------------------------------------------------------------------------
+class RoleUpdateRequest(BaseModel):
+    """Request to update a user's role.
+
+    Accepts roles from `OrgRole` enum (e.g., USER, ADMIN, SUPERUSER).
+    """
+    role: OrgRole
+
 class ReactivateAccountRequest(BaseModel):
     email: EmailStr
     otp: constr(min_length=6, max_length=6)
@@ -266,7 +308,6 @@ class TrustedDeviceItem(BaseModel):
     model_config = ConfigDict(
         from_attributes=True,
         ser_json_timedelta="iso8601",  # for timedelta fields if any
-        json_encoders={datetime: lambda v: v.isoformat()},
     )
 
 
@@ -278,7 +319,6 @@ class TrustedDevicesList(BaseModel):
 
     model_config = ConfigDict(
         from_attributes=True,
-        json_encoders={datetime: lambda v: v.isoformat()},
     )
 
 
@@ -315,7 +355,6 @@ class SessionItem(BaseModel):
     model_config = ConfigDict(
         from_attributes=True,
         populate_by_name=True,
-        json_encoders={},  # FastAPI handles datetime → ISO-8601
     )
 
 
@@ -458,3 +497,5 @@ class CredentialItem(BaseModel):
 class CredentialsListResponse(BaseModel):
     total: int
     credentials: List[CredentialItem]
+
+
