@@ -11,6 +11,8 @@ from .auth import register_routes as auth_routes
 from .orgs import admin as user_admin_routes
 from .orgs import management as user_mgmt_routes
 from . import admin_auth as admin_auth_routes
+from . import admin_sessions as admin_sessions_routes
+from . import admin_staff as admin_staff_routes
 
 # Optional: add no-store headers globally (auth-sensitive endpoints already apply this internally)
 try:
@@ -49,6 +51,8 @@ def build_api_v1_router(*, add_no_store: bool = False) -> APIRouter:
     router.include_router(user_mgmt_routes.router,      prefix="/users",  tags=["User Management"], responses=common_responses)
     router.include_router(user_admin_routes.router,     prefix="/users",  tags=["User Management"], responses=common_responses)
     router.include_router(admin_auth_routes.router,     prefix="/admin",  tags=["Admin Auth"],      responses=common_responses)
+    router.include_router(admin_sessions_routes.router, prefix="/admin",  tags=["Admin Sessions"],  responses=common_responses)
+    router.include_router(admin_staff_routes.router,    prefix="/admin",  tags=["Admin Staff"],     responses=common_responses)
 
     return router
 
