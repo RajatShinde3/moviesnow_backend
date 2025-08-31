@@ -15,7 +15,7 @@ User-centric ADMIN role management using shared primitives:
 from typing import List
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status, Depends, Request, Query
+from fastapi import APIRouter, HTTPException, status, Depends, Request, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import exc as sa_exc
@@ -48,6 +48,7 @@ router = APIRouter(tags=["Admin Actions"])
 @rate_limit("3/minute")
 async def assign_ADMIN_route(
     request: Request,
+    response: Response,
     user_id: UUID,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
@@ -65,7 +66,7 @@ async def assign_ADMIN_route(
     - Uses Redis distributed lock and row-level DB lock to avoid races.
     """
 
-    set_sensitive_cache(request)
+    set_sensitive_cache(response)
 
     # Per-actor hourly budget (defense-in-depth)
     try:
@@ -235,6 +236,7 @@ async def assign_ADMIN_route(
 @rate_limit("3/minute")
 async def revoke_ADMIN_route(
     request: Request,
+    response: Response,
     user_id: UUID,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
@@ -248,7 +250,7 @@ async def revoke_ADMIN_route(
     - Target must currently be `UserRole.ADMIN`.
     """
 
-    set_sensitive_cache(request)
+    set_sensitive_cache(response)
 
     # Per-actor hourly budget
     try:
@@ -414,6 +416,7 @@ async def revoke_ADMIN_route(
 @rate_limit("10/minute")
 async def list_admins(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     limit: int = Query(50, ge=1, le=200),
@@ -423,7 +426,7 @@ async def list_admins(
 
     Requires the caller to be ADMIN.
     """
-    set_sensitive_cache(request, seconds=0)
+    set_sensitive_cache(response, seconds=0)
 
     if current_user.role != UserRole.ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")

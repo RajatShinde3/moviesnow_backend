@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 """
 Admin Sessions & Token Rotation
@@ -145,6 +144,7 @@ async def admin_refresh(
 @rate_limit("30/minute")
 async def list_sessions(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     limit: int = Query(20, ge=1, le=100),
@@ -185,6 +185,7 @@ async def list_sessions(
 async def revoke_session(
     payload: Dict[str, str],
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
@@ -213,6 +214,7 @@ async def revoke_session(
 @rate_limit("10/minute")
 async def revoke_other_sessions(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
@@ -242,6 +244,7 @@ async def revoke_other_sessions(
 @rate_limit("10/minute")
 async def revoke_all_sessions(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:

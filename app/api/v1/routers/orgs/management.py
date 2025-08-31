@@ -19,7 +19,7 @@ Practices
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import exc as sa_exc
@@ -51,6 +51,7 @@ router = APIRouter(tags=["User Management"])
 @rate_limit("5/minute")
 async def update_user_role(
     request: Request,
+    response: Response,
     user_id: UUID,
     payload: RoleUpdateRequest,
     db: AsyncSession = Depends(get_async_db),
@@ -64,7 +65,7 @@ async def update_user_role(
     - Only SUPERUSER can assign/demote SUPERUSER.
     - No self role change.
     """
-    set_sensitive_cache(request)
+    set_sensitive_cache(response)
 
     # Per-actor hourly budget
     await enforce_rate_limit(
@@ -182,6 +183,7 @@ async def update_user_role(
 @rate_limit("5/minute")
 async def deactivate_user(
     request: Request,
+    response: Response,
     user_id: UUID,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
@@ -190,7 +192,7 @@ async def deactivate_user(
 
     Only ADMIN or SUPERUSER may deactivate; cannot deactivate self.
     """
-    set_sensitive_cache(request)
+    set_sensitive_cache(response)
     await enforce_rate_limit(
         key_suffix=f"deactivate:{current_user.id}", seconds=1800, max_calls=10,
         error_message="Too many deactivations; please try again later.",
@@ -267,6 +269,7 @@ async def deactivate_user(
 @rate_limit("5/minute")
 async def reactivate_user(
     request: Request,
+    response: Response,
     user_id: UUID,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
@@ -275,7 +278,7 @@ async def reactivate_user(
 
     Only ADMIN or SUPERUSER may reactivate.
     """
-    set_sensitive_cache(request)
+    set_sensitive_cache(response)
     await enforce_rate_limit(
         key_suffix=f"reactivate:{current_user.id}", seconds=1800, max_calls=10,
         error_message="Too many reactivations; please try again later.",

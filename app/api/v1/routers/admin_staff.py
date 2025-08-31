@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 """
 Admin Staff Management (Org-free)
@@ -92,6 +91,7 @@ def _serialize_user(u: User) -> Dict[str, object]:
 @rate_limit("30/minute")
 async def list_staff(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     role: Optional[UserRole] = Query(None, description="Filter by role: ADMIN or SUPERUSER"),
@@ -101,7 +101,7 @@ async def list_staff(
 ) -> List[Dict[str, object]]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    set_sensitive_cache(request, seconds=0)
+    set_sensitive_cache(response, seconds=0)
 
     conditions = [User.role.in_([UserRole.ADMIN, UserRole.SUPERUSER])]
     if role:
@@ -125,6 +125,7 @@ async def list_staff(
 @rate_limit("10/minute")
 async def list_superusers(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     limit: int = Query(50, ge=1, le=200),
@@ -132,7 +133,7 @@ async def list_superusers(
 ) -> List[Dict[str, object]]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    set_sensitive_cache(request, seconds=0)
+    set_sensitive_cache(response, seconds=0)
 
     cache_key = f"cache:admin:superusers:{limit}:{offset}"
     try:
@@ -162,6 +163,7 @@ async def list_superusers(
 @rate_limit("10/minute")
 async def list_admins_only(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     limit: int = Query(50, ge=1, le=200),
@@ -169,7 +171,7 @@ async def list_admins_only(
 ) -> List[Dict[str, object]]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    set_sensitive_cache(request, seconds=0)
+    set_sensitive_cache(response, seconds=0)
 
     stmt = (
         select(User)
@@ -191,6 +193,7 @@ class _ReauthBody:
 async def promote_superuser(
     user_id: UUID,
     request: Request,
+    response: Response,
     body: Dict[str, str],
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
@@ -225,6 +228,7 @@ async def promote_superuser(
 async def demote_superuser(
     user_id: UUID,
     request: Request,
+    response: Response,
     body: Dict[str, str],
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
@@ -257,6 +261,7 @@ async def demote_superuser(
 async def grant_admin(
     user_id: UUID,
     request: Request,
+    response: Response,
     body: Dict[str, object],
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
@@ -292,6 +297,7 @@ async def grant_admin(
 async def remove_admin(
     user_id: UUID,
     request: Request,
+    response: Response,
     body: Dict[str, str],
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
@@ -327,6 +333,7 @@ async def remove_admin(
 @rate_limit("30/minute")
 async def admin_users_list(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     email: Optional[str] = Query(None),
@@ -337,7 +344,7 @@ async def admin_users_list(
 ) -> List[Dict[str, object]]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    set_sensitive_cache(request, seconds=0)
+    set_sensitive_cache(response, seconds=0)
 
     conds = []
     if email:
@@ -360,6 +367,7 @@ async def admin_users_list(
 async def admin_users_get(
     user_id: UUID,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
@@ -377,6 +385,7 @@ async def admin_users_patch(
     user_id: UUID,
     body: Dict[str, object],
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
@@ -417,6 +426,7 @@ async def admin_users_deactivate(
     user_id: UUID,
     body: Dict[str, str],
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
@@ -446,6 +456,7 @@ async def admin_users_deactivate(
 async def admin_users_reactivate(
     user_id: UUID,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
@@ -469,6 +480,7 @@ async def admin_users_delete(
     user_id: UUID,
     body: Dict[str, str],
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
@@ -494,6 +506,7 @@ async def admin_users_delete(
 async def admin_users_sessions(
     user_id: UUID,
     request: Request,
+    response: Response,    
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     limit: int = Query(20, ge=1, le=200),
@@ -525,6 +538,7 @@ async def admin_users_sessions(
 async def admin_users_sessions_revoke_all(
     user_id: UUID,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
