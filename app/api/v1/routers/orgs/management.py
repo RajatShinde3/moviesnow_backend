@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 """
-User Management (Org‑Free, MoviesNow)
-====================================
+User Management (Org-free)
+==========================
 
-Operations for managing users without org/tenant context:
-- Update user role (USER/ADMIN/SUPERUSER) with strict checks
+Operations for managing users without any organization or tenant context:
+- Update a user's role (USER/ADMIN/SUPERUSER) with strict checks
 - Deactivate/reactivate accounts (soft lifecycle)
 
-Best practices applied
-----------------------
-- MFA‑enforced caller auth (`get_current_user_with_mfa`)
-- SlowAPI route limits + Redis per‑actor budgets
-- Redis idempotency where useful (via `Idempotency-Key` header)
-- Distributed Redis locks + row‑level DB locks
-- Sensitive cache headers and rich audit logs
+Practices
+---------
+- MFA-enforced caller auth (`get_current_user_with_mfa`)
+- SlowAPI route limits + Redis-backed per-actor budgets
+- Optional Redis idempotency (via `Idempotency-Key` header)
+- Distributed Redis locks + row-level DB locks for safety
+- Sensitive cache headers and structured audit logs
 """
 
 from typing import Optional
@@ -27,7 +27,7 @@ from sqlalchemy import exc as sa_exc
 
 from app.db.models.user import User
 from app.db.session import get_async_db
-from app.schemas.enums import OrgRole
+from app.schemas.enums import OrgRole as UserRole
 from app.schemas.auth import MessageResponse, RoleUpdateRequest
 from app.core.dependencies import get_current_user_with_mfa as get_current_user
 from app.core.limiter import rate_limit
@@ -40,9 +40,9 @@ from app.utils.redis_utils import enforce_rate_limit
 router = APIRouter(tags=["User Management"])
 
 
-# ---------------------------------------------------------------------------
-# Update a user's role (org‑free)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Update a user's role (org-free)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.put(
     "/{user_id}/role",
     response_model=MessageResponse,
@@ -67,18 +67,18 @@ async def update_user_role(
     """
     set_sensitive_cache(request)
 
-    # Per‑actor hourly budget
+    # Per-actor hourly budget
     await enforce_rate_limit(
         key_suffix=f"role-update:{current_user.id}", seconds=3600, max_calls=10,
         error_message="Too many role changes; please try again later.",
     )
 
     # Authorization
-    if current_user.role not in {OrgRole.ADMIN, OrgRole.SUPERUSER}:
+    if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     if current_user.id == user_id:
         raise HTTPException(status_code=400, detail="You cannot change your own role")
-    if payload.role == OrgRole.SUPERUSER and current_user.role != OrgRole.SUPERUSER:
+    if payload.role == UserRole.SUPERUSER and current_user.role != UserRole.SUPERUSER:
         raise HTTPException(status_code=403, detail="Only SUPERUSER can assign SUPERUSER")
 
     # Idempotency (optional): repeated same change returns cached result
@@ -107,7 +107,7 @@ async def update_user_role(
                     raise HTTPException(status_code=404, detail="User not found")
 
                 # SUPERUSER demotion restriction
-                if target.role == OrgRole.SUPERUSER and current_user.role != OrgRole.SUPERUSER:
+                if target.role == UserRole.SUPERUSER and current_user.role != UserRole.SUPERUSER:
                     raise HTTPException(status_code=403, detail="Only SUPERUSER can modify SUPERUSER")
 
                 if target.role == payload.role:
@@ -155,9 +155,9 @@ async def update_user_role(
         raise HTTPException(status_code=429, detail="Busy processing a similar request; retry")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Deactivate a user (soft)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @router.put(
     "/{user_id}/deactivate",
     response_model=MessageResponse,
@@ -181,7 +181,7 @@ async def deactivate_user(
         error_message="Too many deactivations; please try again later.",
     )
 
-    if current_user.role not in {OrgRole.ADMIN, OrgRole.SUPERUSER}:
+    if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     if current_user.id == user_id:
         raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
@@ -232,9 +232,9 @@ async def deactivate_user(
         raise HTTPException(status_code=429, detail="Busy processing a similar request; retry")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Reactivate a user (soft)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @router.put(
     "/{user_id}/reactivate",
     response_model=MessageResponse,
@@ -258,7 +258,7 @@ async def reactivate_user(
         error_message="Too many reactivations; please try again later.",
     )
 
-    if current_user.role not in {OrgRole.ADMIN, OrgRole.SUPERUSER}:
+    if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     lock_name = f"lock:user_management:reactivate:{user_id}"

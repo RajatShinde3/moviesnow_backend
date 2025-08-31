@@ -1,29 +1,29 @@
 from __future__ import annotations
 
 """
-Admin Actions (Org‑Free, MoviesNow)
-===================================
+Admin Actions (Org-free)
+=======================
 
-User-centric ADMIN role management using MoviesNow’s shared primitives:
-- Enum roles via `OrgRole` (no raw strings)
-- MFA‑enforced caller auth (`get_current_user_with_mfa`)
-- SlowAPI route limits + Redis per‑actor budgets
+User-centric ADMIN role management using shared primitives:
+- Enum roles via `OrgRole` (aliased to `UserRole` here)
+- MFA-enforced caller auth (`get_current_user_with_mfa`)
+- SlowAPI route limits + Redis per-actor budgets
 - Redis idempotency snapshots (Idempotency-Key)
-- Distributed Redis locks + row‑level DB locks
+- Distributed Redis locks + row-level DB locks
 - Sensitive cache headers and rich audit logs
 """
 
 from typing import List
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status, Depends, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import exc as sa_exc
-from uuid import UUID
 
 from app.db.models.user import User
-from app.schemas.enums import OrgRole
-from app.schemas.auth import AssignADMINResponse, RevokeADMINResponse, AdminUserItem
+from app.schemas.enums import OrgRole as UserRole
+from app.schemas.auth import AssignADMINResponse, RevokeADMINResponse, AdminUserItem, SimpleUserResponse
 from app.services.audit_log_service import log_audit_event
 from app.core.limiter import rate_limit
 from app.db.session import get_async_db
@@ -36,9 +36,9 @@ from app.utils.redis_utils import enforce_rate_limit
 router = APIRouter(tags=["Admin Actions"])
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Assign ADMIN role to a user
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @router.put(
     "/{user_id}/assign-ADMIN",
     response_model=AssignADMINResponse,
@@ -57,18 +57,18 @@ async def assign_ADMIN_route(
 
     Requirements
     ------------
-    - Caller must have role `OrgRole.ADMIN` and be MFA‑authenticated.
+    - Caller must have role `UserRole.ADMIN` and be MFA-authenticated.
     - Target user must exist and be different from the caller.
 
     Notes
     -----
     - Honors `Idempotency-Key` header; successful responses are cached for 10 min.
-    - Uses Redis distributed lock and row‑level DB lock to avoid races.
+    - Uses Redis distributed lock and row-level DB lock to avoid races.
     """
 
     set_sensitive_cache(request)
 
-    # Per‑actor hourly budget (defense‑in‑depth)
+    # Per-actor hourly budget (defense-in-depth)
     try:
         await enforce_rate_limit(
             key_suffix=f"assign-admin:{current_user.id}",
@@ -101,10 +101,10 @@ async def assign_ADMIN_route(
         except Exception:
             cached = None
         if cached:
-            return cached
+            return AssignADMINResponse(**cached)
 
     # Authorization
-    if current_user.role != OrgRole.ADMIN:
+    if current_user.role != UserRole.ADMIN:
         await log_audit_event(
             db,
             user=current_user,
@@ -126,7 +126,6 @@ async def assign_ADMIN_route(
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Self-promotion is not allowed")
 
-    # Concurrency control
     lock_name = f"lock:role_assign_admin:{user_id}"
     try:
         async with redis_wrapper.lock(lock_name, timeout=10, blocking_timeout=3):
@@ -146,19 +145,22 @@ async def assign_ADMIN_route(
                     )
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user not found")
 
-                if target.role == OrgRole.ADMIN:
-                    await log_audit_event(
-                        db,
-                        user=current_user,
-                        action="ASSIGN_ADMIN",
-                        status="ALREADY",
-                        request=request,
-                        meta_data={"target_user_id": str(user_id)},
+                if target.role == UserRole.ADMIN:
+                    # Already admin; treat as success for idempotency semantics
+                    response = AssignADMINResponse(
+                        message="User already has ADMIN role",
+                        user=SimpleUserResponse(email=target.email),
+                        role=str(target.role),
                     )
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is already ADMIN")
+                    if idemp_key:
+                        try:
+                            await redis_wrapper.idempotency_set(idemp_key, response.model_dump(), ttl_seconds=600)
+                        except Exception:
+                            pass
+                    return response
 
                 prev = target.role
-                target.role = OrgRole.ADMIN
+                target.role = UserRole.ADMIN
                 await db.flush()
                 await db.commit()
                 try:
@@ -166,15 +168,15 @@ async def assign_ADMIN_route(
                 except Exception:
                     pass
 
-                response = {
-                    "message": "Role updated to ADMIN",
-                    "user": {"email": target.email},
-                    "role": str(target.role),
-                }
+                response = AssignADMINResponse(
+                    message="Role updated to ADMIN",
+                    user=SimpleUserResponse(email=target.email),
+                    role=str(target.role),
+                )
 
                 if idemp_key:
                     try:
-                        await redis_wrapper.idempotency_set(idemp_key, response, ttl_seconds=600)
+                        await redis_wrapper.idempotency_set(idemp_key, response.model_dump(), ttl_seconds=600)
                     except Exception:
                         pass
 
@@ -221,9 +223,9 @@ async def assign_ADMIN_route(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Busy processing a similar request; retry")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Revoke ADMIN role from a user (demote to USER)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @router.put(
     "/{user_id}/revoke-ADMIN",
     response_model=RevokeADMINResponse,
@@ -242,14 +244,14 @@ async def revoke_ADMIN_route(
 
     Requirements
     ------------
-    - Caller must have role `OrgRole.ADMIN` and be MFA‑authenticated.
+    - Caller must have role `UserRole.ADMIN` and be MFA-authenticated.
     - Target user must exist and be different from the caller.
-    - Target must currently be `OrgRole.ADMIN`.
+    - Target must currently be `UserRole.ADMIN`.
     """
 
     set_sensitive_cache(request)
 
-    # Per‑actor hourly budget
+    # Per-actor hourly budget
     try:
         await enforce_rate_limit(
             key_suffix=f"revoke-admin:{current_user.id}",
@@ -282,10 +284,10 @@ async def revoke_ADMIN_route(
         except Exception:
             cached = None
         if cached:
-            return cached
+            return RevokeADMINResponse(**cached)
 
     # Authorization
-    if current_user.role != OrgRole.ADMIN:
+    if current_user.role != UserRole.ADMIN:
         await log_audit_event(
             db,
             user=current_user,
@@ -326,7 +328,7 @@ async def revoke_ADMIN_route(
                     )
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user not found")
 
-                if target.role != OrgRole.ADMIN:
+                if target.role != UserRole.ADMIN:
                     await log_audit_event(
                         db,
                         user=current_user,
@@ -338,7 +340,7 @@ async def revoke_ADMIN_route(
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not ADMIN")
 
                 prev = target.role
-                target.role = OrgRole.USER
+                target.role = UserRole.USER
                 await db.flush()
                 await db.commit()
                 try:
@@ -346,15 +348,15 @@ async def revoke_ADMIN_route(
                 except Exception:
                     pass
 
-                response = {
-                    "message": "Role updated to USER",
-                    "user": {"email": target.email},
-                    "role": str(target.role),
-                }
+                response = RevokeADMINResponse(
+                    message="Role updated to USER",
+                    user=SimpleUserResponse(email=target.email),
+                    role=str(target.role),
+                )
 
                 if idemp_key:
                     try:
-                        await redis_wrapper.idempotency_set(idemp_key, response, ttl_seconds=600)
+                        await redis_wrapper.idempotency_set(idemp_key, response.model_dump(), ttl_seconds=600)
                     except Exception:
                         pass
 
@@ -401,9 +403,9 @@ async def revoke_ADMIN_route(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Busy processing a similar request; retry")
 
 
-# ---------------------------------------------------------------------------
-# List ADMIN users (org‑free)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# List ADMIN users (org-free)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.get(
     "/admins",
     response_model=List[AdminUserItem],
@@ -424,12 +426,12 @@ async def list_admins(
     """
     set_sensitive_cache(request, seconds=0)
 
-    if current_user.role != OrgRole.ADMIN:
+    if current_user.role != UserRole.ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
     stmt = (
         select(User)
-        .where(User.role == OrgRole.ADMIN)
+        .where(User.role == UserRole.ADMIN)
         .order_by(User.created_at.desc())
         .offset(offset)
         .limit(limit)
@@ -443,7 +445,7 @@ async def list_admins(
             email=u.email,
             full_name=getattr(u, "full_name", None),
             is_active=bool(getattr(u, "is_active", True)),
-            role=str(getattr(u, "role", OrgRole.USER)),
+            role=str(getattr(u, "role", UserRole.USER)),
         )
         for u in users
     ]
