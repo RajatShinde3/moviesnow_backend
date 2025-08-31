@@ -1,31 +1,41 @@
 from __future__ import annotations
 
-import hmac
+"""
+Signing utilities for time-limited media URLs.
+
+Best practices applied:
+- Single source of truth for stream quality enum (reuse API schema enum).
+- Hardened path normalization to prevent path traversal.
+- Clear, concise docstrings for generated tokens/URLs.
+"""
+
 import hashlib
+import hmac
+import logging
 import os
 import time
-import logging
-from enum import Enum
-from pydantic import BaseModel
+
 from fastapi import HTTPException
+from pydantic import BaseModel
+
+# Reuse the public API enum instead of redefining it here
+from app.schemas.titles import QualityEnum  # re-exported below for compatibility
 
 
 logger = logging.getLogger(__name__)
 
 
 class SignedURL(BaseModel):
+    """Data returned when issuing a signed media URL.
+
+    - url: Fully-qualified path including query params (q, exp, sig, use).
+    - expires_at: Epoch seconds when the URL stops being valid.
+    - token: The HMAC signature (hex) over path|purpose|quality|exp.
+    """
+
     url: str
     expires_at: int
     token: str
-
-
-class QualityEnum(str, Enum):
-    auto = "auto"
-    q240p = "240p"
-    q480p = "480p"
-    q720p = "720p"
-    q1080p = "1080p"
-    q2160p = "2160p"
 
 
 def generate_signed_url(
@@ -35,14 +45,13 @@ def generate_signed_url(
     expires_in: int = 3600,
     purpose: str = "stream",
 ) -> SignedURL:
-    """
-    Generate a CDN-friendly HMAC-signed URL for streaming/download.
+    """Generate a CDN-friendly HMAC-signed URL for streaming/download.
 
-    Env:
-      - STREAM_URL_SIGNING_SECRET: required in production. If not set and
-        ALLOW_DEV_SIGNING is true, uses a dev secret (logs a warning).
-      - STREAM_BASE_URL: base URL for signed resources (default: /media).
-      - ALLOW_DEV_SIGNING: set to 1/true to allow missing secret in dev.
+    Environment variables:
+    - STREAM_URL_SIGNING_SECRET: Required in production. If missing and
+      ALLOW_DEV_SIGNING is truthy, a dev secret is used (with a warning).
+    - STREAM_BASE_URL: Base URL prefix for signed resources (default: "/media").
+    - ALLOW_DEV_SIGNING: Set to 1/true to allow missing secret in dev.
     """
     base_url = os.environ.get("STREAM_BASE_URL", "/media")
     secret_env = os.environ.get("STREAM_URL_SIGNING_SECRET")
@@ -58,7 +67,7 @@ def generate_signed_url(
     now = int(time.time())
     exp = now + int(expires_in)
 
-    # Normalize and harden path
+    # Normalize and harden the path
     resource_path = "/" + resource_path.lstrip("/")
     safe_path = "/" + "/".join([seg for seg in resource_path.split("/") if seg and seg not in {"..", "."}])
 
@@ -68,3 +77,6 @@ def generate_signed_url(
     url = f"{base_url}{safe_path}?q={quality.value}&exp={exp}&sig={sig}&use={purpose}"
     return SignedURL(url=url, expires_at=exp, token=sig)
 
+
+# Re-export for legacy imports: from app.services.signing import QualityEnum
+__all__ = ["SignedURL", "QualityEnum", "generate_signed_url"]

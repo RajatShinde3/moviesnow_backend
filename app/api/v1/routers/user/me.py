@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""User-facing endpoints for profile, sessions, watchlist, favorites, ratings, and reviews.
+
+All endpoints assume an authenticated user resolved by `get_current_user`.
+Light rate-limiting and optional public API key enforcement apply consistently.
+"""
+
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -185,4 +191,3 @@ def delete_review(review_id: str = Path(...), user=Depends(get_current_user), _r
     if not ok:
         raise HTTPException(status_code=404, detail="Review not found or not owned")
     return Response(status_code=204)
-

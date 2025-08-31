@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+"""
+HTTP utilities shared by routers:
+- ID sanitization, client IP resolution
+- Lightweight token bucket rate limiter (per-process)
+- API key enforcement and admin checks
+- Webhook signature verification helpers
+
+Note: production deployments should prefer centralized, Redis-backed rate
+limiting (see app.core.limiter) and infrastructure-level request filtering.
+"""
+
+import hashlib
 import hmac
 import os
 import re
@@ -8,8 +20,6 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-import hashlib
-import hmac
 
 
 _SANITIZE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -59,7 +69,8 @@ def rate_limit(
 ):
     """Simple per-IP+path token bucket.
 
-    Replace with a Redis-backed limiter in production to work across processes/instances.
+    Replace with a Redis-backed limiter in production to work across
+    processes/instances or use app.core.limiter for SlowAPI integration.
     """
     ip = get_client_ip(request)
     key = f"{ip}:{request.url.path}"

@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""User profiles, sessions, and social interactions repository.
+
+Defines a protocol and an in-memory implementation used by user-facing
+routers for profile management, sessions, watchlist/favorites, ratings,
+and reviews.
+"""
+
 import os
 import time
 import uuid
@@ -238,4 +245,3 @@ def get_user_repository() -> UserRepositoryProtocol:
         cls = _import_string(impl_path)
         return cls()  # type: ignore
     return MemoryUserRepository()
-

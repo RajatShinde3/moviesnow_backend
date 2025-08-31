@@ -1,18 +1,44 @@
-
 """
-Admin Taxonomy & Credits
-========================
+MoviesNow · Admin Taxonomy & Credits (Org-free)
+===============================================
 
-Genres (taxonomy) and Credits endpoints for admin with MFA enforcement.
-Practices: SlowAPI rate limits, admin+MFA checks, Redis idempotency for create,
-row-level locking for updates, sensitive cache headers, and audit logs.
+Endpoints (ADMIN/SUPERUSER + MFA)
+---------------------------------
+Genres
+- POST   /admin/genres                         : create genre (Idempotency-Key supported)
+- GET    /admin/genres                         : list genres (filters; paginate)
+- PATCH  /admin/genres/{genre_id}              : patch genre
+- DELETE /admin/genres/{genre_id}              : delete genre
+- POST   /admin/titles/{title_id}/genres/{genre_id}   : attach genre to title
+- DELETE /admin/titles/{title_id}/genres/{genre_id}   : detach genre from title
+
+Credits
+- POST   /admin/titles/{title_id}/credits      : create credit
+- GET    /admin/titles/{title_id}/credits      : list credits (filters; paginate)
+- PATCH  /admin/credits/{credit_id}            : patch credit
+- DELETE /admin/credits/{credit_id}            : delete credit
+
+Compliance
+- POST   /admin/titles/{title_id}/block        : apply region/age certification; optional unpublish
+- POST   /admin/titles/{title_id}/dmca         : DMCA takedown + advisory; optional unpublish
+- GET    /admin/compliance/flags               : enums for compliance
+
+Security & Ops Practices
+------------------------
+- Enforce ADMIN/SUPERUSER role and `mfa_authenticated=True` on access token
+- SlowAPI rate limits; Response injected for sensitive cache headers
+- Redis idempotency snapshots for creates (best-effort)
+- Redis locks + DB row locks for mutations to avoid race conditions
+- Structured audit logs (best-effort; never blocks flows)
 """
 
+from __future__ import annotations
+
+# ── [Imports] ─────────────────────────────────────────────────────────────────────────────
 from typing import Optional, List, Dict
 from uuid import UUID
-
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
 from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
 from sqlalchemy import select, update, delete, and_, func, insert, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,15 +51,17 @@ from app.db.models.user import User
 from app.db.models.genre import Genre
 from app.db.models.title import Title
 from app.db.models.credit import Credit
-from app.security_headers import set_sensitive_cache
 from app.db.models.compliance import Certification, ContentAdvisory
 from app.schemas.enums import CertificationSystem, AdvisoryKind, AdvisorySeverity
+from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import log_audit_event
-
 
 router = APIRouter(tags=["Admin Taxonomy & Credits"])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🧩 Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def _is_admin(user: User) -> bool:
     try:
         from app.schemas.enums import OrgRole
@@ -48,8 +76,10 @@ async def _ensure_admin(user: User) -> None:
 
 
 async def _ensure_mfa(request: Request) -> None:
+    """Require `mfa_authenticated=True` on access token (admin-only ops)."""
     try:
-        claims = await decode_token(request.headers.get("Authorization", "").split(" ")[-1], expected_types=["access"], verify_revocation=True)
+        token = request.headers.get("Authorization", "").split(" ")[-1]
+        claims = await decode_token(token, expected_types=["access"], verify_revocation=True)
         if not bool(claims.get("mfa_authenticated")):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA required")
     except HTTPException:
@@ -58,7 +88,7 @@ async def _ensure_mfa(request: Request) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
 
 
-# ───────────────────────── Genres ─────────────────────────
+# ╔════════════════════════════════════ Genres ═══════════════════════════════╗
 
 class GenreCreateIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
@@ -66,7 +96,7 @@ class GenreCreateIn(BaseModel):
     description: Optional[str] = None
     parent_id: Optional[UUID] = None
     is_active: bool = True
-    display_order: Optional[int] = None
+    display_order: Optional[int] = Field(None, ge=0)
 
 
 class GenrePatchIn(BaseModel):
@@ -88,9 +118,13 @@ def _ser_genre(g: Genre) -> Dict[str, object]:
         "is_active": bool(g.is_active),
         "display_order": g.display_order,
         "created_at": getattr(g, "created_at", None),
+        "updated_at": getattr(g, "updated_at", None),
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ➕ Create genre (Idempotency-Key supported)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.post("/genres", summary="Create genre (Idempotency-Key supported)")
 @rate_limit("10/minute")
 async def create_genre(
@@ -100,9 +134,12 @@ async def create_genre(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
+    # ── [Step 0] Security & cache ───────────────────────────────────────────
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
     set_sensitive_cache(response)
+
+    # ── [Step 1] Idempotency (best-effort) ──────────────────────────────────
     idem_hdr = request.headers.get("Idempotency-Key")
     idem_key = f"idemp:admin:genres:create:{payload.slug}:{idem_hdr}" if idem_hdr else None
     if idem_key:
@@ -110,6 +147,7 @@ async def create_genre(
         if snap:
             return snap  # type: ignore[return-value]
 
+    # ── [Step 2] Insert ────────────────────────────────────────────────────
     g = Genre(
         name=payload.name,
         slug=payload.slug,
@@ -124,8 +162,10 @@ async def create_genre(
         await db.refresh(g)
     except Exception:
         pass
+
     body = _ser_genre(g)
-    await log_audit_event(db, user=current_user, action="GENRES_CREATE", status="SUCCESS", request=request, meta_data={"id": body["id"], "slug": g.slug})
+    await log_audit_event(db, user=current_user, action="GENRES_CREATE", status="SUCCESS", request=request,
+                          meta_data={"id": body["id"], "slug": g.slug})
     if idem_key:
         try:
             await redis_wrapper.idempotency_set(idem_key, body, ttl_seconds=600)
@@ -134,19 +174,25 @@ async def create_genre(
     return body
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 📚 List genres (filters; paginate)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.get("/genres", summary="List genres (filters; paginate)")
 @rate_limit("30/minute")
 async def list_genres(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
-    q: Optional[str] = Query(None),
+    q: Optional[str] = Query(None, description="Search in name/slug (case-insensitive)"),
     is_active: Optional[bool] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> List[Dict[str, object]]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response, seconds=0)
+
     stmt = select(Genre)
     if q:
         s = q.strip().lower()
@@ -158,46 +204,68 @@ async def list_genres(
     return [_ser_genre(g) for g in rows]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ✏️ Patch genre (row lock + redis lock)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.patch("/genres/{genre_id}", summary="Patch genre")
 @rate_limit("10/minute")
 async def patch_genre(
     genre_id: UUID,
     payload: GenrePatchIn,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    g = (await db.execute(select(Genre).where(Genre.id == genre_id).with_for_update())).scalar_one_or_none()
-    if not g:
-        raise HTTPException(status_code=404, detail="Genre not found")
+    set_sensitive_cache(response)
+
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         raise HTTPException(status_code=400, detail="No changes provided")
-    for k, v in updates.items():
-        setattr(g, k, v)
-    await db.flush(); await db.commit()
-    await log_audit_event(db, user=current_user, action="GENRES_PATCH", status="SUCCESS", request=request, meta_data={"id": str(genre_id), "fields": list(updates.keys())})
+
+    async with redis_wrapper.lock(f"lock:admin:genres:{genre_id}", timeout=10, blocking_timeout=3):
+        g = (await db.execute(select(Genre).where(Genre.id == genre_id).with_for_update())).scalar_one_or_none()
+        if not g:
+            raise HTTPException(status_code=404, detail="Genre not found")
+        for k, v in updates.items():
+            setattr(g, k, v)
+        await db.flush(); await db.commit()
+
+    await log_audit_event(db, user=current_user, action="GENRES_PATCH", status="SUCCESS", request=request,
+                          meta_data={"id": str(genre_id), "fields": list(updates.keys())})
     return _ser_genre(g)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🗑️ Delete genre (redis lock)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.delete("/genres/{genre_id}", summary="Delete genre")
 @rate_limit("10/minute")
 async def delete_genre(
     genre_id: UUID,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, str]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    await db.execute(delete(Genre).where(Genre.id == genre_id))
-    await db.commit()
-    await log_audit_event(db, user=current_user, action="GENRES_DELETE", status="SUCCESS", request=request, meta_data={"id": str(genre_id)})
+    set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin:genres:{genre_id}", timeout=10, blocking_timeout=3):
+        await db.execute(delete(Genre).where(Genre.id == genre_id))
+        await db.commit()
+
+    await log_audit_event(db, user=current_user, action="GENRES_DELETE", status="SUCCESS", request=request,
+                          meta_data={"id": str(genre_id)})
     return {"message": "Genre deleted"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔗 Attach / Detach genre to/from title
+# ─────────────────────────────────────────────────────────────────────────────
 @router.post("/titles/{title_id}/genres/{genre_id}", summary="Attach genre to title")
 @rate_limit("10/minute")
 async def attach_genre(
@@ -210,18 +278,25 @@ async def attach_genre(
 ) -> Dict[str, str]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response)
+
     t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
     g = (await db.execute(select(Genre).where(Genre.id == genre_id))).scalar_one_or_none()
     if not t or not g:
         raise HTTPException(status_code=404, detail="Title or Genre not found")
-    # Use Title.genres relationship via insert to association table to avoid loading collections
-    try:
-        await db.execute(insert(Title.genres.property.secondary).values(title_id=title_id, genre_id=genre_id))  # type: ignore
-        await db.commit()
-    except Exception:
-        # Already attached or constraint error
-        pass
-    await log_audit_event(db, user=current_user, action="TITLES_GENRE_ATTACH", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "genre_id": str(genre_id)})
+
+    async with redis_wrapper.lock(f"lock:admin:title_genre:{title_id}:{genre_id}", timeout=10, blocking_timeout=3):
+        try:
+            await db.execute(  # type: ignore
+                insert(Title.genres.property.secondary).values(title_id=title_id, genre_id=genre_id)
+            )
+            await db.commit()
+        except Exception:
+            # constraint violation → already attached
+            pass
+
+    await log_audit_event(db, user=current_user, action="TITLES_GENRE_ATTACH", status="SUCCESS", request=request,
+                          meta_data={"title_id": str(title_id), "genre_id": str(genre_id)})
     return {"message": "Attached"}
 
 
@@ -237,19 +312,22 @@ async def detach_genre(
 ) -> Dict[str, str]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    try:
-        await db.execute(delete(Title.genres.property.secondary).where(  # type: ignore
-            Title.genres.property.secondary.c.title_id == title_id,      # type: ignore
-            Title.genres.property.secondary.c.genre_id == genre_id,      # type: ignore
-        ))
-        await db.commit()
-    except Exception:
-        pass
-    await log_audit_event(db, user=current_user, action="TITLES_GENRE_DETACH", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "genre_id": str(genre_id)})
+    set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin:title_genre:{title_id}:{genre_id}", timeout=10, blocking_timeout=3):
+        try:
+            tbl = Title.genres.property.secondary  # type: ignore
+            await db.execute(delete(tbl).where(tbl.c.title_id == title_id, tbl.c.genre_id == genre_id))  # type: ignore
+            await db.commit()
+        except Exception:
+            pass
+
+    await log_audit_event(db, user=current_user, action="TITLES_GENRE_DETACH", status="SUCCESS", request=request,
+                          meta_data={"title_id": str(title_id), "genre_id": str(genre_id)})
     return {"message": "Detached"}
 
 
-# ───────────────────────── Credits ─────────────────────────
+# ╔════════════════════════════════════ Credits ══════════════════════════════╗
 
 class CreditCreateIn(BaseModel):
     person_id: UUID
@@ -288,9 +366,13 @@ def _ser_credit(c: Credit) -> Dict[str, object]:
         "is_guest": bool(c.is_guest),
         "is_cameo": bool(c.is_cameo),
         "created_at": getattr(c, "created_at", None),
+        "updated_at": getattr(c, "updated_at", None),
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ➕ Create title credit
+# ─────────────────────────────────────────────────────────────────────────────
 @router.post("/titles/{title_id}/credits", summary="Create title credit")
 @rate_limit("10/minute")
 async def create_title_credit(
@@ -303,9 +385,12 @@ async def create_title_credit(
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response)
+
     t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
     if not t:
         raise HTTPException(status_code=404, detail="Title not found")
+
     c = Credit(
         title_id=title_id,
         person_id=payload.person_id,
@@ -325,10 +410,15 @@ async def create_title_credit(
         await db.refresh(c)
     except Exception:
         pass
-    await log_audit_event(db, user=current_user, action="CREDITS_CREATE", status="SUCCESS", request=request, meta_data={"credit_id": str(c.id), "title_id": str(title_id)})
+
+    await log_audit_event(db, user=current_user, action="CREDITS_CREATE", status="SUCCESS", request=request,
+                          meta_data={"credit_id": str(c.id), "title_id": str(title_id)})
     return _ser_credit(c)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 📚 List title credits (filters; paginate)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.get("/titles/{title_id}/credits", summary="List title credits")
 @rate_limit("30/minute")
 async def list_title_credits(
@@ -344,6 +434,8 @@ async def list_title_credits(
 ) -> List[Dict[str, object]]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response, seconds=0)
+
     stmt = select(Credit).where(Credit.title_id == title_id)
     if kind:
         stmt = stmt.where(func.lower(Credit.kind) == kind.lower())
@@ -354,57 +446,79 @@ async def list_title_credits(
     return [_ser_credit(c) for c in rows]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ✏️ Patch credit flags/fields (locks)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.patch("/credits/{credit_id}", summary="Patch credit flags/fields")
 @rate_limit("10/minute")
 async def patch_credit(
     credit_id: UUID,
     payload: CreditPatchIn,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    c = (await db.execute(select(Credit).where(Credit.id == credit_id).with_for_update())).scalar_one_or_none()
-    if not c:
-        raise HTTPException(status_code=404, detail="Credit not found")
+    set_sensitive_cache(response)
+
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         raise HTTPException(status_code=400, detail="No changes provided")
-    for k, v in updates.items():
-        setattr(c, k, v)
-    await db.flush(); await db.commit()
-    await log_audit_event(db, user=current_user, action="CREDITS_PATCH", status="SUCCESS", request=request, meta_data={"credit_id": str(credit_id), "fields": list(updates.keys())})
+
+    async with redis_wrapper.lock(f"lock:admin:credit:{credit_id}", timeout=10, blocking_timeout=3):
+        c = (await db.execute(select(Credit).where(Credit.id == credit_id).with_for_update())).scalar_one_or_none()
+        if not c:
+            raise HTTPException(status_code=404, detail="Credit not found")
+        for k, v in updates.items():
+            setattr(c, k, v)
+        await db.flush(); await db.commit()
+
+    await log_audit_event(db, user=current_user, action="CREDITS_PATCH", status="SUCCESS", request=request,
+                          meta_data={"credit_id": str(credit_id), "fields": list(updates.keys())})
     return _ser_credit(c)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🗑️ Delete credit (lock)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.delete("/credits/{credit_id}", summary="Delete credit")
 @rate_limit("10/minute")
 async def delete_credit(
     credit_id: UUID,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, str]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    await db.execute(delete(Credit).where(Credit.id == credit_id))
-    await db.commit()
-    await log_audit_event(db, user=current_user, action="CREDITS_DELETE", status="SUCCESS", request=request, meta_data={"credit_id": str(credit_id)})
+    set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin:credit:{credit_id}", timeout=10, blocking_timeout=3):
+        await db.execute(delete(Credit).where(Credit.id == credit_id))
+        await db.commit()
+
+    await log_audit_event(db, user=current_user, action="CREDITS_DELETE", status="SUCCESS", request=request,
+                          meta_data={"credit_id": str(credit_id)})
     return {"message": "Credit deleted"}
 
 
-# ───────────────────────── Compliance & Content Flags ─────────────────────────
+# ╔══════════════════════════════════ Compliance ═════════════════════════════╗
 
 class BlockIn(BaseModel):
-    regions: List[str] = Field(..., description="ISO-3166-1 alpha-2 country codes")
+    regions: List[str] = Field(..., description="ISO-3166-1 alpha-2 codes, e.g., ['US','IN']")
     system: CertificationSystem = CertificationSystem.OTHER
-    rating_code: Optional[str] = Field(None, description="Board-specific rating code (e.g., '18', 'PG-13')")
+    rating_code: Optional[str] = Field(None, description="Board-specific rating (e.g., 'PG-13', '18')")
     min_age: Optional[int] = Field(None, ge=0, le=21)
     notes: Optional[str] = None
     unpublish: bool = False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🚫 Apply region/age gate (certifications); optional unpublish
+# ─────────────────────────────────────────────────────────────────────────────
 @router.post("/titles/{title_id}/block", summary="Apply region/age gate (certifications); optional unpublish")
 @rate_limit("10/minute")
 async def compliance_block_title(
@@ -417,38 +531,47 @@ async def compliance_block_title(
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
-    if not t:
-        raise HTTPException(status_code=404, detail="Title not found")
+    set_sensitive_cache(response)
 
-    # Set prior current certs for region/system to non-current, then insert new certs
-    regions = [r.strip().upper() for r in (payload.regions or []) if r and r.strip()]
-    if not regions:
-        raise HTTPException(status_code=400, detail="No regions provided")
+    async with redis_wrapper.lock(f"lock:admin:compliance:block:{title_id}", timeout=15, blocking_timeout=5):
+        t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
+        if not t:
+            raise HTTPException(status_code=404, detail="Title not found")
 
-    for region in regions:
-        await db.execute(
-            update(Certification)
-            .where(Certification.title_id == title_id, Certification.region == region, Certification.system == payload.system, Certification.is_current == True)  # noqa: E712
-            .values(is_current=False)
-        )
-        c = Certification(
-            title_id=title_id,
-            region=region,
-            system=payload.system,
-            rating_code=payload.rating_code or (str(payload.min_age) if payload.min_age is not None else "BLOCK"),
-            age_min=payload.min_age,
-            meaning=payload.notes,
-            is_current=True,
-            source="admin_block",
-        )
-        db.add(c)
+        regions = [r.strip().upper() for r in (payload.regions or []) if r and r.strip()]
+        if not regions:
+            raise HTTPException(status_code=400, detail="No regions provided")
 
-    if payload.unpublish and getattr(t, "is_published", False):
-        t.is_published = False
+        for region in regions:
+            await db.execute(
+                update(Certification)
+                .where(
+                    Certification.title_id == title_id,
+                    Certification.region == region,
+                    Certification.system == payload.system,
+                    Certification.is_current == True,  # noqa: E712
+                )
+                .values(is_current=False)
+            )
+            c = Certification(
+                title_id=title_id,
+                region=region,
+                system=payload.system,
+                rating_code=payload.rating_code or (str(payload.min_age) if payload.min_age is not None else "BLOCK"),
+                age_min=payload.min_age,
+                meaning=payload.notes,
+                is_current=True,
+                source="admin_block",
+            )
+            db.add(c)
 
-    await db.flush(); await db.commit()
-    await log_audit_event(db, user=current_user, action="COMPLIANCE_BLOCK", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "regions": regions, "unpublish": payload.unpublish})
+        if payload.unpublish and getattr(t, "is_published", False):
+            t.is_published = False
+
+        await db.flush(); await db.commit()
+
+    await log_audit_event(db, user=current_user, action="COMPLIANCE_BLOCK", status="SUCCESS", request=request,
+                          meta_data={"title_id": str(title_id), "regions": regions, "unpublish": payload.unpublish})
     return {"message": "Compliance block applied", "regions": regions, "unpublish": payload.unpublish}
 
 
@@ -458,6 +581,9 @@ class DMCAIn(BaseModel):
     unpublish: bool = True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 📝 DMCA takedown & unpublish + severe advisory
+# ─────────────────────────────────────────────────────────────────────────────
 @router.post("/titles/{title_id}/dmca", summary="DMCA takedown & unpublish")
 @rate_limit("6/minute")
 async def compliance_dmca_takedown(
@@ -470,38 +596,47 @@ async def compliance_dmca_takedown(
 ) -> Dict[str, str]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
-    if not t:
-        raise HTTPException(status_code=404, detail="Title not found")
+    set_sensitive_cache(response)
 
-    # Unpublish and add a strong advisory flag (global) for internal tracking
-    if payload.unpublish and getattr(t, "is_published", False):
-        t.is_published = False
+    async with redis_wrapper.lock(f"lock:admin:compliance:dmca:{title_id}", timeout=15, blocking_timeout=5):
+        t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
+        if not t:
+            raise HTTPException(status_code=404, detail="Title not found")
 
-    adv = ContentAdvisory(
-        title_id=title_id,
-        kind=AdvisoryKind.OTHER,
-        severity=AdvisorySeverity.SEVERE,
-        language="en",
-        notes=payload.reason or "DMCA takedown",
-        tags={"dmca": True, "source_url": payload.source_url} if payload.source_url else {"dmca": True},
-        is_active=True,
-        source="dmca_admin",
-    )
-    db.add(adv)
-    await db.flush(); await db.commit()
-    await log_audit_event(db, user=current_user, action="COMPLIANCE_DMCA", status="SUCCESS", request=request, meta_data={"title_id": str(title_id)})
+        if payload.unpublish and getattr(t, "is_published", False):
+            t.is_published = False
+
+        adv = ContentAdvisory(
+            title_id=title_id,
+            kind=AdvisoryKind.OTHER,
+            severity=AdvisorySeverity.SEVERE,
+            language="en",
+            notes=payload.reason or "DMCA takedown",
+            tags={"dmca": True, "source_url": payload.source_url} if payload.source_url else {"dmca": True},
+            is_active=True,
+            source="dmca_admin",
+        )
+        db.add(adv)
+        await db.flush(); await db.commit()
+
+    await log_audit_event(db, user=current_user, action="COMPLIANCE_DMCA", status="SUCCESS", request=request,
+                          meta_data={"title_id": str(title_id)})
     return {"message": "Takedown applied"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 📖 Enumerations for compliance flags
+# ─────────────────────────────────────────────────────────────────────────────
 @router.get("/compliance/flags", summary="Enumerations for compliance flags")
 @rate_limit("60/minute")
 async def compliance_flags(
     request: Request,
+    response: Response,
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, List[str]]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response, seconds=0)
     return {
         "certification_systems": [c.name for c in CertificationSystem],
         "advisory_kinds": [k.name for k in AdvisoryKind],

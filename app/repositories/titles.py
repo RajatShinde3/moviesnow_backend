@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Titles discovery repository.
+
+Provides an interface and a simple in-memory implementation for listing and
+querying titles, stream variants, subtitles, credits, and related resources.
+"""
+
 import json
 import os
 from dataclasses import dataclass
@@ -270,4 +276,3 @@ def get_titles_repository() -> TitleRepositoryProtocol:
 # Backwards-compatible alias if some code imports TitleRepository
 class TitleRepository(MemoryTitleRepository):
     pass
-

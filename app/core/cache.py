@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Lightweight in-process caches with TTL semantics.
+
+Use `TTLMap` for small response/object caches and `TTLCache` for idempotency
+tracking (seen keys). These are per-process and intended for dev/test or
+single-instance setups. Prefer a shared cache like Redis in production.
+"""
+
 import time
 from typing import Any, Dict, Optional
 
@@ -67,4 +74,3 @@ class TTLCache:
                 pass
             return False
         return True
-

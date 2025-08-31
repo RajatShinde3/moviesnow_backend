@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+"""Public discovery endpoints for titles, streams, subtitles and related data.
+
+Provides consistent caching (ETag + Cache-Control), optional public API key
+enforcement, and rate limiting. Designed to be CDN-friendly.
+"""
+
 import hashlib
 import logging
 import os
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
@@ -21,7 +26,7 @@ from app.schemas.titles import (
     PaginatedTitles,
     QualityEnum,
 )
-from app.services.signing import SignedURL, QualityEnum as SignedQualityEnum, generate_signed_url
+from app.services.signing import SignedURL, generate_signed_url
 
 
 logger = logging.getLogger(__name__)
@@ -61,8 +66,11 @@ def cache_json_response(request: Request, ttl: int, payload: Any) -> JSONRespons
     return resp
 
 
-def _map_quality(q: QualityEnum) -> SignedQualityEnum:
-    return SignedQualityEnum(q.value)
+"""Public discovery endpoints: titles, streams, subtitles, credits, search.
+
+This module applies consistent caching and header behavior and relies on a
+single shared `QualityEnum` (from schemas) across signing and responses.
+"""
 
 
 @router.get("/titles", response_model=PaginatedTitles)
@@ -91,21 +99,9 @@ def list_titles(
     """
     cache_ttl = int(os.environ.get("PUBLIC_CACHE_TTL_SECONDS", "30"))
     cached = _resp_cache.get(_cache_key(request))
-    if cached:
-        imm = request.headers.get("if-none-match") or request.headers.get("If-None-Match")
-        et = cached.get("etag")
-        if imm and et and imm == et:
-            return JSONResponse(status_code=status.HTTP_304_NOT_MODIFIED, content=None)
-        payload = cached.get("payload")
-        if payload is not None:
-            resp = JSONResponse(content=payload)
-            if et:
-                resp.headers["ETag"] = et
-            resp.headers["Cache-Control"] = (
-                f"public, max-age={cache_ttl}, s-maxage={cache_ttl}, stale-while-revalidate=60, stale-if-error=300"
-            )
-            resp.headers["Vary"] = "Accept, If-None-Match"
-            return resp
+    if cached and cached.get("payload") is not None:
+        # Reuse the payload; delegate ETag/headers/304 logic to the helper
+        return cache_json_response(request, cache_ttl, cached["payload"])  # type: ignore[index]
 
     repo = get_titles_repository()
     filters: Dict[str, Any] = {
@@ -319,7 +315,7 @@ def get_stream_url(
             resource_path = str(repo.get_stream_resource_path(tid))
     except Exception as e:
         logger.warning("get_stream_resource_path failed, using default: %s", e)
-    return generate_signed_url(resource_path=resource_path, quality=_map_quality(quality), expires_in=expires_in, purpose="stream")
+    return generate_signed_url(resource_path=resource_path, quality=quality, expires_in=expires_in, purpose="stream")
 
 
 @router.get("/download/{title_id}/{quality}", response_model=SignedURL)
@@ -339,4 +335,4 @@ def get_download_url(
             resource_path = str(repo.get_download_resource_path(tid))
     except Exception as e:
         logger.warning("get_download_resource_path failed, using default: %s", e)
-    return generate_signed_url(resource_path=resource_path, quality=_map_quality(quality), expires_in=expires_in, purpose="download")
+    return generate_signed_url(resource_path=resource_path, quality=quality, expires_in=expires_in, purpose="download")

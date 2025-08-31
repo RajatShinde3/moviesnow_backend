@@ -1,4 +1,13 @@
 from __future__ import annotations
+
+"""Playback telemetry repository.
+
+Defines a simple protocol and an in-memory implementation to start and track
+player sessions, append events, aggregate QoE metrics, and mark completion.
+
+Production systems should back this with a database or analytics pipeline.
+"""
+
 import os
 import time
 import uuid
@@ -7,7 +16,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 class PlayerRepositoryProtocol:
-    def start_session(self, *, user_id: Optional[str], anon_id: Optional[str], title_id: str, quality: str, device: Dict[str, Any], playback: Dict[str, Any]) -> Dict[str, Any]:
+    """Protocol for playback session storage/analytics backends."""
+
+    def start_session(
+        self,
+        *,
+        user_id: Optional[str],
+        anon_id: Optional[str],
+        title_id: str,
+        quality: str,
+        device: Dict[str, Any],
+        playback: Dict[str, Any],
+    ) -> Dict[str, Any]:
         raise NotImplementedError
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -46,6 +66,8 @@ class _PlayerSession:
 
 
 class MemoryPlayerRepository(PlayerRepositoryProtocol):
+    """In-memory repository for player sessions (dev/test)."""
+
     def __init__(self) -> None:
         self._sessions: Dict[str, _PlayerSession] = {}
 
@@ -166,4 +188,3 @@ def get_player_repository() -> PlayerRepositoryProtocol:
         cls = _import_string(impl_path)
         return cls()  # type: ignore
     return MemoryPlayerRepository()
-

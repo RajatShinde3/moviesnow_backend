@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Player telemetry endpoints (start/heartbeat/pause/resume/seek/complete/error).
+
+All endpoints are rate-limited and optionally gated behind a public API key.
+Session data is stored via a pluggable repository (in-memory by default).
+"""
+
 import hashlib
 import os
 from typing import Dict
@@ -23,6 +29,7 @@ router = APIRouter(prefix="/player/sessions", tags=["Playback"], responses={404:
 
 
 def _anon_id_from_request(request: Request) -> str:
+    """Derive a stable anonymous identifier from client IP + user-agent."""
     ua = request.headers.get("user-agent") or request.headers.get("User-Agent") or ""
     ip = get_client_ip(request)
     raw = f"{ip}|{ua}".encode("utf-8")
@@ -137,4 +144,3 @@ def get_session(session_id: str = Path(...), _rl=Depends(rate_limit), _key=Depen
     if not rec:
         raise HTTPException(status_code=404, detail="Session not found")
     return json_no_store(SessionSummary(**rec).dict())
-

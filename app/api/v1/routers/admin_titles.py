@@ -1,25 +1,29 @@
-
 """
-Admin Titles Management (Org-free)
-==================================
+MoviesNow · Admin Titles Management (Org-free)
+==============================================
 
-Endpoints (admin + MFA enforced):
-- POST /admin/titles                      : Create title (Idempotency-Key supported)
-- GET  /admin/titles                      : Search/list with filters, sort, paginate
-- GET  /admin/titles/{title_id}           : Fetch single title
-- PATCH /admin/titles/{title_id}          : Partial update (safe fields)
-- POST /admin/titles/{title_id}/publish   : Mark title published
-- POST /admin/titles/{title_id}/unpublish : Mark title unpublished
-- DELETE /admin/titles/{title_id}         : Hard delete (cascades managed by DB)
+Endpoints (ADMIN/SUPERUSER + MFA)
+---------------------------------
+- POST   /admin/titles                       : Create title (Idempotency-Key supported)
+- GET    /admin/titles                       : Search/list with filters, sort, paginate
+- GET    /admin/titles/{title_id}            : Fetch single title
+- PATCH  /admin/titles/{title_id}            : Partial update (safe fields)
+- POST   /admin/titles/{title_id}/publish    : Mark title published (idempotent)
+- POST   /admin/titles/{title_id}/unpublish  : Mark title unpublished (idempotent)
+- DELETE /admin/titles/{title_id}            : Hard delete (DB cascades)
 
-Practices
----------
+Ops & Security Practices
+------------------------
 - SlowAPI per-route rate limits
-- Admin + MFA check via access token claim
-- Redis idempotency for create using Idempotency-Key header
+- ADMIN/SUPERUSER + `mfa_authenticated` guard on access token
+- Redis idempotency snapshots for create via Idempotency-Key header
 - Redis distributed locks + DB row-level `FOR UPDATE` for mutations
-- No-store cache headers and best-effort audit logs
+- Sensitive cache-control on responses carrying tokens or admin data
+- Pre-flight slug uniqueness checks -> 409 CONFLICT (defensive, even if DB also enforces)
+- Best-effort structured audit logs (never blocks business flow)
 """
+
+from __future__ import annotations
 
 from typing import List, Dict, Optional
 from uuid import UUID
@@ -45,6 +49,9 @@ from app.services.audit_log_service import log_audit_event
 router = APIRouter(tags=["Admin Titles"])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🧩 Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def _is_admin(user: User) -> bool:
     try:
         from app.schemas.enums import OrgRole
@@ -59,8 +66,10 @@ async def _ensure_admin(user: User) -> None:
 
 
 async def _ensure_mfa(request: Request) -> None:
+    """Require `mfa_authenticated=True` on the access token (admin-only ops)."""
     try:
-        claims = await decode_token(request.headers.get("Authorization", "").split(" ")[-1], expected_types=["access"], verify_revocation=True)
+        token = request.headers.get("Authorization", "").split(" ")[-1]
+        claims = await decode_token(token, expected_types=["access"], verify_revocation=True)
         if not bool(claims.get("mfa_authenticated")):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA required")
     except HTTPException:
@@ -69,6 +78,36 @@ async def _ensure_mfa(request: Request) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
 
 
+async def _slug_exists(db: AsyncSession, slug: str, *, exclude_id: Optional[UUID] = None) -> bool:
+    stmt = select(Title.id).where(func.lower(Title.slug) == slug.strip().lower())
+    if exclude_id:
+        stmt = stmt.where(Title.id != exclude_id)
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
+def _serialize_title(t: Title) -> Dict[str, object]:
+    return {
+        "id": str(t.id),
+        "type": str(getattr(t, "type", None)),
+        "status": str(getattr(t, "status", None)),
+        "name": getattr(t, "name", None),
+        "original_name": getattr(t, "original_name", None),
+        "slug": getattr(t, "slug", None),
+        "is_published": bool(getattr(t, "is_published", False)),
+        "release_year": getattr(t, "release_year", None),
+        "release_date": getattr(t, "release_date", None),
+        "end_date": getattr(t, "end_date", None),
+        "popularity_score": getattr(t, "popularity_score", None),
+        "rating_average": getattr(t, "rating_average", None),
+        "rating_count": getattr(t, "rating_count", None),
+        "created_at": getattr(t, "created_at", None),
+        "updated_at": getattr(t, "updated_at", None),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📦 Schemas
+# ─────────────────────────────────────────────────────────────────────────────
 class TitleCreateIn(BaseModel):
     type: TitleType
     name: str = Field(..., min_length=1, max_length=255)
@@ -93,26 +132,9 @@ class TitlePatchIn(BaseModel):
     tagline: Optional[str] = None
 
 
-def _serialize_title(t: Title) -> Dict[str, object]:
-    return {
-        "id": str(t.id),
-        "type": str(getattr(t, "type", None)),
-        "status": str(getattr(t, "status", None)),
-        "name": getattr(t, "name", None),
-        "original_name": getattr(t, "original_name", None),
-        "slug": getattr(t, "slug", None),
-        "is_published": bool(getattr(t, "is_published", False)),
-        "release_year": getattr(t, "release_year", None),
-        "release_date": getattr(t, "release_date", None),
-        "end_date": getattr(t, "end_date", None),
-        "popularity_score": getattr(t, "popularity_score", None),
-        "rating_average": getattr(t, "rating_average", None),
-        "rating_count": getattr(t, "rating_count", None),
-        "created_at": getattr(t, "created_at", None),
-        "updated_at": getattr(t, "updated_at", None),
-    }
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# ➕ Create title (Idempotency-Key supported)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.post("/titles", response_model=Dict[str, object], summary="Create title (Idempotency-Key supported)")
 @rate_limit("10/minute")
 async def create_title(
@@ -122,13 +144,14 @@ async def create_title(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, object]:
+    # ── [Step 0] Security + cache hardening ─────────────────────────────────
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
     set_sensitive_cache(response)
 
-    # Idempotency: replay if snapshot exists
-    idem_key_hdr = request.headers.get("Idempotency-Key")
-    idem_key = f"idemp:admin:titles:create:{idem_key_hdr}" if idem_key_hdr else None
+    # ── [Step 1] Idempotency replay (best-effort) ───────────────────────────
+    idem_hdr = request.headers.get("Idempotency-Key")
+    idem_key = f"idemp:admin:titles:create:{idem_hdr}" if idem_hdr else None
     if idem_key:
         try:
             snap = await redis_wrapper.idempotency_get(idem_key)
@@ -137,12 +160,16 @@ async def create_title(
         except Exception:
             pass
 
-    # Persist
+    # ── [Step 2] Slug uniqueness guard (defensive 409) ─────────────────────
+    if await _slug_exists(db, payload.slug):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug already exists")
+
+    # ── [Step 3] Persist ────────────────────────────────────────────────────
     t = Title(
         type=payload.type,
-        name=payload.name,
-        slug=payload.slug,
-        original_name=payload.original_name,
+        name=payload.name.strip(),
+        slug=payload.slug.strip(),
+        original_name=(payload.original_name or None),
         status=payload.status or TitleStatus.ANNOUNCED,
         release_year=payload.release_year,
         overview=payload.overview,
@@ -157,7 +184,10 @@ async def create_title(
         pass
 
     body = _serialize_title(t)
-    await log_audit_event(db, user=current_user, action="TITLES_CREATE", status="SUCCESS", request=request, meta_data={"id": body["id"], "slug": t.slug})
+    await log_audit_event(db, user=current_user, action="TITLES_CREATE", status="SUCCESS", request=request,
+                          meta_data={"id": body["id"], "slug": t.slug})
+
+    # ── [Step 4] Idempotency snapshot ───────────────────────────────────────
     if idem_key:
         try:
             await redis_wrapper.idempotency_set(idem_key, body, ttl_seconds=600)
@@ -166,6 +196,9 @@ async def create_title(
     return body
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 📚 List titles (filters/sort/paginate)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.get("/titles", response_model=List[Dict[str, object]], summary="List titles (filters/sort/paginate)")
 @rate_limit("30/minute")
 async def list_titles(
@@ -176,9 +209,11 @@ async def list_titles(
     type: Optional[TitleType] = Query(None),
     status_: Optional[TitleStatus] = Query(None, alias="status"),
     is_published: Optional[bool] = Query(None),
-    q: Optional[str] = Query(None, description="Search name/slug contains (CI)")
-    ,
-    sort: Optional[str] = Query("-created_at", description="Sort field, prefix '-' for desc: created_at,popularity,rating"),
+    q: Optional[str] = Query(None, description="Search name/slug contains (case-insensitive)"),
+    sort: Optional[str] = Query(
+        "-created_at",
+        description="Sort field (prefix '-' for desc). One of: created_at, popularity, rating, release_year",
+    ),
     limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> List[Dict[str, object]]:
@@ -218,6 +253,9 @@ async def list_titles(
     return [_serialize_title(t) for t in rows]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔎 Get single title
+# ─────────────────────────────────────────────────────────────────────────────
 @router.get("/titles/{title_id}", response_model=Dict[str, object], summary="Get title by id")
 @rate_limit("30/minute")
 async def get_title(
@@ -229,12 +267,17 @@ async def get_title(
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response, seconds=0)
+
     t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
     if not t:
         raise HTTPException(status_code=404, detail="Title not found")
     return _serialize_title(t)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ✏️ Patch title (safe fields + slug conflict check)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.patch("/titles/{title_id}", response_model=Dict[str, object], summary="Patch title (safe fields)")
 @rate_limit("10/minute")
 async def patch_title(
@@ -247,20 +290,30 @@ async def patch_title(
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response)
+
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No changes provided")
+    if "slug" in updates and await _slug_exists(db, str(updates["slug"]), exclude_id=title_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug already exists")
+
     async with redis_wrapper.lock(f"lock:admin_titles:patch:{title_id}", timeout=10, blocking_timeout=3):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
             raise HTTPException(status_code=404, detail="Title not found")
-        updates = payload.model_dump(exclude_unset=True)
-        if not updates:
-            raise HTTPException(status_code=400, detail="No changes provided")
         for k, v in updates.items():
             setattr(t, k, v)
         await db.flush(); await db.commit()
-        await log_audit_event(db, user=current_user, action="TITLES_PATCH", status="SUCCESS", request=request, meta_data={"id": str(title_id), "fields": list(updates.keys())})
-        return _serialize_title(t)
+
+    await log_audit_event(db, user=current_user, action="TITLES_PATCH", status="SUCCESS", request=request,
+                          meta_data={"id": str(title_id), "fields": list(updates.keys())})
+    return _serialize_title(t)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🚀 Publish / 📴 Unpublish (idempotent)
+# ─────────────────────────────────────────────────────────────────────────────
 @router.post("/titles/{title_id}/publish", response_model=Dict[str, object], summary="Publish title")
 @rate_limit("5/minute")
 async def publish_title(
@@ -272,6 +325,8 @@ async def publish_title(
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response)
+
     async with redis_wrapper.lock(f"lock:admin_titles:publish:{title_id}", timeout=10, blocking_timeout=3):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
@@ -280,8 +335,10 @@ async def publish_title(
             return {"message": "Already published"}
         t.is_published = True
         await db.flush(); await db.commit()
-        await log_audit_event(db, user=current_user, action="TITLES_PUBLISH", status="SUCCESS", request=request, meta_data={"id": str(title_id)})
-        return {"message": "Published"}
+
+    await log_audit_event(db, user=current_user, action="TITLES_PUBLISH", status="SUCCESS", request=request,
+                          meta_data={"id": str(title_id)})
+    return {"message": "Published"}
 
 
 @router.post("/titles/{title_id}/unpublish", response_model=Dict[str, object], summary="Unpublish title")
@@ -295,6 +352,8 @@ async def unpublish_title(
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
+    set_sensitive_cache(response)
+
     async with redis_wrapper.lock(f"lock:admin_titles:unpublish:{title_id}", timeout=10, blocking_timeout=3):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
@@ -303,10 +362,15 @@ async def unpublish_title(
             return {"message": "Already unpublished"}
         t.is_published = False
         await db.flush(); await db.commit()
-        await log_audit_event(db, user=current_user, action="TITLES_UNPUBLISH", status="SUCCESS", request=request, meta_data={"id": str(title_id)})
-        return {"message": "Unpublished"}
+
+    await log_audit_event(db, user=current_user, action="TITLES_UNPUBLISH", status="SUCCESS", request=request,
+                          meta_data={"id": str(title_id)})
+    return {"message": "Unpublished"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🗑️ Hard delete
+# ─────────────────────────────────────────────────────────────────────────────
 @router.delete("/titles/{title_id}", response_model=Dict[str, object], summary="Hard delete title")
 @rate_limit("5/minute")
 async def delete_title(
@@ -318,8 +382,12 @@ async def delete_title(
 ) -> Dict[str, object]:
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    await db.execute(delete(Title).where(Title.id == title_id))
-    await db.commit()
-    await log_audit_event(db, user=current_user, action="TITLES_DELETE", status="SUCCESS", request=request, meta_data={"id": str(title_id)})
-    return {"message": "Title deleted"}
+    set_sensitive_cache(response)
 
+    async with redis_wrapper.lock(f"lock:admin_titles:delete:{title_id}", timeout=10, blocking_timeout=3):
+        await db.execute(delete(Title).where(Title.id == title_id))
+        await db.commit()
+
+    await log_audit_event(db, user=current_user, action="TITLES_DELETE", status="SUCCESS", request=request,
+                          meta_data={"id": str(title_id)})
+    return {"message": "Title deleted"}

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Minimal audit log repository for admin/ops observability.
+
+Stores entries in-memory by default; can be swapped via env var
+`AUDIT_REPOSITORY_IMPL` to a custom implementation.
+"""
+
 import os
 import time
 from dataclasses import dataclass
@@ -65,4 +71,3 @@ def get_audit_repository() -> AuditRepositoryProtocol:
         cls = _import_string(impl_path)
         return cls()  # type: ignore
     return MemoryAuditRepository()
-
