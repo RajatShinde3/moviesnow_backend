@@ -1,28 +1,56 @@
+from __future__ import annotations
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ MoviesNow · Admin Actions (Org-free)                                     ║
+# ║                                                                          ║
+# ║ Endpoints (ADMIN + MFA enforced):                                        ║
+# ║  - PUT  /{user_id}/assign-ADMIN     → Promote user to ADMIN              ║
+# ║  - PUT  /{user_id}/revoke-ADMIN     → Demote user to USER                ║
+# ║  - GET  /admins                     → List ADMIN users (paginated)       ║
+# ╠──────────────────────────────────────────────────────────────────────────╣
+# ║ Security & Ops                                                           ║
+# ║  - Caller must be ADMIN and MFA-authenticated (dependency).              ║
+# ║  - SlowAPI route limits + Redis per-actor budgets.                       ║
+# ║  - Idempotency via `Idempotency-Key` header (10 min snapshots).          ║
+# ║  - Distributed Redis locks + DB row-level `FOR UPDATE`.                  ║
+# ║  - Cache-Control: no-store on all responses.                              ║
+# ║  - Rich audit logs; neutral error messages.                               ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 """
-Admin Actions (Org-free)
-=======================
+User-centric ADMIN role management using shared primitives.
 
-User-centric ADMIN role management using shared primitives:
-- Enum roles via `OrgRole` (aliased to `UserRole` here)
+- Enum roles via `OrgRole` (aliased to `UserRole`)
 - MFA-enforced caller auth (`get_current_user_with_mfa`)
-- SlowAPI route limits + Redis per-actor budgets
-- Redis idempotency snapshots (Idempotency-Key)
-- Distributed Redis locks + row-level DB locks
-- Sensitive cache headers and rich audit logs
+- Rate limiting (SlowAPI) and per-actor Redis budgets
+- Idempotency snapshots (Idempotency-Key)
+- Distributed locks + row-level DB locks
+- Sensitive cache headers and extensive audit logging
 """
 
 from typing import List
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status, Depends, Request, Query, Response
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    status,
+    Depends,
+    Request,
+    Query,
+    Response,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import exc as sa_exc
 
 from app.db.models.user import User
 from app.schemas.enums import OrgRole as UserRole
-from app.schemas.auth import AssignADMINResponse, RevokeADMINResponse, AdminUserItem, SimpleUserResponse
+from app.schemas.auth import (
+    AssignADMINResponse,
+    RevokeADMINResponse,
+    AdminUserItem,
+    SimpleUserResponse,
+)
 from app.services.audit_log_service import log_audit_event
 from app.core.limiter import rate_limit
 from app.db.session import get_async_db
@@ -53,22 +81,32 @@ async def assign_ADMIN_route(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Promote a user to ADMIN with concurrency + idempotency guards.
+    """
+    Promote a user to ADMIN with concurrency + idempotency guards.
 
     Requirements
     ------------
-    - Caller must have role `UserRole.ADMIN` and be MFA-authenticated.
+    - Caller must be `UserRole.ADMIN` and MFA-authenticated.
     - Target user must exist and be different from the caller.
 
-    Notes
-    -----
-    - Honors `Idempotency-Key` header; successful responses are cached for 10 min.
-    - Uses Redis distributed lock and row-level DB lock to avoid races.
-    """
+    Behaviors
+    ---------
+    - Honors `Idempotency-Key` header; on success, snapshots for 10 minutes.
+    - Uses Redis distributed lock and DB row lock (`FOR UPDATE`) to avoid races.
 
+    Steps
+    -----
+    1) Apply sensitive `no-store` headers
+    2) Enforce per-actor budget (defense-in-depth)
+    3) Short-circuit on idempotency snapshot if provided
+    4) Authorization & self-promotion checks
+    5) Acquire Redis lock → select `FOR UPDATE` → mutate role → commit
+    6) Cache idempotent response & audit log
+    """
+    # 1) No-store cache headers (sensitive admin mutation)
     set_sensitive_cache(response)
 
-    # Per-actor hourly budget (defense-in-depth)
+    # 2) Per-actor budget (hourly)
     try:
         await enforce_rate_limit(
             key_suffix=f"assign-admin:{current_user.id}",
@@ -87,7 +125,7 @@ async def assign_ADMIN_route(
         )
         raise
 
-    # Idempotency key (optional)
+    # 3) Idempotency snapshot
     raw_idemp = request.headers.get("Idempotency-Key")
     actor_id = getattr(current_user, "id", None)
     idemp_key = (
@@ -103,7 +141,7 @@ async def assign_ADMIN_route(
         if cached:
             return AssignADMINResponse(**cached)
 
-    # Authorization
+    # 4) Authorization checks
     if current_user.role != UserRole.ADMIN:
         await log_audit_event(
             db,
@@ -126,6 +164,7 @@ async def assign_ADMIN_route(
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Self-promotion is not allowed")
 
+    # 5) Acquire lock → mutate
     lock_name = f"lock:role_assign_admin:{user_id}"
     try:
         async with redis_wrapper.lock(lock_name, timeout=10, blocking_timeout=3):
@@ -146,18 +185,18 @@ async def assign_ADMIN_route(
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user not found")
 
                 if target.role == UserRole.ADMIN:
-                    # Already admin; treat as success for idempotency semantics
-                    response = AssignADMINResponse(
+                    # Already admin; idempotent success
+                    resp_model = AssignADMINResponse(
                         message="User already has ADMIN role",
                         user=SimpleUserResponse(email=target.email),
                         role=str(target.role),
                     )
                     if idemp_key:
                         try:
-                            await redis_wrapper.idempotency_set(idemp_key, response.model_dump(), ttl_seconds=600)
+                            await redis_wrapper.idempotency_set(idemp_key, resp_model.model_dump(), ttl_seconds=600)
                         except Exception:
                             pass
-                    return response
+                    return resp_model
 
                 prev = target.role
                 target.role = UserRole.ADMIN
@@ -168,15 +207,16 @@ async def assign_ADMIN_route(
                 except Exception:
                     pass
 
-                response = AssignADMINResponse(
+                resp_model = AssignADMINResponse(
                     message="Role updated to ADMIN",
                     user=SimpleUserResponse(email=target.email),
                     role=str(target.role),
                 )
 
+                # 6) Persist idempotency snapshot + audit log
                 if idemp_key:
                     try:
-                        await redis_wrapper.idempotency_set(idemp_key, response.model_dump(), ttl_seconds=600)
+                        await redis_wrapper.idempotency_set(idemp_key, resp_model.model_dump(), ttl_seconds=600)
                     except Exception:
                         pass
 
@@ -193,7 +233,7 @@ async def assign_ADMIN_route(
                         "idempotency": bool(idemp_key is not None),
                     },
                 )
-                return response
+                return resp_model
 
             except HTTPException:
                 raise
@@ -241,18 +281,28 @@ async def revoke_ADMIN_route(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Demote a user from ADMIN to USER with concurrency + idempotency guards.
+    """
+    Demote a user from ADMIN to USER with concurrency + idempotency guards.
 
     Requirements
     ------------
-    - Caller must have role `UserRole.ADMIN` and be MFA-authenticated.
+    - Caller must be `UserRole.ADMIN` and MFA-authenticated.
     - Target user must exist and be different from the caller.
     - Target must currently be `UserRole.ADMIN`.
-    """
 
+    Steps
+    -----
+    1) Apply sensitive `no-store` headers
+    2) Enforce per-actor budget
+    3) Short-circuit on idempotency snapshot if provided
+    4) Authorization & self-demotion checks
+    5) Acquire lock → select `FOR UPDATE` → mutate → commit
+    6) Cache idempotent response & audit log
+    """
+    # 1) No-store cache headers
     set_sensitive_cache(response)
 
-    # Per-actor hourly budget
+    # 2) Per-actor budget (hourly)
     try:
         await enforce_rate_limit(
             key_suffix=f"revoke-admin:{current_user.id}",
@@ -271,7 +321,7 @@ async def revoke_ADMIN_route(
         )
         raise
 
-    # Idempotency key (optional)
+    # 3) Idempotency snapshot
     raw_idemp = request.headers.get("Idempotency-Key")
     actor_id = getattr(current_user, "id", None)
     idemp_key = (
@@ -287,7 +337,7 @@ async def revoke_ADMIN_route(
         if cached:
             return RevokeADMINResponse(**cached)
 
-    # Authorization
+    # 4) Authorization checks
     if current_user.role != UserRole.ADMIN:
         await log_audit_event(
             db,
@@ -310,6 +360,7 @@ async def revoke_ADMIN_route(
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Self-demotion is not allowed")
 
+    # 5) Acquire lock → mutate
     lock_name = f"lock:role_revoke_admin:{user_id}"
     try:
         async with redis_wrapper.lock(lock_name, timeout=10, blocking_timeout=3):
@@ -349,7 +400,7 @@ async def revoke_ADMIN_route(
                 except Exception:
                     pass
 
-                response = RevokeADMINResponse(
+                resp_model = RevokeADMINResponse(
                     message="Role updated to USER",
                     user=SimpleUserResponse(email=target.email),
                     role=str(target.role),
@@ -357,7 +408,7 @@ async def revoke_ADMIN_route(
 
                 if idemp_key:
                     try:
-                        await redis_wrapper.idempotency_set(idemp_key, response.model_dump(), ttl_seconds=600)
+                        await redis_wrapper.idempotency_set(idemp_key, resp_model.model_dump(), ttl_seconds=600)
                     except Exception:
                         pass
 
@@ -374,7 +425,7 @@ async def revoke_ADMIN_route(
                         "idempotency": bool(idemp_key is not None),
                     },
                 )
-                return response
+                return resp_model
 
             except HTTPException:
                 raise
@@ -422,9 +473,16 @@ async def list_admins(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """Return a paginated list of users with ADMIN role.
+    """
+    Return a paginated list of users with ADMIN role.
 
-    Requires the caller to be ADMIN.
+    Requirements
+    ------------
+    - Caller must be `UserRole.ADMIN` and MFA-authenticated.
+
+    Notes
+    -----
+    - Sets `Cache-Control: no-store` (sensitive listing).
     """
     set_sensitive_cache(response, seconds=0)
 
@@ -451,4 +509,3 @@ async def list_admins(
         )
         for u in users
     ]
-

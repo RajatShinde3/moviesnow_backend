@@ -1,7 +1,23 @@
+from __future__ import annotations
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ MoviesNow · User Management (Org-free)                                   ║
+# ║                                                                          ║
+# ║ Endpoints (ADMIN or SUPERUSER + MFA enforced):                           ║
+# ║  - PUT  /{user_id}/role         → Change user role (USER/ADMIN/SUPERUSER)║
+# ║  - PUT  /{user_id}/deactivate   → Deactivate account (soft)              ║
+# ║  - PUT  /{user_id}/reactivate   → Reactivate account (soft)              ║
+# ╠──────────────────────────────────────────────────────────────────────────╣
+# ║ Security & Ops                                                           ║
+# ║  - Caller auth via get_current_user_with_mfa.                            ║
+# ║  - SlowAPI route limits + Redis per-actor budgets.                       ║
+# ║  - Optional idempotency snapshots (Idempotency-Key, 10 min).             ║
+# ║  - Distributed Redis locks + DB row-level FOR UPDATE.                    ║
+# ║  - Cache-Control: no-store on all responses.                              ║
+# ║  - Rich audit logs with neutral error wording.                            ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 """
 User Management (Org-free)
-==========================
 
 Operations for managing users without any organization or tenant context:
 - Update a user's role (USER/ADMIN/SUPERUSER) with strict checks
@@ -57,35 +73,61 @@ async def update_user_role(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> MessageResponse:
-    """Set a user's role to the requested value.
+    """
+    Set a user's role to the requested value.
 
     Rules
     -----
     - Caller must be ADMIN or SUPERUSER.
     - Only SUPERUSER can assign/demote SUPERUSER.
-    - No self role change.
+    - Self role changes are disallowed.
+
+    Steps
+    -----
+    1) Apply `no-store` headers
+    2) Enforce per-actor budget (Redis)
+    3) Authorization checks (role + self-change)
+    4) Optional idempotency short-circuit (Idempotency-Key)
+    5) Acquire Redis lock → `SELECT ... FOR UPDATE` → mutate → commit
+    6) Persist idempotent snapshot & audit log
     """
+    # 1) Sensitive caching
     set_sensitive_cache(response)
 
-    # Per-actor hourly budget
-    await enforce_rate_limit(
-        key_suffix=f"role-update:{current_user.id}", seconds=3600, max_calls=10,
-        error_message="Too many role changes; please try again later.",
-    )
+    # 2) Per-actor hourly budget
+    try:
+        await enforce_rate_limit(
+            key_suffix=f"role-update:{current_user.id}",
+            seconds=3600,
+            max_calls=10,
+            error_message="Too many role changes; please try again later.",
+        )
+    except HTTPException:
+        await log_audit_event(
+            db,
+            user=current_user,
+            action="USER_ROLE_CHANGED",
+            status="RATE_LIMITED",
+            request=request,
+            meta_data={"target_user_id": str(user_id)},
+        )
+        raise
 
-    # Authorization
+    # 3) Authorization
     if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
         await log_audit_event(
             db, user=current_user, action="USER_ROLE_CHANGED", status="FORBIDDEN", request=request,
             meta_data={"target_user_id": str(user_id), "reason": "insufficient_permissions"},
         )
         raise HTTPException(status_code=403, detail="Insufficient permissions")
+
     if current_user.id == user_id:
         await log_audit_event(
             db, user=current_user, action="USER_ROLE_CHANGED", status="DENIED_SELF_CHANGE", request=request,
             meta_data={"target_user_id": str(user_id)},
         )
         raise HTTPException(status_code=400, detail="You cannot change your own role")
+
     if payload.role == UserRole.SUPERUSER and current_user.role != UserRole.SUPERUSER:
         await log_audit_event(
             db, user=current_user, action="USER_ROLE_CHANGED", status="FORBIDDEN_SUPERUSER_ASSIGN", request=request,
@@ -93,12 +135,11 @@ async def update_user_role(
         )
         raise HTTPException(status_code=403, detail="Only SUPERUSER can assign SUPERUSER")
 
-    # Idempotency (optional): repeated same change returns cached result
+    # 4) Idempotency (optional)
     raw_idemp = request.headers.get("Idempotency-Key")
     idemp_key = (
         f"idemp:user-role:{current_user.id}:{user_id}:{payload.role}:{raw_idemp.strip()}"
-        if raw_idemp
-        else None
+        if raw_idemp else None
     )
     if idemp_key:
         try:
@@ -108,6 +149,7 @@ async def update_user_role(
         if cached:
             return MessageResponse(**cached)
 
+    # 5) Concurrency-safe mutation
     lock_name = f"lock:user_management:role:{user_id}"
     try:
         async with redis_wrapper.lock(lock_name, timeout=10, blocking_timeout=3):
@@ -127,7 +169,14 @@ async def update_user_role(
                     raise HTTPException(status_code=403, detail="Only SUPERUSER can modify SUPERUSER")
 
                 if target.role == payload.role:
-                    return MessageResponse(message="User already has the requested role")
+                    # Idempotent success behavior
+                    resp = MessageResponse(message="User already has the requested role")
+                    if idemp_key:
+                        try:
+                            await redis_wrapper.idempotency_set(idemp_key, resp.model_dump(), ttl_seconds=600)
+                        except Exception:
+                            pass
+                    return resp
 
                 previous = target.role
                 target.role = payload.role
@@ -143,13 +192,13 @@ async def update_user_role(
                     },
                 )
 
-                response = MessageResponse(message="User role updated successfully")
+                resp = MessageResponse(message="User role updated successfully")
                 if idemp_key:
                     try:
-                        await redis_wrapper.idempotency_set(idemp_key, response.model_dump(), ttl_seconds=600)
+                        await redis_wrapper.idempotency_set(idemp_key, resp.model_dump(), ttl_seconds=600)
                     except Exception:
                         pass
-                return response
+                return resp
 
             except HTTPException:
                 raise
@@ -188,16 +237,56 @@ async def deactivate_user(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> MessageResponse:
-    """Mark the user as inactive and set `deactivated_at`.
-
-    Only ADMIN or SUPERUSER may deactivate; cannot deactivate self.
     """
-    set_sensitive_cache(response)
-    await enforce_rate_limit(
-        key_suffix=f"deactivate:{current_user.id}", seconds=1800, max_calls=10,
-        error_message="Too many deactivations; please try again later.",
-    )
+    Mark the user as inactive and set `deactivated_at`.
 
+    Rules
+    -----
+    - Only ADMIN or SUPERUSER may deactivate.
+    - Self-deactivation is disallowed.
+
+    Steps
+    -----
+    1) Apply `no-store` headers
+    2) Enforce per-actor budget
+    3) Optional idempotency short-circuit
+    4) Authorization checks
+    5) Acquire lock → `FOR UPDATE` → mutate → commit
+    6) Persist idempotent snapshot & audit log
+    """
+    # 1) Sensitive caching
+    set_sensitive_cache(response)
+
+    # 2) Per-actor budget
+    try:
+        await enforce_rate_limit(
+            key_suffix=f"deactivate:{current_user.id}",
+            seconds=1800,
+            max_calls=10,
+            error_message="Too many deactivations; please try again later.",
+        )
+    except HTTPException:
+        await log_audit_event(
+            db, user=current_user, action=AuditEvent.DEACTIVATE_USER, status="RATE_LIMITED", request=request,
+            meta_data={"target_user_id": str(user_id)},
+        )
+        raise
+
+    # 3) Idempotency (optional)
+    raw_idemp = request.headers.get("Idempotency-Key")
+    idemp_key = (
+        f"idemp:user-deactivate:{current_user.id}:{user_id}:{raw_idemp.strip()}"
+        if raw_idemp else None
+    )
+    if idemp_key:
+        try:
+            cached = await redis_wrapper.idempotency_get(idemp_key)
+        except Exception:
+            cached = None
+        if cached:
+            return MessageResponse(**cached)
+
+    # 4) Authorization
     if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
         await log_audit_event(
             db, user=current_user, action=AuditEvent.DEACTIVATE_USER, status="FORBIDDEN", request=request,
@@ -211,6 +300,7 @@ async def deactivate_user(
         )
         raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
 
+    # 5) Concurrency-safe mutation
     lock_name = f"lock:user_management:deactivate:{user_id}"
     try:
         async with redis_wrapper.lock(lock_name, timeout=10, blocking_timeout=3):
@@ -222,7 +312,13 @@ async def deactivate_user(
                     raise HTTPException(status_code=404, detail="User not found")
 
                 if not getattr(target, "is_active", True):
-                    return MessageResponse(message="User is already inactive")
+                    resp = MessageResponse(message="User is already inactive")
+                    if idemp_key:
+                        try:
+                            await redis_wrapper.idempotency_set(idemp_key, resp.model_dump(), ttl_seconds=600)
+                        except Exception:
+                            pass
+                    return resp
 
                 target.is_active = False
                 if hasattr(target, "deactivated_at"):
@@ -235,7 +331,14 @@ async def deactivate_user(
                     db, user=current_user, action=AuditEvent.DEACTIVATE_USER, status="SUCCESS", request=request,
                     meta_data={"target_user_id": str(target.id)},
                 )
-                return MessageResponse(message="User deactivated successfully")
+
+                resp = MessageResponse(message="User deactivated successfully")
+                if idemp_key:
+                    try:
+                        await redis_wrapper.idempotency_set(idemp_key, resp.model_dump(), ttl_seconds=600)
+                    except Exception:
+                        pass
+                return resp
 
             except HTTPException:
                 raise
@@ -274,16 +377,55 @@ async def reactivate_user(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> MessageResponse:
-    """Mark the user as active and clear `deactivated_at` if present.
-
-    Only ADMIN or SUPERUSER may reactivate.
     """
-    set_sensitive_cache(response)
-    await enforce_rate_limit(
-        key_suffix=f"reactivate:{current_user.id}", seconds=1800, max_calls=10,
-        error_message="Too many reactivations; please try again later.",
-    )
+    Mark the user as active and clear `deactivated_at` if present.
 
+    Rules
+    -----
+    - Only ADMIN or SUPERUSER may reactivate.
+
+    Steps
+    -----
+    1) Apply `no-store` headers
+    2) Enforce per-actor budget
+    3) Optional idempotency short-circuit
+    4) Authorization checks
+    5) Acquire lock → `FOR UPDATE` → mutate → commit
+    6) Persist idempotent snapshot & audit log
+    """
+    # 1) Sensitive caching
+    set_sensitive_cache(response)
+
+    # 2) Per-actor budget
+    try:
+        await enforce_rate_limit(
+            key_suffix=f"reactivate:{current_user.id}",
+            seconds=1800,
+            max_calls=10,
+            error_message="Too many reactivations; please try again later.",
+        )
+    except HTTPException:
+        await log_audit_event(
+            db, user=current_user, action=AuditEvent.REACTIVATE_USER, status="RATE_LIMITED", request=request,
+            meta_data={"target_user_id": str(user_id)},
+        )
+        raise
+
+    # 3) Idempotency (optional)
+    raw_idemp = request.headers.get("Idempotency-Key")
+    idemp_key = (
+        f"idemp:user-reactivate:{current_user.id}:{user_id}:{raw_idemp.strip()}"
+        if raw_idemp else None
+    )
+    if idemp_key:
+        try:
+            cached = await redis_wrapper.idempotency_get(idemp_key)
+        except Exception:
+            cached = None
+        if cached:
+            return MessageResponse(**cached)
+
+    # 4) Authorization
     if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
         await log_audit_event(
             db, user=current_user, action=AuditEvent.REACTIVATE_USER, status="FORBIDDEN", request=request,
@@ -291,6 +433,7 @@ async def reactivate_user(
         )
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
+    # 5) Concurrency-safe mutation
     lock_name = f"lock:user_management:reactivate:{user_id}"
     try:
         async with redis_wrapper.lock(lock_name, timeout=10, blocking_timeout=3):
@@ -302,7 +445,13 @@ async def reactivate_user(
                     raise HTTPException(status_code=404, detail="User not found")
 
                 if getattr(target, "is_active", True):
-                    return MessageResponse(message="User is already active")
+                    resp = MessageResponse(message="User is already active")
+                    if idemp_key:
+                        try:
+                            await redis_wrapper.idempotency_set(idemp_key, resp.model_dump(), ttl_seconds=600)
+                        except Exception:
+                            pass
+                    return resp
 
                 target.is_active = True
                 if hasattr(target, "deactivated_at"):
@@ -314,7 +463,14 @@ async def reactivate_user(
                     db, user=current_user, action=AuditEvent.REACTIVATE_USER, status="SUCCESS", request=request,
                     meta_data={"target_user_id": str(target.id)},
                 )
-                return MessageResponse(message="User reactivated successfully")
+
+                resp = MessageResponse(message="User reactivated successfully")
+                if idemp_key:
+                    try:
+                        await redis_wrapper.idempotency_set(idemp_key, resp.model_dump(), ttl_seconds=600)
+                    except Exception:
+                        pass
+                return resp
 
             except HTTPException:
                 raise
