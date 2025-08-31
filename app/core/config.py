@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: Literal["HS256", "HS384", "HS512"] = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(60, ge=5, le=24 * 60)
     REFRESH_TOKEN_EXPIRE_DAYS: int = Field(7, ge=1, le=365)
+    
+    # Admin auth policies
+    ADMIN_REQUIRE_MFA: bool = True
+    ADMIN_LOGIN_NEUTRAL_ERRORS: bool = True
 
     # ── Redis / Rate limiting ─────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"

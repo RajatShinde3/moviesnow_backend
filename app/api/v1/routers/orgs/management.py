@@ -75,10 +75,22 @@ async def update_user_role(
 
     # Authorization
     if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
+        await log_audit_event(
+            db, user=current_user, action="USER_ROLE_CHANGED", status="FORBIDDEN", request=request,
+            meta_data={"target_user_id": str(user_id), "reason": "insufficient_permissions"},
+        )
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     if current_user.id == user_id:
+        await log_audit_event(
+            db, user=current_user, action="USER_ROLE_CHANGED", status="DENIED_SELF_CHANGE", request=request,
+            meta_data={"target_user_id": str(user_id)},
+        )
         raise HTTPException(status_code=400, detail="You cannot change your own role")
     if payload.role == UserRole.SUPERUSER and current_user.role != UserRole.SUPERUSER:
+        await log_audit_event(
+            db, user=current_user, action="USER_ROLE_CHANGED", status="FORBIDDEN_SUPERUSER_ASSIGN", request=request,
+            meta_data={"target_user_id": str(user_id), "requested_role": str(payload.role)},
+        )
         raise HTTPException(status_code=403, detail="Only SUPERUSER can assign SUPERUSER")
 
     # Idempotency (optional): repeated same change returns cached result
@@ -108,6 +120,10 @@ async def update_user_role(
 
                 # SUPERUSER demotion restriction
                 if target.role == UserRole.SUPERUSER and current_user.role != UserRole.SUPERUSER:
+                    await log_audit_event(
+                        db, user=current_user, action="USER_ROLE_CHANGED", status="FORBIDDEN_SUPERUSER_MODIFY", request=request,
+                        meta_data={"target_user_id": str(user_id)},
+                    )
                     raise HTTPException(status_code=403, detail="Only SUPERUSER can modify SUPERUSER")
 
                 if target.role == payload.role:
@@ -182,8 +198,16 @@ async def deactivate_user(
     )
 
     if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
+        await log_audit_event(
+            db, user=current_user, action=AuditEvent.DEACTIVATE_USER, status="FORBIDDEN", request=request,
+            meta_data={"target_user_id": str(user_id)},
+        )
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     if current_user.id == user_id:
+        await log_audit_event(
+            db, user=current_user, action=AuditEvent.DEACTIVATE_USER, status="DENIED_SELF", request=request,
+            meta_data={"target_user_id": str(user_id)},
+        )
         raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
 
     lock_name = f"lock:user_management:deactivate:{user_id}"
@@ -259,6 +283,10 @@ async def reactivate_user(
     )
 
     if current_user.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
+        await log_audit_event(
+            db, user=current_user, action=AuditEvent.REACTIVATE_USER, status="FORBIDDEN", request=request,
+            meta_data={"target_user_id": str(user_id)},
+        )
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     lock_name = f"lock:user_management:reactivate:{user_id}"
@@ -304,4 +332,3 @@ async def reactivate_user(
                 raise HTTPException(status_code=500, detail="Unexpected error while reactivating user") from e
     except TimeoutError:
         raise HTTPException(status_code=429, detail="Busy processing a similar request; retry")
-
