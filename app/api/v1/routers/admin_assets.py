@@ -1860,7 +1860,7 @@ async def delivery_download_redeem(
     storage_key = data.get("storage_key") if isinstance(data, dict) else None
     if not storage_key:
         raise HTTPException(status_code=400, detail="Token missing storage_key")
-
+ 
     try:
         s3 = _ensure_s3()
         disp = f'attachment; filename="{filename}"' if filename else None
