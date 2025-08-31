@@ -212,6 +212,13 @@ def create_app() -> FastAPI:
     except Exception:
         logger.warning("No v1 router found at app.api.v1; continuing without API routes")
 
+    # Non-versioned security & discovery endpoints (well-known, oauth2, idempotency)
+    try:
+        from app.api.well_known import router as well_known_router  # type: ignore
+        app.include_router(well_known_router)
+    except Exception:
+        logger.warning("well-known router not available; skipping OIDC/JWKS endpoints")
+
     # ── Meta endpoints ──────────────────────────────────────────────────────
     @app.get("/healthz", tags=["meta"])  # health endpoints should not be rate limited
     @rate_limit_exempt()

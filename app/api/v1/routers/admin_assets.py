@@ -38,16 +38,22 @@ Uploads (6)
   - POST   /uploads/multipart/{uploadId}/abort
   - POST   /uploads/direct-proxy
 
-Bulk (4)
+Bulk (7)
   - POST   /bulk/manifest
   - GET    /bulk/jobs
   - GET    /bulk/jobs/{job_id}
   - POST   /bulk/jobs/{job_id}/cancel
+  - GET    /bulk/jobs/{job_id}/items
+  - POST   /bulk/jobs/{job_id}/retry
+  - DELETE /bulk/jobs/{job_id}
 
-CDN & Delivery (3)
+CDN & Delivery (6)
   - POST   /cdn/invalidate
+  - GET    /cdn/invalidation/{request_id}
   - POST   /delivery/signed-url
   - POST   /delivery/download-token
+  - GET    /delivery/download/{token}
+  - POST   /delivery/signed-manifest
 
 Security & Operations
 ---------------------
@@ -67,8 +73,9 @@ import base64
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, update, delete, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.limiter import rate_limit
@@ -297,6 +304,18 @@ class DownloadTokenIn(BaseModel):
     ttl_seconds: int = Field(3600, ge=60, le=24 * 3600)
 
 
+class SignedManifestIn(BaseModel):
+    """Request body to sign a manifest (HLS/DASH) for short-lived preview.
+
+    The endpoint returns a signed URL for the manifest object itself. Segment
+    URLs referenced within are not rewritten; this is intended for ephemeral
+    previews where the manifest is privately stored.
+    """
+    storage_key: str
+    expires_in: int = Field(300, ge=60, le=3600)
+    format: Optional[Literal["hls", "dash"]] = Field(None, description="Override auto-detect by file extension")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 🖼️ Artwork
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,6 +417,246 @@ async def list_artwork(
         "is_primary": bool(getattr(a, "is_primary", False)),
         "created_at": getattr(a, "created_at", None),
     } for a in rows]
+
+
+class ArtworkPatchIn(BaseModel):
+    language: Optional[str] = Field(None, description="BCP-47 tag (e.g., 'en', 'en-US')")
+    is_primary: Optional[bool] = None
+    region: Optional[str] = Field(None, description="ISO-3166-1 alpha-2 (optional)")
+    dominant_color: Optional[str] = None
+    focus_x: Optional[float] = Field(None, ge=0.0, le=1.0)
+    focus_y: Optional[float] = Field(None, ge=0.0, le=1.0)
+    sort_order: Optional[int] = Field(None, ge=0)
+    cdn_url: Optional[str] = None
+
+
+@router.patch("/artwork/{artwork_id}", summary="Update artwork flags/meta")
+@rate_limit("20/minute")
+async def patch_artwork(
+    artwork_id: UUID,
+    payload: ArtworkPatchIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin:artwork:{artwork_id}", timeout=10, blocking_timeout=3):
+        art = (await db.execute(select(Artwork).where(Artwork.id == artwork_id).with_for_update())).scalar_one_or_none()
+        if not art:
+            raise HTTPException(status_code=404, detail="Artwork not found")
+
+        updates: Dict[str, object] = {}
+        if payload.language is not None:
+            updates["language"] = _validate_language(payload.language)
+        if payload.region is not None:
+            updates["region"] = (payload.region or None)
+        if payload.dominant_color is not None:
+            updates["dominant_color"] = (payload.dominant_color or None)
+        if payload.focus_x is not None:
+            updates["focus_x"] = payload.focus_x
+        if payload.focus_y is not None:
+            updates["focus_y"] = payload.focus_y
+        if payload.sort_order is not None:
+            updates["sort_order"] = int(payload.sort_order)
+        if payload.cdn_url is not None:
+            updates["cdn_url"] = (payload.cdn_url or None)
+
+        if payload.is_primary is not None:
+            want_primary = bool(payload.is_primary)
+            if want_primary:
+                # Unset others for same parent/kind/lang first to avoid unique violations
+                lang = updates.get("language", art.language)
+                conds = [Artwork.kind == art.kind]
+                if art.title_id:
+                    conds += [Artwork.title_id == art.title_id]
+                if art.season_id:
+                    conds += [Artwork.season_id == art.season_id]
+                if art.episode_id:
+                    conds += [Artwork.episode_id == art.episode_id]
+                if lang is not None:
+                    conds += [func.coalesce(func.lower(Artwork.language), "") == (str(lang).lower())]
+                await db.execute(update(Artwork).where(and_(*conds)).values(is_primary=False))
+                updates["is_primary"] = True
+            else:
+                updates["is_primary"] = False
+
+        if updates:
+            await db.execute(update(Artwork).where(Artwork.id == artwork_id).values(**updates))
+            await db.commit()
+
+    await log_audit_event(db, user=current_user, action="ARTWORK_PATCH", status="SUCCESS", request=request,
+                          meta_data={"artwork_id": str(artwork_id), "fields": list(updates.keys()) if updates else []})
+    # Return a small view
+    art = (await db.execute(select(Artwork).where(Artwork.id == artwork_id))).scalar_one_or_none()
+    return {
+        "id": str(getattr(art, "id", artwork_id)),
+        "language": getattr(art, "language", None),
+        "is_primary": bool(getattr(art, "is_primary", False)),
+        "sort_order": getattr(art, "sort_order", 0),
+    }
+
+
+class ReorderArtworkIn(BaseModel):
+    order: List[UUID] = Field(..., description="Artwork IDs in desired order (front to back)")
+
+
+@router.post("/titles/{title_id}/artwork/reorder", summary="Reorder artwork for a title")
+@rate_limit("10/minute")
+async def reorder_artwork(
+    title_id: UUID,
+    payload: ReorderArtworkIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+    ids = [UUID(str(i)) for i in payload.order]
+    if not ids:
+        raise HTTPException(status_code=400, detail="Provide at least one artwork id")
+
+    async with redis_wrapper.lock(f"lock:admin:artwork:reorder:{title_id}", timeout=15, blocking_timeout=5):
+        # Verify all belong to title
+        rows = (await db.execute(select(Artwork.id).where(Artwork.title_id == title_id, Artwork.id.in_(ids)))).scalars().all()
+        found = set(rows)
+        missing = [str(i) for i in ids if i not in found]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Artwork not for title or missing: {', '.join(missing)}")
+        # Assign sort_order in the given order (0..)
+        for idx, aid in enumerate(ids):
+            await db.execute(update(Artwork).where(Artwork.id == aid).values(sort_order=idx))
+        await db.commit()
+
+    await log_audit_event(db, user=current_user, action="ARTWORK_REORDER", status="SUCCESS", request=request,
+                          meta_data={"title_id": str(title_id), "count": len(ids)})
+    return {"message": "Reordered", "count": len(ids)}
+
+
+@router.post("/titles/{title_id}/artwork/{artwork_id}/make-primary", summary="Make this artwork primary")
+@rate_limit("10/minute")
+async def make_primary_artwork(
+    title_id: UUID,
+    artwork_id: UUID,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin:artwork:primary:{title_id}:{artwork_id}", timeout=15, blocking_timeout=5):
+        art = (await db.execute(select(Artwork).where(Artwork.id == artwork_id).with_for_update())).scalar_one_or_none()
+        if not art or art.title_id != title_id:
+            raise HTTPException(status_code=404, detail="Artwork not found for this title")
+        lang = art.language
+        conds = [Artwork.title_id == title_id, Artwork.kind == art.kind]
+        if lang is not None:
+            conds += [func.coalesce(func.lower(Artwork.language), "") == str(lang).lower()]
+        await db.execute(update(Artwork).where(and_(*conds)).values(is_primary=False))
+        await db.execute(update(Artwork).where(Artwork.id == artwork_id).values(is_primary=True))
+        await db.commit()
+
+    await log_audit_event(db, user=current_user, action="ARTWORK_MAKE_PRIMARY", status="SUCCESS", request=request,
+                          meta_data={"title_id": str(title_id), "artwork_id": str(artwork_id)})
+    return {"message": "Primary set"}
+
+
+class TrailerPatchIn(BaseModel):
+    language: Optional[str] = None
+    is_primary: Optional[bool] = None
+    label: Optional[str] = Field(None, description="UI label stored in metadata")
+
+
+@router.patch("/trailers/{trailer_id}", summary="Update trailer flags/label")
+@rate_limit("20/minute")
+async def patch_trailer(
+    trailer_id: UUID,
+    payload: TrailerPatchIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin:trailer:{trailer_id}", timeout=10, blocking_timeout=3):
+        m = (await db.execute(select(MediaAsset).where(MediaAsset.id == trailer_id, MediaAsset.kind == MediaAssetKind.TRAILER).with_for_update())).scalar_one_or_none()
+        if not m:
+            raise HTTPException(status_code=404, detail="Trailer not found")
+
+        updates: Dict[str, object] = {}
+        if payload.language is not None:
+            updates["language"] = _validate_language(payload.language)
+        if payload.is_primary is not None:
+            if payload.is_primary:
+                # Unset others for same scope/lang
+                conds = [MediaAsset.kind == MediaAssetKind.TRAILER]
+                if m.title_id:
+                    conds += [MediaAsset.title_id == m.title_id]
+                if m.season_id:
+                    conds += [MediaAsset.season_id == m.season_id]
+                if m.episode_id:
+                    conds += [MediaAsset.episode_id == m.episode_id]
+                lang = updates.get("language", m.language)
+                if lang is not None:
+                    conds += [func.coalesce(func.lower(MediaAsset.language), "") == str(lang).lower()]
+                await db.execute(update(MediaAsset).where(and_(*conds)).values(is_primary=False))
+                updates["is_primary"] = True
+            else:
+                updates["is_primary"] = False
+
+        if payload.label is not None:
+            md = dict(getattr(m, "metadata_json", {}) or {})
+            if payload.label:
+                md["label"] = payload.label
+            else:
+                md.pop("label", None)
+            updates["metadata_json"] = md
+
+        if updates:
+            await db.execute(update(MediaAsset).where(MediaAsset.id == trailer_id).values(**updates))
+            await db.commit()
+
+    await log_audit_event(db, user=current_user, action="TRAILER_PATCH", status="SUCCESS", request=request,
+                          meta_data={"trailer_id": str(trailer_id), "fields": list(updates.keys()) if updates else []})
+    m = (await db.execute(select(MediaAsset).where(MediaAsset.id == trailer_id))).scalar_one_or_none()
+    return {
+        "id": str(getattr(m, "id", trailer_id)),
+        "language": getattr(m, "language", None),
+        "is_primary": bool(getattr(m, "is_primary", False)),
+        "label": (getattr(m, "metadata_json", {}) or {}).get("label"),
+    }
+
+
+@router.post("/titles/{title_id}/trailers/{trailer_id}/make-primary", summary="Make this trailer primary")
+@rate_limit("10/minute")
+async def make_primary_trailer(
+    title_id: UUID,
+    trailer_id: UUID,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin:trailer:primary:{title_id}:{trailer_id}", timeout=15, blocking_timeout=5):
+        m = (await db.execute(select(MediaAsset).where(MediaAsset.id == trailer_id, MediaAsset.kind == MediaAssetKind.TRAILER).with_for_update())).scalar_one_or_none()
+        if not m or m.title_id != title_id:
+            raise HTTPException(status_code=404, detail="Trailer not found for this title")
+        lang = m.language
+        conds = [MediaAsset.title_id == title_id, MediaAsset.kind == MediaAssetKind.TRAILER]
+        if lang is not None:
+            conds += [func.coalesce(func.lower(MediaAsset.language), "") == str(lang).lower()]
+        await db.execute(update(MediaAsset).where(and_(*conds)).values(is_primary=False))
+        await db.execute(update(MediaAsset).where(MediaAsset.id == trailer_id).values(is_primary=True))
+        await db.commit()
+
+    await log_audit_event(db, user=current_user, action="TRAILER_MAKE_PRIMARY", status="SUCCESS", request=request,
+                          meta_data={"title_id": str(title_id), "trailer_id": str(trailer_id)})
+    return {"message": "Primary set"}
 
 
 @router.delete("/artwork/{artwork_id}", summary="Delete artwork + storage")
@@ -1159,6 +1418,260 @@ async def bulk_job_cancel(
     return {"status": "CANCEL_REQUESTED"}
 
 
+# ----------------------------------------------------------------------------------
+# Bulk job QoL: inspect items/errors, retry failed, purge job records
+# ----------------------------------------------------------------------------------
+
+
+@router.get("/bulk/jobs/{job_id}/items", summary="Inspect bulk job items and errors")
+@rate_limit("60/minute")
+async def bulk_job_items(
+    job_id: str,
+    request: Request,
+    status_filter: Literal["all", "failed", "succeeded", "pending", "error"] = Query(
+        "all", alias="status", description="Filter items by status"
+    ),
+    only_errors: bool = Query(False, description="Return only error entries if available"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    limit: int = Query(100, ge=1, le=1000, description="Pagination limit"),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    """Return a slice of recorded items and errors for a bulk job.
+
+    Data Model (Redis)
+    ------------------
+    - Job envelope: `bulk:job:{job_id}` (JSON)
+    - Items array:  `bulk:job:{job_id}:items` (JSON list; optional)
+    - Errors array: `bulk:job:{job_id}:errors` (JSON list; optional)
+
+    Notes
+    -----
+    - If a worker does not populate items/errors, this returns empty arrays.
+    - Supports simple pagination and status filtering on the in-memory list.
+    """
+    await _ensure_admin(current_user); await _ensure_mfa(request)
+
+    job_key = f"bulk:job:{job_id}"
+    job = await redis_wrapper.json_get(job_key)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    items_key = f"bulk:job:{job_id}:items"
+    errs_key = f"bulk:job:{job_id}:errors"
+    items = await redis_wrapper.json_get(items_key, default=[]) or []
+    errors = await redis_wrapper.json_get(errs_key, default=[]) or []
+
+    # Defensive normalization: ensure lists of dicts
+    try:
+        items = [i for i in items if isinstance(i, dict)]
+    except Exception:
+        items = []
+    try:
+        errors = [e for e in errors if isinstance(e, dict)]
+    except Exception:
+        errors = []
+
+    # Optional filter by status
+    sf = str(status_filter or "all").lower()
+    if sf != "all":
+        def _match(it: Dict[str, object]) -> bool:
+            st = str(it.get("status", "")).lower()
+            if sf == "failed":
+                return st in {"failed", "error"}
+            if sf == "succeeded":
+                return st in {"success", "succeeded", "done"}
+            if sf == "pending":
+                return st in {"queued", "pending", "running"}
+            if sf == "error":
+                return st == "error"
+            return True
+        items = [it for it in items if _match(it)]
+
+    total = len(items)
+    start = int(offset)
+    end = min(start + int(limit), total)
+    page = items[start:end]
+
+    return {
+        "job": {"id": job.get("id"), "status": job.get("status")},
+        "items": page,
+        "items_total": total,
+        "next_offset": end if end < total else None,
+        "errors": errors if only_errors else None,
+        "errors_total": len(errors) if errors else 0,
+    }
+
+
+class BulkRetryIn(BaseModel):
+    """Retry request payload for a bulk job.
+
+    - `only_failed`: when true, only items with status FAILED/ERROR are re-queued.
+    - `include_pending`: include PENDING/QUEUED items in retry set.
+    """
+    only_failed: bool = True
+    include_pending: bool = False
+
+
+@router.post("/bulk/jobs/{job_id}/retry", status_code=202, summary="Re-queue a failed/partial bulk job")
+@rate_limit("10/minute")
+async def bulk_job_retry(
+    job_id: str,
+    payload: BulkRetryIn,
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    """Create a new queued job from failed/pending items of an existing job.
+
+    Behavior
+    --------
+    - Reads `bulk:job:{job_id}` and its `:items` list, if present.
+    - Filters items according to `only_failed` and `include_pending`.
+    - Creates a new job id and enqueues it with copied items.
+    - Marks source job with `retries` count and `last_retry_job_id`.
+    """
+    await _ensure_admin(current_user); await _ensure_mfa(request)
+
+    src_job_key = f"bulk:job:{job_id}"
+    src_job = await redis_wrapper.json_get(src_job_key)
+    if not src_job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Load items to retry (may be empty if not recorded by worker)
+    items_key = f"bulk:job:{job_id}:items"
+    items = await redis_wrapper.json_get(items_key, default=[]) or []
+    if not isinstance(items, list):
+        items = []
+
+    def _is_failed(it: Dict[str, object]) -> bool:
+        st = str(it.get("status", "")).lower()
+        return st in {"failed", "error"}
+
+    def _is_pending(it: Dict[str, object]) -> bool:
+        st = str(it.get("status", "")).lower()
+        return st in {"queued", "pending", "running"}
+
+    retry_pool: List[Dict[str, object]] = []
+    for it in (items if isinstance(items, list) else []):
+        if not isinstance(it, dict):
+            continue
+        if payload.only_failed and not _is_failed(it):
+            if payload.include_pending and _is_pending(it):
+                retry_pool.append(it)
+            continue
+        else:
+            # If only_failed=False -> include all items, or include_failed path
+            if payload.only_failed:
+                retry_pool.append(it) if _is_failed(it) else None
+            else:
+                retry_pool.append(it)
+
+    # If we have no recorded items, still allow a blind retry by cloning manifest_url
+    if not retry_pool and not items:
+        retry_pool = []  # empty -> worker can interpret manifest_url
+
+    new_job_id = uuid4().hex
+    new_job_key = f"bulk:job:{new_job_id}"
+    ttl = 24 * 3600
+    try:
+        await redis_wrapper.json_set(new_job_key, {
+            "id": new_job_id,
+            "status": "QUEUED",
+            "submitted_at": getattr(request, "state", object()).__dict__.get("request_start_time", None),
+            "submitted_by": str(getattr(current_user, "id", "")),
+            "manifest_url": src_job.get("manifest_url"),
+            "items_count": len(retry_pool) if retry_pool else src_job.get("items_count"),
+            "retry_of": job_id,
+        }, ttl_seconds=ttl)
+        await redis_wrapper.client.sadd("bulk:jobs", new_job_id)  # type: ignore
+
+        # Copy selected items into the new job's items list
+        if retry_pool:
+            await redis_wrapper.json_set(f"bulk:job:{new_job_id}:items", retry_pool, ttl_seconds=ttl)
+
+        # Update source job with retry bookkeeping
+        src_job["retries"] = int(src_job.get("retries", 0) or 0) + 1
+        src_job["last_retry_job_id"] = new_job_id
+        src_job["status"] = src_job.get("status") or "RETRY_QUEUED"
+        await redis_wrapper.json_set(src_job_key, src_job, ttl_seconds=ttl)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Could not enqueue retry job")
+
+    try:
+        await log_audit_event(
+            db=db,
+            user=current_user,
+            action="BULK_JOB_RETRY",
+            status="QUEUED",
+            request=request,
+            meta_data={
+                "source_job_id": job_id,
+                "new_job_id": new_job_id,
+                "requeued_items": len(retry_pool),
+                "only_failed": payload.only_failed,
+                "include_pending": payload.include_pending,
+            },
+        )
+    except Exception:
+        pass
+
+    return {"job_id": new_job_id, "status": "QUEUED", "requeued_items": len(retry_pool)}
+
+
+@router.delete("/bulk/jobs/{job_id}", status_code=200, summary="Purge a bulk job record")
+@rate_limit("10/minute")
+async def bulk_job_purge(
+    job_id: str,
+    request: Request,
+    force: bool = Query(False, description="Force purge regardless of status"),
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    """Delete a bulk job envelope and its associated items/errors from Redis.
+
+    Safety
+    ------
+    - By default only purges jobs in a terminal state: COMPLETED/FAILED/CANCELLED/ABORTED.
+    - Set `force=true` to override (not recommended during active processing).
+    """
+    await _ensure_admin(current_user); await _ensure_mfa(request)
+
+    key = f"bulk:job:{job_id}"
+    job = await redis_wrapper.json_get(key)
+    if not job:
+        # Remove from index set if present anyway
+        try:
+            await redis_wrapper.client.srem("bulk:jobs", job_id)  # type: ignore
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status_str = str(job.get("status", "")).upper()
+    terminal = {"COMPLETED", "FAILED", "CANCELLED", "ABORTED"}
+    if not force and status_str not in terminal:
+        raise HTTPException(status_code=409, detail="Job not in terminal state; set force=true to purge")
+
+    try:
+        await redis_wrapper.client.delete(key)  # type: ignore
+        await redis_wrapper.client.delete(f"bulk:job:{job_id}:items")  # type: ignore
+        await redis_wrapper.client.delete(f"bulk:job:{job_id}:errors")  # type: ignore
+        await redis_wrapper.client.srem("bulk:jobs", job_id)  # type: ignore
+    except Exception:
+        raise HTTPException(status_code=503, detail="Could not purge job")
+    try:
+        await log_audit_event(
+            db=db,
+            user=current_user,
+            action="BULK_JOB_PURGE",
+            status="SUCCESS",
+            request=request,
+            meta_data={"job_id": job_id, "forced": force},
+        )
+    except Exception:
+        pass
+
+    return {"status": "PURGED", "job_id": job_id}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 🚀 CDN & Delivery
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1191,7 +1704,8 @@ async def cdn_invalidate(
         raise HTTPException(status_code=400, detail="Provide at least one path or prefix")
 
     dist_id = payload.distribution_id or getattr(settings, "CLOUDFRONT_DISTRIBUTION_ID", None)
-    caller_ref = f"inv-{uuid4().hex}"
+    request_id = uuid4().hex
+    caller_ref = f"inv-{request_id}"
 
     if dist_id:
         try:
@@ -1201,34 +1715,67 @@ async def cdn_invalidate(
                 aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY.get_secret_value(),
                 region_name=settings.AWS_REGION,
             )
-            cf.create_invalidation(
+            resp = cf.create_invalidation(
                 DistributionId=dist_id,
                 InvalidationBatch={"Paths": {"Quantity": len(paths), "Items": paths}, "CallerReference": caller_ref},
             )
+            inv_id = None
+            try:
+                inv_id = (resp or {}).get("Invalidation", {}).get("Id")  # type: ignore[assignment]
+            except Exception:
+                inv_id = None
+
+            # Persist status for later polling
+            state = {
+                "request_id": request_id,
+                "provider": "cloudfront",
+                "distribution_id": dist_id,
+                "invalidation_id": inv_id,
+                "paths": paths,
+                "status": "SUBMITTED",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "caller_reference": caller_ref,
+            }
+            try:
+                await redis_wrapper.json_set(f"cdn:inv:{request_id}", state, ttl_seconds=24 * 3600)
+            except Exception:
+                pass
             await log_audit_event(
                 db=db,
                 user=current_user,
                 action="CDN_INVALIDATE",
                 status="SUBMITTED",
                 request=request,
-                meta_data={"distribution": dist_id, "paths": paths[:10], "count": len(paths)},
+                meta_data={"distribution": dist_id, "paths": paths[:10], "count": len(paths), "request_id": request_id, "invalidation_id": inv_id},
             )
-            return {"status": "SUBMITTED", "distribution_id": dist_id, "paths": paths}
+            return {"status": "SUBMITTED", "distribution_id": dist_id, "paths": paths, "request_id": request_id, "invalidation_id": inv_id}
         except Exception:
             # Fall through to queue
             pass
 
     try:
         await redis_wrapper.client.rpush("cdn:invalidate:queue", *paths)  # type: ignore
+        # Persist queued request for status polling
+        state = {
+            "request_id": request_id,
+            "provider": "queue",
+            "paths": paths,
+            "status": "QUEUED",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            await redis_wrapper.json_set(f"cdn:inv:{request_id}", state, ttl_seconds=24 * 3600)
+        except Exception:
+            pass
         await log_audit_event(
             db=db,
             user=current_user,
             action="CDN_INVALIDATE",
             status="QUEUED",
             request=request,
-            meta_data={"paths": paths[:10], "count": len(paths)},
+            meta_data={"paths": paths[:10], "count": len(paths), "request_id": request_id},
         )
-        return {"status": "QUEUED", "paths": paths}
+        return {"status": "QUEUED", "paths": paths, "request_id": request_id}
     except Exception:
         raise HTTPException(status_code=503, detail="Could not queue invalidation")
 
@@ -1276,3 +1823,351 @@ async def delivery_download_token(
     except Exception:
         raise HTTPException(status_code=503, detail="Could not store token")
     return {"token": token, "expires_at": data["expires_at"]}
+
+
+@router.get("/delivery/download/{token}", summary="Redeem one-time download token")
+@rate_limit("60/minute")
+async def delivery_download_redeem(
+    token: str,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    redirect: bool = Query(True, description="If true, 307 redirect to signed URL; else return JSON"),
+    filename: Optional[str] = Query(None, description="Optional attachment filename for Content-Disposition"),
+    expires_in: int = Query(300, ge=60, le=3600, description="Signed URL TTL in seconds"),
+) -> Dict[str, str] | RedirectResponse:
+    """Redeem a one-time token and return/redirect to a signed URL.
+
+    Semantics
+    ---------
+    - Tokens are stored at `download:token:{token}` with TTL and one_time flag.
+    - Redemption acquires a short lock and deletes the token to prevent reuse.
+    - This endpoint does not require authentication; the token itself authorizes access.
+    """
+    set_sensitive_cache(response)
+    # Serialize redemption via a distributed lock to ensure one-time usage
+    async with redis_wrapper.lock(f"lock:download:token:{token}", timeout=5, blocking_timeout=2):
+        key = f"download:token:{token}"
+        data = await redis_wrapper.json_get(key)
+        if not data:
+            raise HTTPException(status_code=404, detail="Token not found or expired")
+        # One-time semantics: best-effort delete
+        try:
+            await redis_wrapper.client.delete(key)  # type: ignore
+        except Exception:
+            pass
+
+    storage_key = data.get("storage_key") if isinstance(data, dict) else None
+    if not storage_key:
+        raise HTTPException(status_code=400, detail="Token missing storage_key")
+
+    try:
+        s3 = _ensure_s3()
+        disp = f'attachment; filename="{filename}"' if filename else None
+        url = s3.presigned_get(str(storage_key), expires_in=int(expires_in), response_content_disposition=disp)
+    except S3StorageError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    # Return redirect or JSON, based on caller preference
+    if redirect:
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+        try:
+            await log_audit_event(
+                db=db,
+                user=None,
+                action="DELIVERY_DOWNLOAD_REDEEM",
+                status="SUCCESS",
+                request=request,
+                meta_data={"token": token, "redirect": True},
+            )
+        except Exception:
+            pass
+        return RedirectResponse(url=url, status_code=307, headers=headers)
+    try:
+        await log_audit_event(
+            db=db,
+            user=None,
+            action="DELIVERY_DOWNLOAD_REDEEM",
+            status="SUCCESS",
+            request=request,
+            meta_data={"token": token, "redirect": False},
+        )
+    except Exception:
+        pass
+    return {"url": url}
+
+
+@router.get("/cdn/invalidation/{request_id}", summary="Fetch CDN invalidation status")
+@rate_limit("60/minute")
+async def cdn_invalidation_status(
+    request_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    """Return the status of a previously submitted CDN invalidation.
+
+    Looks up state from Redis at `cdn:inv:{request_id}`. When CloudFront
+    information is present, attempts to refresh status via `GetInvalidation`.
+    """
+    await _ensure_admin(current_user); await _ensure_mfa(request)
+    key = f"cdn:inv:{request_id}"
+    state = await redis_wrapper.json_get(key)
+    if not state:
+        raise HTTPException(status_code=404, detail="Invalidation request not found")
+
+    provider = state.get("provider") if isinstance(state, dict) else None
+    if provider == "cloudfront":
+        dist_id = state.get("distribution_id")
+        inv_id = state.get("invalidation_id")
+        if dist_id and inv_id:
+            try:
+                cf = boto3.client(
+                    "cloudfront",
+                    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY.get_secret_value(),
+                    region_name=settings.AWS_REGION,
+                )
+                resp = cf.get_invalidation(DistributionId=dist_id, Id=inv_id)
+                status = (resp or {}).get("Invalidation", {}).get("Status", state.get("status"))
+                # Update cached state
+                state.update({
+                    "status": status,
+                    "last_checked_at": datetime.now(timezone.utc).isoformat(),
+                })
+                try:
+                    await redis_wrapper.json_set(key, state, ttl_seconds=24 * 3600)
+                except Exception:
+                    pass
+            except Exception:
+                # Ignore refresh failures; return cached state
+                pass
+
+    try:
+        await log_audit_event(
+            db=db,
+            user=current_user,
+            action="CDN_INVALIDATE_STATUS",
+            status=str(state.get("status") if isinstance(state, dict) else "UNKNOWN"),
+            request=request,
+            meta_data={"request_id": request_id},
+        )
+    except Exception:
+        pass
+
+    return state  # type: ignore[return-value]
+
+
+@router.post("/delivery/signed-manifest", summary="Sign a HLS/DASH manifest for preview")
+@rate_limit("60/minute")
+async def delivery_signed_manifest(
+    payload: SignedManifestIn,
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    """Return a short-lived signed URL for the manifest object.
+
+    This does not rewrite segment URLs; use a private storage layout for
+    previews where the manifest suffices.
+    """
+    await _ensure_admin(current_user); await _ensure_mfa(request)
+    s3 = _ensure_s3()
+    # Decide content-type by format or extension
+    fmt = (payload.format or "").lower()
+    ctype = None
+    key_lower = payload.storage_key.lower()
+    if fmt == "hls" or key_lower.endswith(".m3u8"):
+        ctype = "application/vnd.apple.mpegurl"
+    elif fmt == "dash" or key_lower.endswith(".mpd"):
+        ctype = "application/dash+xml"
+    try:
+        url = s3.presigned_get(payload.storage_key, expires_in=payload.expires_in, response_content_type=ctype)
+    except S3StorageError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    try:
+        await log_audit_event(
+            db=db,
+            user=current_user,
+            action="DELIVERY_SIGNED_MANIFEST",
+            status="SUCCESS",
+            request=request,
+            meta_data={"storage_key": payload.storage_key, "format": fmt or ("hls" if key_lower.endswith(".m3u8") else "dash" if key_lower.endswith(".mpd") else None)},
+        )
+    except Exception:
+        pass
+    return {"url": url, "content_type": ctype or "application/octet-stream"}
+
+
+# ----------------------------------------------------------------------------
+# Video assets (main features)
+# ----------------------------------------------------------------------------
+
+class VideoCreateIn(BaseModel):
+    content_type: str = Field(..., description="e.g., video/mp4")
+    language: Optional[str] = Field(None, description="BCP-47 tag")
+    is_primary: bool = False
+    label: Optional[str] = Field(None, description="UI label stored in metadata")
+
+
+@router.post("/titles/{title_id}/video", summary="Create a video asset (presigned PUT)")
+@rate_limit("6/minute")
+async def create_video_asset(
+    title_id: UUID,
+    payload: VideoCreateIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+
+    t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Title not found")
+    _ensure_allowed_mime(payload.content_type, ALLOWED_VIDEO_MIME, "video")
+    lang = _validate_language(payload.language)
+
+    idem_hdr = request.headers.get("Idempotency-Key")
+    idem_key = f"idemp:admin:video:create:{title_id}:{idem_hdr}" if idem_hdr else None
+    if idem_key:
+        snap = await redis_wrapper.idempotency_get(idem_key)
+        if snap:
+            return snap  # type: ignore[return-value]
+
+    s3 = _ensure_s3()
+    ext = _ext_for_content_type(payload.content_type) or "mp4"
+    key = f"video/title/{title_id}/main_{uuid4().hex}.{ext}"
+    url = s3.presigned_put(key, content_type=payload.content_type, public=False)
+
+    meta = {}
+    if payload.label:
+        meta["label"] = payload.label
+
+    if payload.is_primary:
+        conds = [MediaAsset.title_id == title_id, MediaAsset.kind == MediaAssetKind.VIDEO]
+        if lang is not None:
+            conds += [func.coalesce(func.lower(MediaAsset.language), "") == str(lang).lower()]
+        await db.execute(update(MediaAsset).where(and_(*conds)).values(is_primary=False))
+
+    m = MediaAsset(
+        title_id=title_id,
+        kind=MediaAssetKind.VIDEO,
+        language=lang,
+        storage_key=key,
+        mime_type=payload.content_type,
+        is_primary=bool(payload.is_primary),
+        metadata_json=meta or None,
+    )
+    db.add(m); await db.flush(); await db.commit()
+
+    body = {"upload_url": url, "storage_key": key, "asset_id": str(m.id)}
+    await log_audit_event(db, user=current_user, action="VIDEO_CREATE", status="SUCCESS", request=request,
+                          meta_data={"title_id": str(title_id), "asset_id": body["asset_id"]})
+    if idem_key:
+        try:
+            await redis_wrapper.idempotency_set(idem_key, body, ttl_seconds=600)
+        except Exception:
+            pass
+    return body
+
+
+class VideoPatchIn(BaseModel):
+    language: Optional[str] = None
+    is_primary: Optional[bool] = None
+    label: Optional[str] = None
+    sort_order: Optional[int] = Field(None, ge=0)
+    cdn_url: Optional[str] = None
+
+
+@router.patch("/video/{asset_id}", summary="Update video asset metadata")
+@rate_limit("20/minute")
+async def patch_video_asset(
+    asset_id: UUID,
+    payload: VideoPatchIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin:video:{asset_id}", timeout=10, blocking_timeout=3):
+        m = (await db.execute(select(MediaAsset).where(MediaAsset.id == asset_id, MediaAsset.kind == MediaAssetKind.VIDEO).with_for_update())).scalar_one_or_none()
+        if not m:
+            raise HTTPException(status_code=404, detail="Video asset not found")
+        updates: Dict[str, object] = {}
+        if payload.language is not None:
+            updates["language"] = _validate_language(payload.language)
+        if payload.is_primary is not None:
+            if payload.is_primary:
+                conds = [MediaAsset.kind == MediaAssetKind.VIDEO]
+                if m.title_id:
+                    conds += [MediaAsset.title_id == m.title_id]
+                if m.season_id:
+                    conds += [MediaAsset.season_id == m.season_id]
+                if m.episode_id:
+                    conds += [MediaAsset.episode_id == m.episode_id]
+                lang = updates.get("language", m.language)
+                if lang is not None:
+                    conds += [func.coalesce(func.lower(MediaAsset.language), "") == str(lang).lower()]
+                await db.execute(update(MediaAsset).where(and_(*conds)).values(is_primary=False))
+                updates["is_primary"] = True
+            else:
+                updates["is_primary"] = False
+        if payload.label is not None:
+            md = dict(getattr(m, "metadata_json", {}) or {})
+            if payload.label:
+                md["label"] = payload.label
+            else:
+                md.pop("label", None)
+            updates["metadata_json"] = md
+        if payload.sort_order is not None:
+            updates["sort_order"] = int(payload.sort_order)
+        if payload.cdn_url is not None:
+            updates["cdn_url"] = (payload.cdn_url or None)
+        if updates:
+            await db.execute(update(MediaAsset).where(MediaAsset.id == asset_id).values(**updates))
+            await db.commit()
+
+    await log_audit_event(db, user=current_user, action="VIDEO_PATCH", status="SUCCESS", request=request,
+                          meta_data={"asset_id": str(asset_id), "fields": list(updates.keys()) if updates else []})
+    m = (await db.execute(select(MediaAsset).where(MediaAsset.id == asset_id))).scalar_one_or_none()
+    return {
+        "id": str(getattr(m, "id", asset_id)),
+        "language": getattr(m, "language", None),
+        "is_primary": bool(getattr(m, "is_primary", False)),
+        "label": (getattr(m, "metadata_json", {}) or {}).get("label"),
+        "sort_order": getattr(m, "sort_order", 0),
+    }
+
+
+@router.delete("/video/{asset_id}", summary="Delete a video asset")
+@rate_limit("10/minute")
+async def delete_video_asset(
+    asset_id: UUID,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+
+    m = (await db.execute(select(MediaAsset).where(MediaAsset.id == asset_id, MediaAsset.kind == MediaAssetKind.VIDEO))).scalar_one_or_none()
+    if not m:
+        raise HTTPException(status_code=404, detail="Video asset not found")
+    key = getattr(m, "storage_key", None)
+
+    async with redis_wrapper.lock(f"lock:admin:video:delete:{asset_id}", timeout=10, blocking_timeout=3):
+        await db.execute(delete(MediaAsset).where(MediaAsset.id == asset_id))
+        await db.commit()
+    if key:
+        try:
+            s3 = _ensure_s3()
+            s3.delete_object(key)
+        except Exception:
+            pass
+
+    await log_audit_event(db, user=current_user, action="VIDEO_DELETE", status="SUCCESS", request=request,
+                          meta_data={"asset_id": str(asset_id), "storage_key": key})
+    return {"message": "Deleted"}

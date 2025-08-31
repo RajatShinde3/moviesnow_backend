@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: Literal["HS256", "HS384", "HS512"] = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(60, ge=5, le=24 * 60)
     REFRESH_TOKEN_EXPIRE_DAYS: int = Field(7, ge=1, le=365)
+    # Optional OIDC/JWKS for service-to-service tokens
+    OIDC_RSA_PRIVATE_KEY_PEM: Optional[SecretStr] = None
+    OIDC_RSA_PUBLIC_KEY_PEM: Optional[str] = None
+    OIDC_RSA_PRIVATE_KEY_PATH: Optional[str] = None
+    OIDC_RSA_PUBLIC_KEY_PATH: Optional[str] = None
+    OIDC_KID: Optional[str] = None
+    OIDC_ISSUER: Optional[str] = None  # Full URL; falls back to PUBLIC_BASE_URL
+    SERVICE_TOKEN_TTL_SECONDS: int = Field(3600, ge=300, le=24 * 3600)
     
     # Admin auth policies
     ADMIN_REQUIRE_MFA: bool = True

@@ -320,5 +320,9 @@ class Title(Base):
         foreign_keys="[ContentAdvisory.title_id]",
     )
 
+    # Soft-delete (recycle bin). When set, the title is considered deleted and
+    # should be filtered out of normal listings at the application layer.
+    deleted_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Title id={self.id} type={self.type} name={self.name!r} published={self.is_published}>"

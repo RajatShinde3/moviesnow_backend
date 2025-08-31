@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import List, Dict, Optional
 from uuid import UUID
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
 from pydantic import BaseModel, Field
@@ -41,7 +41,8 @@ from app.core.redis_client import redis_wrapper
 from app.db.session import get_async_db
 from app.db.models.user import User
 from app.db.models.title import Title
-from app.schemas.enums import TitleType, TitleStatus
+from app.db.models.availability import Availability
+from app.schemas.enums import TitleType, TitleStatus, TerritoryMode, DistributionKind, DeviceClass
 from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import log_audit_event
 
@@ -102,6 +103,7 @@ def _serialize_title(t: Title) -> Dict[str, object]:
         "rating_count": getattr(t, "rating_count", None),
         "created_at": getattr(t, "created_at", None),
         "updated_at": getattr(t, "updated_at", None),
+        "deleted_at": getattr(t, "deleted_at", None),
     }
 
 
@@ -391,3 +393,145 @@ async def delete_title(
     await log_audit_event(db, user=current_user, action="TITLES_DELETE", status="SUCCESS", request=request,
                           meta_data={"id": str(title_id)})
     return {"message": "Title deleted"}
+
+
+# ---- Soft delete / restore (recycle bin) ------------------------------------
+@router.post("/titles/{title_id}/soft-delete", summary="Soft-delete a title (recycle bin)")
+@rate_limit("5/minute")
+async def soft_delete_title(
+    title_id: UUID,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    await _ensure_admin(current_user)
+    await _ensure_mfa(request)
+    set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin_titles:soft_delete:{title_id}", timeout=10, blocking_timeout=3):
+        t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
+        if not t:
+            raise HTTPException(status_code=404, detail="Title not found")
+        if getattr(t, "deleted_at", None) is not None:
+            return {"message": "Already deleted"}
+        await db.execute(update(Title).where(Title.id == title_id).values(deleted_at=func.now()))
+        await db.commit()
+    await log_audit_event(db, user=current_user, action="TITLES_DELETE_SOFT", status="SUCCESS", request=request,
+                          meta_data={"id": str(title_id)})
+    return {"message": "Soft-deleted"}
+
+
+@router.post("/titles/{title_id}/restore", summary="Restore a soft-deleted title")
+@rate_limit("5/minute")
+async def restore_title(
+    title_id: UUID,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    await _ensure_admin(current_user)
+    await _ensure_mfa(request)
+    set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin_titles:restore:{title_id}", timeout=10, blocking_timeout=3):
+        t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
+        if not t:
+            raise HTTPException(status_code=404, detail="Title not found")
+        if getattr(t, "deleted_at", None) is None:
+            return {"message": "Already active"}
+        await db.execute(update(Title).where(Title.id == title_id).values(deleted_at=None))
+        await db.commit()
+    await log_audit_event(db, user=current_user, action="TITLES_RESTORE", status="SUCCESS", request=request,
+                          meta_data={"id": str(title_id)})
+    return {"message": "Restored"}
+
+
+# ---- Availability endpoints --------------------------------------------------
+class AvailabilityWindowIn(BaseModel):
+    window_start: datetime
+    window_end: Optional[datetime] = None
+    territory_mode: TerritoryMode = TerritoryMode.GLOBAL
+    countries: Optional[List[str]] = None
+    distribution: Optional[List[DistributionKind]] = None
+    device_classes: Optional[List[DeviceClass]] = None
+    rights: Optional[Dict[str, object]] = None
+
+
+class AvailabilitySetIn(BaseModel):
+    windows: List[AvailabilityWindowIn]
+
+
+def _ser_availability(a: Availability) -> Dict[str, object]:
+    return {
+        "id": str(getattr(a, "id", "")),
+        "window_start": getattr(a, "window_start", None),
+        "window_end": getattr(a, "window_end", None),
+        "territory_mode": str(getattr(a, "territory_mode", None)),
+        "countries": getattr(a, "countries", None),
+        "distribution": getattr(a, "distribution", None),
+        "device_classes": getattr(a, "device_classes", None),
+        "rights": getattr(a, "rights", None),
+    }
+
+
+@router.get("/titles/{title_id}/availability", summary="Get availability windows for a title")
+@rate_limit("30/minute")
+async def get_title_availability(
+    title_id: UUID,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> List[Dict[str, object]]:
+    await _ensure_admin(current_user)
+    await _ensure_mfa(request)
+    set_sensitive_cache(response, seconds=0)
+
+    t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Title not found")
+    rows = (await db.execute(select(Availability).where(Availability.title_id == title_id).order_by(Availability.window_start.asc()))).scalars().all() or []
+    return [_ser_availability(a) for a in rows]
+
+
+@router.put("/titles/{title_id}/availability", summary="Replace availability windows for a title")
+@rate_limit("10/minute")
+async def put_title_availability(
+    title_id: UUID,
+    payload: AvailabilitySetIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user)
+    await _ensure_mfa(request)
+    set_sensitive_cache(response)
+
+    async with redis_wrapper.lock(f"lock:admin_titles:availability:{title_id}", timeout=15, blocking_timeout=5):
+        t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
+        if not t:
+            raise HTTPException(status_code=404, detail="Title not found")
+        if getattr(t, "deleted_at", None) is not None:
+            raise HTTPException(status_code=409, detail="Title is deleted; restore before changing availability")
+
+        await db.execute(delete(Availability).where(Availability.title_id == title_id))
+        for w in payload.windows:
+            a = Availability(
+                title_id=title_id,
+                window_start=w.window_start,
+                window_end=w.window_end,
+                territory_mode=w.territory_mode,
+                countries=(w.countries or None),
+                distribution=(w.distribution or None),
+                device_classes=(w.device_classes or None),
+                rights=(w.rights or None),
+            )
+            db.add(a)
+        await db.flush(); await db.commit()
+
+    await log_audit_event(db, user=current_user, action="TITLES_AVAILABILITY_SET", status="SUCCESS", request=request,
+                          meta_data={"id": str(title_id), "windows": len(payload.windows)})
+    return {"message": "Availability updated", "count": len(payload.windows)}

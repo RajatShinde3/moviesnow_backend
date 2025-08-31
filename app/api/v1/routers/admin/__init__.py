@@ -16,6 +16,8 @@ from .sessions import router as sessions_router
 from .staff import router as staff_router
 from .taxonomy import router as taxonomy_router
 from .auth import router as auth_router
+from .api_keys import router as api_keys_router
+from .genres import router as genres_router
 
 
 router = APIRouter()
@@ -29,6 +31,8 @@ router.include_router(sessions_router)
 router.include_router(staff_router)
 router.include_router(taxonomy_router)
 router.include_router(auth_router)
+router.include_router(api_keys_router)
+router.include_router(genres_router)
 
 __all__ = [
     "router",
@@ -39,5 +43,7 @@ __all__ = [
     "staff_router",
     "taxonomy_router",
     "auth_router",
+    "api_keys_router",
+    "genres_router",
 ]
 
