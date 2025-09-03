@@ -1,27 +1,29 @@
-
+# app/api/v1/routers/observability.py
 # ╔════════════════════════════════════════════════════════════════════════════╗
-# ║ MoviesNow · Observability                                                  ║
+# ║ 🧩 MoviesNow · Observability                                               ║
 # ║                                                                            ║
 # ║ Endpoints                                                                  ║
 # ║  - GET/HEAD /healthz                          → Liveness (fast)            ║
-# ║  - GET      /readyz                           → Readiness w/ deps          ║
+# ║  - GET/HEAD /readyz                           → Readiness w/ deps          ║
 # ║  - GET      /metrics                          → Prometheus metrics          ║
 # ║  - GET      /version                          → Build/version info          ║
 # ║  - GET      /debug/audit-logs                 → Admin-only audit viewer     ║
 # ║  - POST     /webhooks/*                       → HMAC-verified webhooks      ║
 # ╠────────────────────────────────────────────────────────────────────────────╣
 # ║ Security & Ops                                                              
-# ║  - Rate limiting on all routes (except Prometheus pull cadence is usually   ║
-# ║    low anyway).                                                              ║
-# ║  - Webhooks: HMAC signature required + Redis-free in-memory TTL dedupe.     ║
-# ║  - Secret scrubbing for logged headers (Authorization, signatures, etc.).    ║
-# ║  - Cache-Control: no-store for probes/webhooks/version/debug.                ║
-# ║  - Optional “deep” checks via HEALTHCHECK_DEEP=1.                            ║
+# ║  - Per-route rate limiting (Prometheus scrape is lightweight anyway).       ║
+# ║  - Webhooks: HMAC signature required + in-memory TTL dedupe.                ║
+# ║  - Secret scrubbing for logged headers (Authorization, signatures, etc.).   ║
+# ║  - Cache-Control: no-store for probes/webhooks/version/debug.               ║
+# ║  - Optional “deep” checks via HEALTHCHECK_DEEP=1.                           ║
+# ║  - Correlation headers echoed back when present (X-Request-Id/traceparent). ║
 # ╚════════════════════════════════════════════════════════════════════════════╝
+
+from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -41,55 +43,78 @@ from app.security_headers import set_sensitive_cache
 
 router = APIRouter(tags=["Observability"], responses={404: {"description": "Not found"}})
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilities
+# 🧰 Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _no_store_json(payload: Any, status_code: int = 200) -> JSONResponse:
-    """Return a JSONResponse with strict no-store caching."""
+def _echo_correlation_headers(request: Request, response: Response) -> None:
+    """Echo common correlation headers back to the caller (best-effort)."""
+    for h in ("x-request-id", "traceparent"):
+        if h in request.headers:
+            response.headers[h] = request.headers[h]
+
+
+def _no_store_json(payload: Any, status_code: int = 200, request: Optional[Request] = None) -> JSONResponse:
+    """Return a JSONResponse with strict no-store caching and correlation headers."""
     resp = JSONResponse(payload, status_code=status_code)
-    # Defense-in-depth alongside set_sensitive_cache (used on Response objects).
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     resp.headers["Pragma"] = "no-cache"
+    if request is not None:
+        _echo_correlation_headers(request, resp)
     return resp
 
 
 def _scrub_headers(headers: Mapping[str, str]) -> Dict[str, str]:
-    """Remove or redact potentially sensitive headers before logging."""
-    REDACT = {"authorization", "x-signature", "x-signature-v2", "x-api-key", "cookie"}
+    """Redact sensitive headers before logging; truncate very long values."""
+    REDACT = {"authorization", "x-signature", "x-signature-v2", "x-api-key", "cookie", "set-cookie"}
     out: Dict[str, str] = {}
     for k, v in headers.items():
         lk = k.lower()
         if lk in REDACT:
             out[k] = "[REDACTED]"
         else:
-            # Keep short values intact; truncate very long ones to avoid log bloat.
             out[k] = v if len(v) <= 256 else (v[:256] + "…")
     return out
 
 
+def _with_timing(fn) -> Tuple[Dict[str, Any], float]:
+    """Run a check and return (result, duration_ms)."""
+    t0 = time.monotonic()
+    res = fn()
+    dt = (time.monotonic() - t0) * 1000.0
+    return res, dt
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Liveness / Readiness
+# 🧪 Liveness / Readiness
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/healthz")
-def healthz(response: Response, _rl=Depends(rate_limit)):
+def healthz(request: Request, response: Response, _rl=Depends(rate_limit)):
     """
-    Liveness probe: returns quickly if process is alive.
+    🧪 Liveness probe (fast path).
 
     Steps
     -----
-    1) Apply `no-store` headers.
-    2) Return an epoch timestamp for simple monotonicity checks.
+    1) Apply strict `no-store` headers.
+    2) Echo correlation headers (X-Request-Id/traceparent) back to the caller.
+    3) Return a tiny payload with a UNIX epoch timestamp.
+
+    Returns
+    -------
+    {"status": "ok", "ts": <int>}
     """
     set_sensitive_cache(response, seconds=0)
-    return _no_store_json({"status": "ok", "ts": int(time.time())})
+    _echo_correlation_headers(request, response)
+    return _no_store_json({"status": "ok", "ts": int(time.time())}, request=request)
 
 
 @router.head("/healthz")
-def healthz_head(response: Response, _rl=Depends(rate_limit)):
+def healthz_head(request: Request, response: Response, _rl=Depends(rate_limit)):
     """HEAD variant of /healthz for super-lightweight probes."""
     set_sensitive_cache(response, seconds=0)
+    _echo_correlation_headers(request, response)
     return Response(status_code=200)
 
 
@@ -102,7 +127,6 @@ def _check_database() -> Dict[str, Any]:
         from sqlalchemy import create_engine  # type: ignore
 
         timeout = float(os.environ.get("HEALTHCHECK_DB_TIMEOUT", "1.0"))
-        # NOTE: pool_pre_ping helps detect dead connections.
         engine = create_engine(url, pool_pre_ping=True, connect_args={})
         try:
             with engine.connect() as conn:
@@ -126,8 +150,7 @@ def _check_redis() -> Dict[str, Any]:
         import redis  # type: ignore
 
         client = redis.StrictRedis.from_url(
-            url,
-            socket_timeout=float(os.environ.get("HEALTHCHECK_REDIS_TIMEOUT", "0.5")),
+            url, socket_timeout=float(os.environ.get("HEALTHCHECK_REDIS_TIMEOUT", "0.5"))
         )
         client.ping()
         return {"name": "redis", "configured": True, "ok": True}
@@ -171,6 +194,7 @@ def _check_kms() -> Dict[str, Any]:
 
 def _check_repositories() -> Dict[str, Any]:
     try:
+        # Validate DI wiring and import-time side effects
         get_titles_repository()
         get_user_repository()
         get_player_repository()
@@ -180,48 +204,79 @@ def _check_repositories() -> Dict[str, Any]:
 
 
 @router.get("/readyz")
-def readyz(response: Response, _rl=Depends(rate_limit)):
+def readyz(request: Request, response: Response, _rl=Depends(rate_limit)):
     """
-    Readiness probe with light dependency checks.
+    🧪 Readiness probe with light dependency checks (optionally deep).
 
     Behavior
     --------
     - By default performs shallow checks only.
     - Set `HEALTHCHECK_DEEP=1` to enable deeper provider calls (S3 head, KMS describe).
+    - Includes per-check durations to facilitate SLO/SLA dashboards.
 
     Steps
     -----
-    1) Apply `no-store` headers.
-    2) Run DB/Redis/S3/KMS/repository checks.
-    3) Return 200 if all OK, else 503 with details for dashboards.
+    1) Apply `no-store` headers and echo correlation headers.
+    2) Run DB/Redis/S3/KMS/repository checks with timing.
+    3) Return 200 if all OK, else 503 with structured details.
+
+    Returns
+    -------
+    {
+      "ok": bool,
+      "ts": <unix_epoch>,
+      "checks": [
+        {"name": "...", "ok": true, "configured": true, "duration_ms": 2.1, ...},
+        ...
+      ]
+    }
     """
     set_sensitive_cache(response, seconds=0)
-    checks = [
-        _check_database(),
-        _check_redis(),
-        _check_s3(),
-        _check_kms(),
-        _check_repositories(),
+    _echo_correlation_headers(request, response)
+
+    checks_with_fns = [
+        ("database", _check_database),
+        ("redis", _check_redis),
+        ("s3", _check_s3),
+        ("kms", _check_kms),
+        ("repositories", _check_repositories),
     ]
-    ok = all(c.get("ok", False) for c in checks)
-    status_code = 200 if ok else 503
-    return _no_store_json({"ok": ok, "checks": checks, "ts": int(time.time())}, status_code=status_code)
+
+    checks: list[Dict[str, Any]] = []
+    all_ok = True
+    for name, fn in checks_with_fns:
+        res, ms = _with_timing(fn)
+        res["name"] = name  # enforce name presence
+        res["duration_ms"] = round(ms, 2)
+        checks.append(res)
+        all_ok = all_ok and bool(res.get("ok", False))
+
+    status_code = 200 if all_ok else 503
+    return _no_store_json({"ok": all_ok, "checks": checks, "ts": int(time.time())}, status_code, request)
+
+
+@router.head("/readyz")
+def readyz_head(request: Request, response: Response, _rl=Depends(rate_limit)):
+    """HEAD variant of /readyz (useful for super-lightweight load balancer checks)."""
+    set_sensitive_cache(response, seconds=0)
+    _echo_correlation_headers(request, response)
+    return Response(status_code=200)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metrics & Version
+# 📈 Metrics & 🔢 Version
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/metrics")
 def metrics(_rl=Depends(rate_limit)):
     """
-    Prometheus metrics endpoint.
+    📈 Prometheus metrics endpoint.
 
     Notes
     -----
-    - If `prometheus_client` is missing, serves a tiny fallback so load balancers
-      and uptime checks still have a scrape target.
-    - Avoids cache headers: Prometheus expects fresh content each scrape.
+    - If `prometheus_client` is unavailable, serves a tiny fallback so scrapes
+      still succeed and LB health checks remain green.
+    - Avoids explicit cache headers: Prometheus expects fresh content per scrape.
     """
     try:
         from prometheus_client import CONTENT_TYPE_LATEST, generate_latest  # type: ignore
@@ -241,6 +296,7 @@ def _read_version() -> Dict[str, Any]:
     version = os.environ.get("APP_VERSION")
     build = os.environ.get("APP_BUILD")
     commit = os.environ.get("GIT_SHA")
+    runtime_env = os.environ.get("RUNTIME", "unknown")
     if not version:
         for path in ("VERSION", "app/VERSION", "version.txt"):
             if os.path.exists(path):
@@ -250,29 +306,37 @@ def _read_version() -> Dict[str, Any]:
                         break
                 except Exception:
                     pass
-    return {"version": version or "0.0.0-dev", "build": build, "commit": commit}
+    return {
+        "version": version or "0.0.0-dev",
+        "build": build,
+        "commit": commit,
+        "runtime": runtime_env,
+    }
 
 
 @router.get("/version")
-def version(response: Response, _rl=Depends(rate_limit)):
+def version(request: Request, response: Response, _rl=Depends(rate_limit)):
     """
-    Return build/version info from env/files.
+    🔢 Build/version info.
 
     Steps
     -----
-    1) Apply `no-store` headers to avoid proxy caching stale build info.
-    2) Read env or VERSION file(s) and return structured payload.
+    1) Apply `no-store` headers (avoid stale versions through proxies).
+    2) Read env or VERSION file(s); return a small structured payload.
+    3) Echo correlation headers for easier end-to-end tracing.
     """
     set_sensitive_cache(response, seconds=0)
-    return _no_store_json(_read_version())
+    _echo_correlation_headers(request, response)
+    return _no_store_json(_read_version(), request=request)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Admin debug: audit log viewer
+# 🛡️ Admin debug: audit log viewer
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/debug/audit-logs")
 def debug_audit_logs(
+    request: Request,
     response: Response,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
@@ -281,37 +345,57 @@ def debug_audit_logs(
     _=Depends(require_admin),
 ):
     """
-    Admin-only paginated audit log viewer.
+    🛡️ Admin-only paginated audit log viewer.
 
     Steps
     -----
-    1) Apply `no-store` headers.
-    2) Fetch logs from repository with filters.
+    1) Apply `no-store` headers and echo correlation headers.
+    2) Fetch logs from repository with optional filters (source/actor).
+    3) Return items with pagination metadata.
+
+    Security
+    --------
+    - Requires admin (validated by `require_admin` dependency).
+    - Response has sensitive cache-control to avoid leaking PII via caches.
     """
     set_sensitive_cache(response, seconds=0)
+    _echo_correlation_headers(request, response)
     repo = get_audit_repository()
     items, total = repo.list(page=page, page_size=page_size, source=source, actor=actor)
-    return json_no_store({"items": items, "page": page, "page_size": page_size, "total": total})
+    return json_no_store(
+        {"items": items, "page": page, "page_size": page_size, "total": total}, response=response
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Webhooks (HMAC verified + idempotent)
+# 📬 Webhooks (HMAC verified + idempotent)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _webhook_seen = TTLCache(maxsize=8192)
 
 async def _handle_webhook(request: Request, *, secret_env: str, source: str) -> Response:
     """
-    Generic webhook handler.
+    📬 Generic webhook handler (HMAC verified + TTL dedupe).
 
     Steps
     -----
+    0) Apply strict `no-store` cache headers and echo correlation headers.
     1) Verify HMAC signature with shared secret from env (`secret_env`).
-    2) Deduplicate by `X-Event-Id`/`x-event-id`/body.id/body.event_id using TTL cache.
-    3) Record an audit entry with scrubbed headers and body (size-safe).
-    4) Return 202 to indicate asynchronous acceptance.
+    2) Deduplicate by `X-Event-Id`/`x-event-id` or JSON `id`/`event_id` using a
+       process-local TTL cache (Redis-free for minimal latency/cost).
+    3) Record an audit entry with scrubbed headers and size-safe body.
+    4) Return 202 to indicate asynchronous acceptance (providers can retry).
+
+    Fail-Closed
+    -----------
+    - Signature verification failure → 401.
     """
-    # 1) Verify signature (fail closed).
+    # Step 0: Prepare response early with cache & correlation headers
+    resp = Response(status_code=202)
+    set_sensitive_cache(resp, seconds=0)
+    _echo_correlation_headers(request, resp)
+
+    # Step 1: Verify signature
     ok = await verify_webhook_signature(request, secret_env=secret_env)
     if not ok:
         raise HTTPException(status_code=401, detail="Invalid signature")
@@ -322,58 +406,54 @@ async def _handle_webhook(request: Request, *, secret_env: str, source: str) -> 
     except Exception:
         body = {}
 
-    # 2) Idempotency / dedupe
+    # Step 2: Idempotency / dedupe
     event_id = (
         request.headers.get("x-event-id")
         or request.headers.get("X-Event-Id")
-        or body.get("id")
-        or body.get("event_id")
+        or (body.get("id") if isinstance(body, dict) else None)
+        or (body.get("event_id") if isinstance(body, dict) else None)
     )
     if event_id:
         key = f"wh:{source}:{event_id}"
         if _webhook_seen.seen(key):
-            # Already processed—accept again but no-op.
-            resp = Response(status_code=202)
-            set_sensitive_cache(resp, seconds=0)
-            return resp
+            return resp  # already processed—accept again but no-op
         _webhook_seen.set(key, ttl_seconds=int(os.environ.get("WEBHOOKS_DEDUP_TTL", "600")))
 
-    # 3) Audit log with scrubbed headers. Avoid logging huge/sensitive payloads.
+    # Step 3: Audit log (scrub headers; truncate body if huge)
     repo = get_audit_repository()
     actor = request.headers.get("x-sender") or request.headers.get("X-Sender")
     headers = _scrub_headers(dict(request.headers))
-    # Optionally truncate body to a safe size
-    if isinstance(body, dict) and int(os.environ.get("WEBHOOK_LOG_BODY_MAX_KEYS", "512")) < len(body):
-        body = {k: body[k] for k in list(body)[: int(os.environ.get("WEBHOOK_LOG_BODY_MAX_KEYS", "512"))]}
-        body["_truncated"] = True
-
+    if isinstance(body, dict):
+        max_keys = int(os.environ.get("WEBHOOK_LOG_BODY_MAX_KEYS", "512"))
+        if len(body) > max_keys:
+            keep_keys = list(body)[:max_keys]
+            body = {k: body[k] for k in keep_keys}
+            body["_truncated"] = True
     repo.add(source=source, action="webhook", actor=actor, meta={"headers": headers, "body": body})
 
-    # 4) Respond
-    resp = Response(status_code=202)
-    set_sensitive_cache(resp, seconds=0)
+    # Step 4: Respond
     return resp
 
 
 @router.post("/webhooks/cdn/invalidation-callback")
 async def webhooks_cdn_invalidation(request: Request, _rl=Depends(rate_limit)):
-    """CDN invalidation callback webhook (HMAC verified; idempotent)."""
+    """📦 CDN invalidation callback webhook (HMAC verified; idempotent)."""
     return await _handle_webhook(request, secret_env="WEBHOOKS_CDN_SECRET", source="cdn")
 
 
 @router.post("/webhooks/email-events")
 async def webhooks_email_events(request: Request, _rl=Depends(rate_limit)):
-    """Email provider events webhook (HMAC verified; idempotent)."""
+    """📧 Email provider events webhook (HMAC verified; idempotent)."""
     return await _handle_webhook(request, secret_env="WEBHOOKS_EMAIL_SECRET", source="email")
 
 
 @router.post("/webhooks/encoding-status")
 async def webhooks_encoding_status(request: Request, _rl=Depends(rate_limit)):
-    """Encoding pipeline status webhook (HMAC verified; idempotent)."""
+    """🎞️ Encoding pipeline status webhook (HMAC verified; idempotent)."""
     return await _handle_webhook(request, secret_env="WEBHOOKS_ENCODING_SECRET", source="encoding")
 
 
 @router.post("/webhooks/payments")
 async def webhooks_payments(request: Request, _rl=Depends(rate_limit)):
-    """Payments provider webhook (HMAC verified; idempotent)."""
+    """💸 Payments provider webhook (HMAC verified; idempotent)."""
     return await _handle_webhook(request, secret_env="WEBHOOKS_PAYMENTS_SECRET", source="payments")

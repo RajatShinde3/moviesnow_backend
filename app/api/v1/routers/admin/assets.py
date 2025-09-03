@@ -5,7 +5,7 @@ standardize on `app.api.v1.routers.admin.assets` while tests and existing
 code keep working.
 """
 
-from app.api.v1.routers.admin_assets import router  # noqa: F401
+from app.api.v1.routers.admin.assets import router  # noqa: F401
 
 __all__ = ["router"]
 

@@ -1,33 +1,29 @@
-
+# app/api/v1/routers/public_discovery.py
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ MoviesNow · Public Discovery API                                         ║
+# ║ 🧊🎬 MoviesNow · Public Discovery API                                    ║
 # ║                                                                          ║
 # ║ Endpoints (public + optional API key):                                   ║
-# ║  - GET /titles                           → Paginated discovery list      ║
-# ║  - GET /titles/{title_id}                → Title detail                  ║
-# ║  - GET /titles/{title_id}/streams        → Public stream variants        ║
-# ║  - GET /titles/{title_id}/subtitles      → Public subtitle tracks        ║
-# ║  - GET /search                           → Text search (paginated)       ║
-# ║  - GET /genres                           → Available genres              ║
-# ║  - GET /credits?title_id=...             → Public credits                ║
-# ║  - GET /similar/{title_id}               → Related titles                ║
-# ║  - GET /stream/{title_id}/{quality}      → Signed stream URL (no-store)  ║
-# ║  - GET /download/{title_id}/{quality}    → Signed download URL (no-store)║
+# ║  - GET  /titles                           → Paginated discovery list      ║
+# ║  - GET  /titles/{title_id}                → Title detail                  ║
+# ║  - GET  /titles/{title_id}/streams        → Public stream variants        ║
+# ║  - GET  /titles/{title_id}/subtitles      → Public subtitle tracks        ║
+# ║  - GET  /search                           → Text search (paginated)       ║
+# ║  - GET  /genres                           → Available genres              ║
+# ║  - GET  /credits?title_id=...             → Public credits                ║
+# ║  - GET  /similar/{title_id}               → Related titles                ║
+# ║  - GET  /stream/{title_id}/{quality}      → Signed stream URL (no-store)  ║
+# ║  - GET  /download/{title_id}/{quality}    → Signed download URL (no-store)║
 # ╠──────────────────────────────────────────────────────────────────────────╣
 # ║ Security & Ops                                                           
-# ║  - Optional `X-API-Key` enforcement (if configured).                      
-# ║  - Rate limited via dependency.                                           
-# ║  - Strong ETag + Cache-Control (CDN-friendly) where safe.                 
+# ║  - Optional `X-API-Key` enforcement, per-route rate limits.               
+# ║  - Strong ETag + CDN Cache-Control where safe (public data).              
 # ║  - RFC 5988 pagination headers (`Link`) + `X-Total-Count`.                
-# ║  - Neutral errors; no internal details leaked.                            
-# ║  - Structured logging (best-effort) without blocking request flow.        
+# ║  - Responses for signed URLs are `Cache-Control: no-store`.               
+# ║  - Neutral errors; no provider/internal details leak.                     
+# ║  - Best-effort structured logging; never blocks the request flow.         
 # ╚══════════════════════════════════════════════════════════════════════════╝
-"""
-Public discovery endpoints for titles, streams, subtitles and related data.
 
-Provides consistent caching (ETag + Cache-Control), optional public API key
-enforcement, and rate limiting. Designed to be CDN-friendly.
-"""
+from __future__ import annotations
 
 import hashlib
 import json
@@ -52,7 +48,7 @@ from app.api.http_utils import (
     enforce_public_api_key,
     rate_limit,
     sanitize_title_id,
-    json_no_store,  # used for signed URL responses (no-store)
+    json_no_store,  # for signed URL responses (no-store)
 )
 from app.core.cache import TTLMap
 from app.repositories.titles import get_titles_repository
@@ -67,8 +63,7 @@ from app.schemas.titles import (
 )
 from app.services.signing import SignedURL, generate_signed_url
 
-logger = logging.getLogger(__name__)
-
+log = logging.getLogger(__name__)
 router = APIRouter(
     prefix="",
     tags=["Public Discovery"],
@@ -83,50 +78,43 @@ router = APIRouter(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cache & ETag helpers
+# 🧩 Cache & ETag helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Small in-proc TTL cache for hot paths (still validates client ETag)
 _resp_cache = TTLMap(maxsize=4096)
 
-def _compute_etag(data: Any) -> str:
-    """
-    Compute a **strong** ETag (quoted SHA-256 hex of a canonicalized JSON payload).
 
-    Returns
-    -------
-    str
-        A quoted ETag value per RFC 7232, e.g. `"abc123..."`.
-    """
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer from env safely (defensive)."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+
+def _compute_etag(data: Any) -> str:
+    """Compute a **strong** ETag (quoted SHA-256 of canonical JSON)."""
     raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f"\"{hashlib.sha256(raw).hexdigest()}\""
 
 
 def _parse_if_none_match(header_val: Optional[str]) -> List[str]:
-    """
-    Parse `If-None-Match` which may contain a list of ETags separated by commas.
-
-    Returns a list of trimmed values (keeps quotes if present).
-    """
+    """Parse `If-None-Match`, which may contain a comma-delimited list of ETags."""
     if not header_val:
         return []
     return [part.strip() for part in header_val.split(",") if part.strip()]
 
 
 def _cache_key(request: Request) -> str:
-    """
-    Build a stable cache key from method, path, and sorted query params.
-
-    Note: Authentication is not considered here because these endpoints are public.
-    If you add auth-sensitive variants in the future, include auth state in this key.
-    """
+    """Stable cache key from method, path, and **sorted** query params (public data only)."""
     query = "&".join(sorted([f"{k}={v}" for k, v in request.query_params.multi_items()]))
     return f"{request.method}:{request.url.path}?{query}"
 
 
-def _pagination_header_values(request: Request, *, page: int, page_size: int, total: int) -> Dict[str, str]:
-    """Return RFC 5988 `Link` and `X-Total-Count` header values for pagination."""
-    headers: Dict[str, str] = {}
-    headers["X-Total-Count"] = str(total)
+def _pagination_headers(request: Request, *, page: int, page_size: int, total: int) -> Dict[str, str]:
+    """Return RFC 5988 `Link` and `X-Total-Count` headers for pagination."""
+    headers: Dict[str, str] = {"X-Total-Count": str(total)}
 
     def _q(p: int) -> str:
         qd = dict(request.query_params)
@@ -148,6 +136,13 @@ def _pagination_header_values(request: Request, *, page: int, page_size: int, to
     return headers
 
 
+def _echo_correlation_headers(request: Request, response: Response) -> None:
+    """Echo correlation headers (best-effort) to help clients stitch logs."""
+    for h in ("x-request-id", "traceparent"):
+        if h in request.headers:
+            response.headers[h] = request.headers[h]
+
+
 def cache_json_response(
     request: Request,
     ttl: int,
@@ -155,27 +150,20 @@ def cache_json_response(
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> JSONResponse:
     """
-    Return a JSONResponse with strong ETag + CDN-friendly Cache-Control.
+    Return a JSONResponse with **strong ETag** + CDN-friendly `Cache-Control`.
 
-    Handles conditional requests: returns 304 if `If-None-Match` matches.
+    Handles conditional requests: returns **304** if `If-None-Match` matches.
 
-    Parameters
-    ----------
-    request : Request
-        Incoming request (used for conditional logic and cache key).
-    ttl : int
-        Cache TTL in seconds (applies to both max-age & s-maxage).
-    payload : Any
-        JSON-serializable payload.
-    extra_headers : Optional[Dict[str, str]]
-        Additional headers (e.g., pagination).
-
-    Returns
-    -------
-    JSONResponse
+    Steps
+    -----
+    1) Compute ETag from payload.
+    2) If client's `If-None-Match` matches → 304 with cache headers.
+    3) Else → 200 JSON with ETag + `public, max-age` caching.
+    4) Store short-lived in-proc snapshot (best-effort).
     """
     etag = _compute_etag(payload)
     inm_values = _parse_if_none_match(request.headers.get("If-None-Match") or request.headers.get("if-none-match"))
+
     if etag in inm_values or "*" in inm_values:
         resp = JSONResponse(status_code=status.HTTP_304_NOT_MODIFIED, content=None)
         resp.headers["ETag"] = etag
@@ -186,6 +174,7 @@ def cache_json_response(
         if extra_headers:
             for k, v in extra_headers.items():
                 resp.headers[k] = v
+        _echo_correlation_headers(request, resp)
         return resp
 
     resp = JSONResponse(content=payload)
@@ -197,24 +186,29 @@ def cache_json_response(
     if extra_headers:
         for k, v in extra_headers.items():
             resp.headers[k] = v
+    _echo_correlation_headers(request, resp)
 
     _resp_cache.set(_cache_key(request), {"payload": payload, "etag": etag}, ttl)
     return resp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public discovery endpoints: titles, streams, subtitles, credits, search
+# 🎛️ Query validation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ALLOWED_SORT = {"popularity", "year", "rating", "name", "released_at"}
 _ALLOWED_ORDER = {"asc", "desc"}
 
+
 def _validated_sort(sort: Optional[str]) -> str:
     return sort if sort in _ALLOWED_SORT else "popularity"
+
 
 def _validated_order(order: Optional[str]) -> str:
     return order if order in _ALLOWED_ORDER else "desc"
 
+
+# ╔════════════════════════════════ Titles & Search ══════════════════════════╗
 
 @router.get(
     "/titles",
@@ -227,7 +221,7 @@ def list_titles(
     q: Optional[str] = Query(None, min_length=1, max_length=128, description="Search query"),
     page: int = Query(1, ge=1),
     page_size: int = Query(24, ge=1, le=100),
-    sort: Optional[str] = Query("popularity", description="popularity|year|rating|name|released_at"),
+    sort: Optional[str] = Query("popularity", description="one of: popularity|year|rating|name|released_at"),
     order: Optional[str] = Query("desc", description="asc|desc"),
     genres: Optional[List[str]] = Query(None, description="Filter by genre(s)"),
     year_gte: Optional[int] = Query(None, ge=1800, le=2100),
@@ -238,31 +232,29 @@ def list_titles(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
+    """Paginated discovery list (CDN-cached with strong ETag).
+
+    Steps
+    -----
+    1) Serve hot cache if present (still validates ETag).
+    2) Sanitize sort/order; build filter map.
+    3) Query repository for items/total/facets.
+    4) Build payload and pagination headers.
+    5) Return cached JSON with ETag (30s default TTL).
     """
-    List titles for public discovery.
+    cache_ttl = _env_int("PUBLIC_CACHE_TTL_SECONDS", 30)
 
-    Caching
-    -------
-    - Strong ETag + `Cache-Control` with short TTL (CDN-friendly).
-    - Conditional GET with `If-None-Match` → `304 Not Modified`.
-
-    Security
-    --------
-    - Optional `X-API-Key` if configured; always rate-limited.
-    """
-    cache_ttl = int(os.environ.get("PUBLIC_CACHE_TTL_SECONDS", "30"))
-
-    # 1) Attempt to serve from in-memory TTL cache (still validates ETag)
+    # (1) Hot path: in-proc cache (best-effort)
     cached = _resp_cache.get(_cache_key(request))
     if cached and cached.get("payload") is not None:
-        headers = _pagination_header_values(request, page=page, page_size=page_size, total=cached["payload"].get("total", 0))
+        headers = _pagination_headers(request, page=page, page_size=page_size, total=cached["payload"].get("total", 0))
         return cache_json_response(request, cache_ttl, cached["payload"], extra_headers=headers)  # type: ignore[index]
 
-    # 2) Sanitize sort/order inputs
+    # (2) Validate sort/order
     sort = _validated_sort(sort)
     order = _validated_order(order)
 
-    # 3) Query repository
+    # (3) Fetch from repo
     repo = get_titles_repository()
     filters: Dict[str, Any] = {
         "genres": genres,
@@ -277,10 +269,10 @@ def list_titles(
             q=q, filters=filters, sort=sort, order=order, page=page, page_size=page_size
         )
     except Exception as e:
-        logger.exception("titles search failed: %s", e)
+        log.exception("titles search failed: %s", e)
         raise HTTPException(status_code=500, detail="Search failed")
 
-    # 4) Build payload and respond with cache headers + pagination headers
+    # (4) Shape response
     payload = PaginatedTitles(
         items=[TitleSummary(**i) if not isinstance(i, TitleSummary) else i for i in items],
         page=page,
@@ -288,7 +280,9 @@ def list_titles(
         total=int(total or 0),
         facets=facets or {},
     ).dict()
-    headers = _pagination_header_values(request, page=page, page_size=page_size, total=payload["total"])
+    headers = _pagination_headers(request, page=page, page_size=page_size, total=payload["total"])
+
+    # (5) Send cached JSON
     return cache_json_response(request, cache_ttl, payload, extra_headers=headers)
 
 
@@ -304,13 +298,12 @@ def get_title(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    Return title details.
+    """Return title detail (ETag cached if enabled).
 
     Caching
     -------
     - If `PUBLIC_ITEM_CACHE_TTL_SECONDS` > 0, response is ETagged and cached.
-      Otherwise, relies on outer CDN/reverse proxy policy.
+      Otherwise, relies on upstream/CDN policy.
     """
     tid = sanitize_title_id(title_id)
     repo = get_titles_repository()
@@ -322,14 +315,16 @@ def get_title(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("get title failed: %s", e)
+        log.exception("get title failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to fetch title")
 
-    ttl = int(os.environ.get("PUBLIC_ITEM_CACHE_TTL_SECONDS", "0"))
+    ttl = _env_int("PUBLIC_ITEM_CACHE_TTL_SECONDS", 0)
     if ttl > 0:
         return cache_json_response(request, ttl, detail.dict())
     return detail
 
+
+# ╔════════════════════════════════ Streams & Subtitles ══════════════════════╗
 
 @router.get(
     "/titles/{title_id}/streams",
@@ -343,8 +338,7 @@ def list_stream_variants(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    List available stream variants for a title (public view).
+    """List available **public** stream variants (bitrate/quality/container).
 
     Caching
     -------
@@ -359,10 +353,10 @@ def list_stream_variants(
         else:
             data = []
     except Exception as e:
-        logger.exception("get stream variants failed: %s", e)
+        log.exception("get stream variants failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to fetch stream variants")
 
-    ttl = int(os.environ.get("PUBLIC_ITEM_CACHE_TTL_SECONDS", "0"))
+    ttl = _env_int("PUBLIC_ITEM_CACHE_TTL_SECONDS", 0)
     payload = [v.dict() if isinstance(v, StreamVariant) else v for v in data]
     if ttl > 0:
         return cache_json_response(request, ttl, payload)
@@ -381,8 +375,7 @@ def list_subtitles(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    List available subtitle tracks for a title.
+    """List **public** subtitle tracks (lang, kind, URL/manifest ref).
 
     Caching
     -------
@@ -397,15 +390,17 @@ def list_subtitles(
         else:
             data = []
     except Exception as e:
-        logger.exception("get subtitles failed: %s", e)
+        log.exception("get subtitles failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to fetch subtitles")
 
-    ttl = int(os.environ.get("PUBLIC_ITEM_CACHE_TTL_SECONDS", "0"))
+    ttl = _env_int("PUBLIC_ITEM_CACHE_TTL_SECONDS", 0)
     payload = [s.dict() if isinstance(s, SubtitleTrack) else s for s in data]
     if ttl > 0:
         return cache_json_response(request, ttl, payload)
     return data
 
+
+# ╔════════════════════════════════ Search, Genres, Credits, Similar ═════════╗
 
 @router.get(
     "/search",
@@ -421,21 +416,23 @@ def search(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    Search titles by text query.
+    """Full-text search over titles (ETag + CDN cache).
 
-    Caching
-    -------
-    - Strong ETag + `Cache-Control` with short TTL (CDN-friendly).
+    Steps
+    -----
+    1) Query repo with popularity-sorted defaults.
+    2) Shape `PaginatedTitles` payload.
+    3) Add RFC 5988 pagination headers.
+    4) Return cached JSON with strong ETag (30s default).
     """
-    cache_ttl = int(os.environ.get("PUBLIC_CACHE_TTL_SECONDS", "30"))
+    cache_ttl = _env_int("PUBLIC_CACHE_TTL_SECONDS", 30)
     repo = get_titles_repository()
     try:
         items, total, facets = repo.search_titles(
             q=q, filters={}, sort="popularity", order="desc", page=page, page_size=page_size
         )
     except Exception as e:
-        logger.exception("search failed: %s", e)
+        log.exception("search failed: %s", e)
         raise HTTPException(status_code=500, detail="Search failed")
 
     payload = PaginatedTitles(
@@ -445,7 +442,7 @@ def search(
         total=int(total or 0),
         facets=facets or {},
     ).dict()
-    headers = _pagination_header_values(request, page=page, page_size=page_size, total=payload["total"])
+    headers = _pagination_headers(request, page=page, page_size=page_size, total=payload["total"])
     return cache_json_response(request, cache_ttl, payload, extra_headers=headers)
 
 
@@ -458,20 +455,14 @@ def list_genres(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    List known genres for discovery facets.
-
-    Notes
-    -----
-    - Falls back to a static list if the repository does not provide genres.
-    """
+    """Return known genres (falls back to a static list if repo unavailable)."""
     repo = get_titles_repository()
     try:
         if repo and hasattr(repo, "list_genres"):
             genres = repo.list_genres()
             return [str(g) for g in genres]
     except Exception as e:
-        logger.exception("list genres failed: %s", e)
+        log.exception("list genres failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to fetch genres")
     return [
         "Action",
@@ -498,9 +489,7 @@ def list_credits(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    List public credits for a title.
-    """
+    """Return public credits for a title (cast/crew with role/kind)."""
     tid = sanitize_title_id(title_id)
     repo = get_titles_repository()
     try:
@@ -508,7 +497,7 @@ def list_credits(
             credits = repo.get_credits(tid)
             return [Credit(**c) if not isinstance(c, Credit) else c for c in credits]
     except Exception as e:
-        logger.exception("list credits failed: %s", e)
+        log.exception("list credits failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to fetch credits")
     return []
 
@@ -524,9 +513,7 @@ def similar_titles(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    Recommend related titles (simple similarity or repo-provided).
-    """
+    """Recommend related titles (repo-provided or simple similarity)."""
     tid = sanitize_title_id(title_id)
     repo = get_titles_repository()
     try:
@@ -534,13 +521,13 @@ def similar_titles(
             items = repo.get_similar(tid)
             return [TitleSummary(**i) if not isinstance(i, TitleSummary) else i for i in items]
     except Exception as e:
-        logger.exception("get similar failed: %s", e)
+        log.exception("get similar failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to fetch similar titles")
     return []
 
 
 # ╭───────────────────────────────────────────────────────────────────────────╮
-# │ Signed URL endpoints (no-store, private semantics)                         │
+# │ 🔐 Signed URL endpoints (no-store, private semantics)                      │
 # ╰───────────────────────────────────────────────────────────────────────────╯
 
 @router.get(
@@ -556,32 +543,39 @@ def get_stream_url(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    Return a signed stream URL for the requested quality.
+    """Return a **signed** stream URL (HLS/DASH origin), `no-store`.
 
     Security
     --------
-    - HMAC-signed URL; set `STREAM_URL_SIGNING_SECRET`.
-    - Response is `Cache-Control: no-store` to prevent intermediaries caching.
+    - HMAC-signed URL; requires `STREAM_URL_SIGNING_SECRET`.
+    - Response is `Cache-Control: no-store` to prevent caching.
+
+    Steps
+    -----
+    1) Sanitize title id; obtain origin resource path from repository.
+    2) Validate requested quality against allowed set.
+    3) Generate signed URL with expiry.
+    4) Return JSON with `no-store` headers.
     """
     tid = sanitize_title_id(title_id)
     repo = get_titles_repository()
+
     resource_path = f"stream/{tid}"
     try:
         if repo and hasattr(repo, "get_stream_resource_path"):
             resource_path = str(repo.get_stream_resource_path(tid))
     except Exception as e:
-        logger.warning("get_stream_resource_path failed, using default: %s", e)
-    # Restrict to fixed cost-friendly variants
+        log.warning("get_stream_resource_path failed, using default: %s", e)
+
     if quality not in {QualityEnum.q480p, QualityEnum.q720p, QualityEnum.q1080p}:
         raise HTTPException(status_code=400, detail="Unsupported quality; allowed: 480p, 720p, 1080p")
+
     payload = generate_signed_url(
         resource_path=resource_path,
         quality=quality,
         expires_in=expires_in,
         purpose="stream",
     ).dict()
-    # Ensure signed URLs are not cached anywhere
     return json_no_store(payload)
 
 
@@ -598,24 +592,26 @@ def get_download_url(
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
-    """
-    Return a signed download URL for the requested quality.
+    """Return a **signed** download URL for offline usage, `no-store`.
 
     Security
     --------
-    - HMAC-signed URL; set `STREAM_URL_SIGNING_SECRET`.
-    - Response is `Cache-Control: no-store` to prevent intermediaries caching.
+    - HMAC-signed URL; requires `STREAM_URL_SIGNING_SECRET`.
+    - Response is `Cache-Control: no-store`.
     """
     tid = sanitize_title_id(title_id)
     repo = get_titles_repository()
+
     resource_path = f"download/{tid}"
     try:
         if repo and hasattr(repo, "get_download_resource_path"):
             resource_path = str(repo.get_download_resource_path(tid))
     except Exception as e:
-        logger.warning("get_download_resource_path failed, using default: %s", e)
+        log.warning("get_download_resource_path failed, using default: %s", e)
+
     if quality not in {QualityEnum.q480p, QualityEnum.q720p, QualityEnum.q1080p}:
         raise HTTPException(status_code=400, detail="Unsupported quality; allowed: 480p, 720p, 1080p")
+
     payload = generate_signed_url(
         resource_path=resource_path,
         quality=quality,
