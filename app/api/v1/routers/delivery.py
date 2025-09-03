@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 """
 MoviesNow • Delivery (Presigned GET)
@@ -23,7 +22,7 @@ from typing import Optional, Dict, List
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 import logging
-
+import os
 from app.api.http_utils import enforce_public_api_key, rate_limit, json_no_store, sanitize_filename
 from app.core.redis_client import redis_wrapper
 from app.security_headers import set_sensitive_cache

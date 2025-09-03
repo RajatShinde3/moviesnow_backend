@@ -1,4 +1,4 @@
-# app/security.py
+# app/utils/security.py
 from __future__ import annotations
 """
 MoviesNow — security utils (production-grade)
@@ -19,8 +19,8 @@ Design
 Notes
 -----
 - JWT verification lives in your auth modules.
-- `set_security_headers`, `set_sensitive_cache`, `set_static_cache`,
-  `install_security`, and `configure_cors` are re-exported when available.
+- `set_sensitive_cache`, `install_security`, and `configure_cors` are
+  imported from `app.security_headers` when available.
 """
 import base64
 import hashlib
@@ -41,27 +41,27 @@ logger = logging.getLogger("moviesnow.security")
 # ─────────────────────────────────────────────────────────────
 # 🔌 Prefer your project header/CORS helpers (nonce-aware)
 # ─────────────────────────────────────────────────────────────
-# These symbols are optional re-exports. If your app.security_headers exists,
-# we surface them; otherwise the module keeps working without them.
+# Import core header/cors helpers (available in this project)
 try:  # pragma: no cover
     from app.security_headers import (  # type: ignore
-        set_security_headers as _project_set_headers,
-        set_sensitive_cache as set_sensitive_cache,
-        set_static_cache as set_static_cache,
-        install_security as install_security,
-        configure_cors as configure_cors,
+        set_sensitive_cache,
+        install_security,
+        configure_cors,
     )
-
-    def set_security_headers(response: Response, request: Optional[Request] = None) -> None:
-        """Idempotent. Uses MoviesNow CSP nonce from request.state.csp_nonce."""
-        _project_set_headers(response, request)  # type: ignore[misc]
-
 except Exception:  # pragma: no cover
-    # Fallback: minimal header setter (nonce-agnostic). You rarely hit this path.
-    def set_security_headers(response: Response, request: Optional[Request] = None) -> None:
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    # Provide no-op shims if the module is absent (unlikely in this codebase)
+    def set_sensitive_cache(*_args, **_kwargs):
+        return None
+    def install_security(*_args, **_kwargs):
+        return None
+    def configure_cors(*_args, **_kwargs):
+        return None
+
+# Minimal per-route header helper (kept for compatibility; not used by this repo)
+def set_security_headers(response: Response, request: Optional[Request] = None) -> None:
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
 
 
 # ─────────────────────────────────────────────────────────────

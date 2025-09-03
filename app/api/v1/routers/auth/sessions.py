@@ -1,5 +1,4 @@
 # app/api/v1/auth/sessions.py
-from __future__ import annotations
 
 """
 MoviesNow — Session Inventory & Revocation Router (prod-ready)

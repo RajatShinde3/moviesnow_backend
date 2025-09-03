@@ -100,7 +100,7 @@ class MediaAsset(Base):
     # downloads. Nullable to allow image-only assets.
     video_codec = Column(SAEnum(VideoCodec, name="video_codec"), nullable=True, index=True)
     audio_codec = Column(SAEnum(AudioCodec, name="audio_codec"), nullable=True, index=True)
-    container = Column(SAEnum(AssetContainer, name="asset_container"), nullable=True, index=True)
+    container = Column(SAEnum(AssetContainer, name="asset_container"), nullable=True)
     hdr = Column(SAEnum(HDRFormat, name="hdr_format"), nullable=True, index=True)
     stereoscopic = Column(SAEnum(StereoscopicMode, name="stereoscopic_mode"), nullable=True)
     channels = Column(String(8), nullable=True, doc="Audio layout label (e.g., '2.0', '5.1', '7.1').")

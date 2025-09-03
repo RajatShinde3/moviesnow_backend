@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ MoviesNow · User API (Profile, Sessions, Watchlist, Favorites, Ratings,  ║

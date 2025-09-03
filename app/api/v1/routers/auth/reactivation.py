@@ -1,5 +1,4 @@
 # app/api/v1/routers/auth/reactivation.py
-from __future__ import annotations
 
 """
 Account Reactivation API — hardened, production-grade

@@ -19,9 +19,6 @@ Security & Ops Practices
 - SlowAPI rate limits per endpoint and best-effort audit logs
 """
 
-from __future__ import annotations
-
-# ── [Imports] ─────────────────────────────────────────────────────────────────────────────
 from typing import Optional, List, Dict
 from uuid import UUID
 from datetime import datetime, timezone

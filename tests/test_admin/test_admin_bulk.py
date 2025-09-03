@@ -1,5 +1,4 @@
 # tests/test_admin/test_admin_bulk.py
-from __future__ import annotations
 
 import uuid
 import pytest

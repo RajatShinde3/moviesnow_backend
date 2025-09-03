@@ -74,7 +74,7 @@ from app.core.limiter import rate_limit
 from app.db.session import get_async_db
 from app.core.security import verify_password, generate_totp  # MFA helper
 from app.core.jwt import get_bearer_token, decode_token
-from app.security import set_sensitive_cache
+from app.utils.security import set_sensitive_cache
 from app.db.models.user import User
 from app.schemas.auth import (
     ReauthMFARequest,

@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ MoviesNow · Player Telemetry                                             ║
@@ -132,7 +131,7 @@ def _validate_session_id() -> Path:
     Constrain path param for session ids (defensive).
     Adjust regex/lengths to match your generator.
     """
-    return Path(..., regex=r"^[A-Za-z0-9_\-]{8,72}$", description="Playback session id")
+    return Path(..., pattern=r"^[A-Za-z0-9_\-]{8,72}$", description="Playback session id")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

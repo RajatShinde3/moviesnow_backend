@@ -1807,7 +1807,11 @@ async def delivery_download_token(
     return {"token": token, "expires_at": data["expires_at"]}
 
 
-@router.get("/delivery/download/{token}", summary="Redeem one-time download token")
+@router.get(
+    "/delivery/download/{token}",
+    summary="Redeem one-time download token",
+    response_model=None,
+)
 @rate_limit("60/minute")
 async def delivery_download_redeem(
     token: str,

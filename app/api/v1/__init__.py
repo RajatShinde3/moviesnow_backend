@@ -1,11 +1,14 @@
 """Versioned API (v1) aggregator.
 
-Expose an aggregated FastAPI router via the symbol `routers` so that
-`from app.api.v1 import routers as api_v1_router` returns an APIRouter
-ready to be included under the configured API prefix.
+Expose an aggregated FastAPI router via `app.api.v1.routers.router`.
+Prefer importing directly from the routers subpackage to avoid name
+shadowing with the package name:
+
+    from app.api.v1.routers import router as api_v1_router
 """
 
-from .routers import router as routers
+# Note: avoid `routers = ...` here to prevent shadowing the `routers` package
+# which breaks dotted-path resolution used by tests (monkeypatch, etc.).
 
-__all__ = ["routers"]
+__all__ = []
 

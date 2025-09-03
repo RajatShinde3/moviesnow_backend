@@ -202,15 +202,15 @@ def create_app() -> FastAPI:
 
     # ── Routers (versioned API) ─────────────────────────────────────────────
     try:
-        # Expect your aggregate v1 router to exist; skip gracefully if not yet added.
-        from app.api.v1 import routers as api_v1_router  # type: ignore
+        # Include the aggregated v1 router from the routers subpackage.
+        from app.api.v1.routers import router as api_v1_router  # type: ignore
         app.include_router(
             api_v1_router,
             prefix=getattr(settings, "API_V1_STR", "/api/v1"),
             tags=["v1"],
         )
     except Exception:
-        logger.warning("No v1 router found at app.api.v1; continuing without API routes")
+        logger.warning("No v1 router found at app.api.v1.routers; continuing without API routes")
 
     # Non-versioned security & discovery endpoints (well-known, oauth2, idempotency)
     try:

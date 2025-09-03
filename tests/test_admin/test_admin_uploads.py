@@ -1,5 +1,4 @@
 # tests/test_admin/test_admin_uploads.py
-from __future__ import annotations
 
 import base64
 import pytest

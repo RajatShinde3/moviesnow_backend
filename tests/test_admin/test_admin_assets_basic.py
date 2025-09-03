@@ -1,5 +1,4 @@
 # tests/test_admin/test_admin_assets_basic.py
-from __future__ import annotations
 
 import pytest
 from httpx import AsyncClient, ASGITransport

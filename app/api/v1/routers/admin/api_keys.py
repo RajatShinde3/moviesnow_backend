@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 """
 Admin: API Keys management (Redis-backed, no migrations).

@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 """
 Top-level security and discovery endpoints (non-versioned):

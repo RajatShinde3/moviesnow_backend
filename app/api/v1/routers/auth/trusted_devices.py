@@ -1,5 +1,4 @@
 # app/api/v1/auth/trusted_devices.py
-from __future__ import annotations
 
 """
 Enterprise-grade **Trusted Devices / Remembered MFA** Router

@@ -1,5 +1,4 @@
 # tests/test_admin/test_admin_auth.py
-from __future__ import annotations
 
 import os
 import pytest

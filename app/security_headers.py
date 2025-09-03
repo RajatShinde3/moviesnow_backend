@@ -12,7 +12,7 @@ Production-grade security headers and CORS utilities for FastAPI/Starlette.
 - **Per-request CSP nonce**: available as `request.state.csp_nonce`.
 - **CORS installer**: strict allow-list via env (safe localhost defaults in dev).
 - **Skip list**: configurable path prefixes (e.g., static/docs/health) to avoid CSP noise.
-- **Cache helpers**: `set_sensitive_cache()` and `set_static_cache()` for correct HTTP caching.
+- **Cache helpers**: `set_sensitive_cache()` for correct HTTP caching.
 - **Report-only CSP (optional)**: trial CSP without breaking traffic.
 
 ## Quick start
@@ -23,12 +23,12 @@ Production-grade security headers and CORS utilities for FastAPI/Starlette.
     configure_cors(app)     # CORS allow-list from env
 
 Inside a route (optional):
-    from app.security_headers import set_security_headers, set_sensitive_cache
+    from app.security_headers import set_sensitive_cache
 
     @router.post("/auth/login")
     async def login(request: Request, response: Response):
-        set_sensitive_cache(request)              # mark as sensitive; middleware applies headers
-        set_security_headers(response, request)   # idempotent per-route header set
+        # Mark as sensitive; middleware applies headers automatically
+        set_sensitive_cache(request)
 
 ## Env knobs
 - ENABLE_HTTPS_REDIRECT (default "true")
@@ -240,40 +240,7 @@ def _apply_sensitive_cache_to_raw(raw_headers: List[Tuple[bytes, bytes]], *, sec
 # 🔓 Public helpers (idempotent; safe to call in routes)
 # ─────────────────────────────────────────────────────────────
 
-def set_security_headers(
-    response: Response,
-    request: Optional[Request] = None,
-    cfg: SecurityHeadersConfig = _CFG,
-) -> None:
-    """Apply security headers to a Starlette/FastAPI `Response` (idempotent)."""
-    nonce: Optional[str] = None
-    if request is not None:
-        nonce = getattr(getattr(request, "state", object()), "csp_nonce", None)
-
-    def _set_if_absent(name: str, value: str) -> None:
-        if response.headers.get(name) is None:
-            response.headers[name] = value
-
-    # HSTS
-    hsts = f"max-age={cfg.hsts_max_age}"
-    if cfg.hsts_include_subdomains:
-        hsts += "; includeSubDomains"
-    if cfg.hsts_preload:
-        hsts += "; preload"
-
-    _set_if_absent("Strict-Transport-Security", hsts)
-    _set_if_absent("X-Content-Type-Options", "nosniff")
-    _set_if_absent("X-Frame-Options", "DENY")
-    _set_if_absent("Referrer-Policy", cfg.referrer_policy)
-    _set_if_absent("Permissions-Policy", cfg.permissions_policy)
-    _set_if_absent("Cross-Origin-Opener-Policy", cfg.coop)
-    _set_if_absent("Cross-Origin-Resource-Policy", cfg.corp)
-    _set_if_absent("Cross-Origin-Embedder-Policy", cfg.coep)
-    _set_if_absent("X-Permitted-Cross-Domain-Policies", "none")
-
-    csp = _build_csp(nonce=nonce, cfg=cfg)
-    header_name = "Content-Security-Policy-Report-Only" if cfg.csp_report_only else "Content-Security-Policy"
-    _set_if_absent(header_name, csp)
+# Note: per-route `set_security_headers` helper removed (unused).
 
 
 def set_sensitive_cache(target: Union[Response, Request], *, seconds: int = 0) -> None:
@@ -312,9 +279,7 @@ def set_sensitive_cache(target: Union[Response, Request], *, seconds: int = 0) -
     raise TypeError("set_sensitive_cache expects a Response or Request")
 
 
-def set_static_cache(response: Response, *, seconds: int = 31536000) -> None:
-    """Enable long-lived caching for immutable **static** assets."""
-    response.headers.setdefault("Cache-Control", f"public, max-age={seconds}, immutable")
+# Note: `set_static_cache` removed (unused); rely on CDN/static server for caching.
 
 
 # ─────────────────────────────────────────────────────────────
@@ -382,7 +347,5 @@ __all__ = [
     "SecurityHeadersMiddleware",
     "install_security",
     "configure_cors",
-    "set_security_headers",
     "set_sensitive_cache",
-    "set_static_cache",
 ]
