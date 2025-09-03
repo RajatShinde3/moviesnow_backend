@@ -104,8 +104,8 @@ def _cached_json(
     summary="List downloadable assets for a title (restricted; use bundles)",
 )
 async def list_downloads(
+    request: Request,
     title_id: UUID = Path(..., description="Title ID (UUID)"),
-    request: Request | None = None,
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ) -> JSONResponse:
@@ -148,7 +148,7 @@ async def list_downloads(
 async def list_episode_downloads(
     title_id: UUID,
     episode_id: UUID,
-    request: Request | None = None,
+    request: Request,
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ) -> JSONResponse:

@@ -24,7 +24,11 @@ from app.api.v1.routers.auth import (
     email_verification, password_reset, mfa, mfa_reset,
     account_deletion, reactivation, reauth, recovery_codes,
     trusted_devices, sessions, activity, credentials,
-    
+)
+
+from app.api.v1.routers.admin.assets import (
+    artwork, bulk, cdn_delivery, meta, video,
+    streams, subtitles, trailers, uploads, validation,
 )
 
 @pytest.fixture()
@@ -61,6 +65,16 @@ async def app(db_session: AsyncSession) -> FastAPI:
     app.include_router(activity.router, prefix="/api/v1/auth")
     app.include_router(credentials.router, prefix="/api/v1/auth")
 
+    app.include_router(artwork.router, prefix="/api/v1/admin")
+    app.include_router(bulk.router, prefix="/api/v1/admin")
+    app.include_router(cdn_delivery.router, prefix="/api/v1/admin")
+    app.include_router(meta.router, prefix="/api/v1/admin")
+    app.include_router(streams.router, prefix="/api/v1/admin")
+    app.include_router(subtitles.router, prefix="/api/v1/admin")
+    app.include_router(trailers.router, prefix="/api/v1/admin")
+    app.include_router(uploads.router, prefix="/api/v1/admin")
+    app.include_router(validation.router, prefix="/api/v1/admin")
+    app.include_router(video.router, prefix="/api/v1/admin")
 
     # 🔁 Override DB dependency with isolated test session
     app.dependency_overrides[get_async_db] = get_override_get_db(db_session)
