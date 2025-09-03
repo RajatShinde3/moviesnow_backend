@@ -284,6 +284,10 @@ async def admin_rebuild_bundle(
     current_user: User = Depends(lambda: None),
 ) -> dict:
     await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+    # Respect settings: allow disabling server-side rebuilds (minimal-cost mode)
+    from app.core.config import settings
+    if not bool(getattr(settings, "BUNDLE_ENABLE_REBUILD", False)):
+        raise HTTPException(status_code=405, detail="Rebuild is disabled. Build and upload ZIP locally via admin API.")
     # Ensure title exists
     t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
     if not t:

@@ -181,6 +181,11 @@ class Settings(BaseSettings):
     # ── Observability ─────────────────────────────────────────
     SENTRY_DSN: Optional[AnyHttpUrl] = None
 
+    # Downloads/Bundle controls
+    BUNDLE_ENABLE_REBUILD: bool = False  # default minimal-cost mode: no server-side rebuilds
+    BUNDLE_REBUILD_COOLDOWN_SECONDS: int = 3600
+    BATCH_DOWNLOAD_MAX_ITEMS: int = 50
+
     # ── Validators / normalizers ──────────────────────────────
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod

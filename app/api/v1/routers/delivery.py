@@ -162,6 +162,9 @@ async def delivery_bundle_url(
         # Not found or not accessible
         if not payload.rebuild_if_missing:
             raise HTTPException(status_code=404, detail="Bundle not found or expired")
+        # Rebuild requested but may be disabled by settings
+        if not bool(getattr(settings, "BUNDLE_ENABLE_REBUILD", False)):
+            raise HTTPException(status_code=404, detail="Bundle not available; server-side rebuilds are disabled. Upload the ZIP via admin API.")
 
     # Rebuild requested: need title/season
     if not payload.title_id or not payload.season_number:
@@ -243,7 +246,9 @@ async def delivery_request_bundle(
         url = s3.presigned_get(storage_key, expires_in=payload.ttl_seconds)
         return json_no_store({"status": "READY", "storage_key": storage_key, "url": url}, response=response)
     except Exception:
-        pass
+        # Missing; if rebuilds are disabled, return 404 instructing upload
+        if not bool(getattr(settings, "BUNDLE_ENABLE_REBUILD", False)):
+            raise HTTPException(status_code=404, detail="Bundle not available; server-side rebuilds are disabled. Upload the ZIP via admin API.")
 
     # Schedule rebuild via existing mechanism
     body = BundleUrlIn(storage_key=storage_key, ttl_seconds=payload.ttl_seconds, token=None, attachment_filename=None, rebuild_if_missing=True, title_id=payload.title_id, season_number=payload.season_number)

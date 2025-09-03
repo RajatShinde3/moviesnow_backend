@@ -338,6 +338,72 @@ Why this is “best of best”
 - Flexibility: Compatibility MP4 only when needed; extras on demand
 - Low cost: Remux only; lifecycle expiry; no large, always‑on bundles
 
+---
+
+## C. Preferred Minimal‑Cost Mode (Local‑Built Downloads, Server‑Only 3‑Tier HLS)
+
+If you want to avoid any server‑side rebuild jobs entirely, use this mode. You build ZIPs and master files locally, upload them via presigned PUT, and expose only the three streamable HLS tiers for playback.
+
+Configuration
+- Set `BUNDLE_ENABLE_REBUILD = false` (default in code) to disable server rebuild paths.
+- Keep `BUNDLE_REBUILD_COOLDOWN_SECONDS` and related status endpoints around for future use; they are ignored when rebuilds are disabled.
+
+### C.1 Series (Local Season ZIP only)
+
+Goal
+- Users download a single Season ZIP that you build locally; no per‑episode downloads and no server rebuilds.
+
+Admin Steps
+1) Produce three HLS tiers for streaming (480p/720p/1080p) for each episode
+   - Upload to `hls/{title_id}/{episode_id}/...`
+   - Create StreamVariant rows: set `is_streamable=true`, `stream_tier=P480|P720|P1080`, `protocol=HLS` (exactly one per tier)
+2) Build the Season ZIP locally (video‑only by default)
+   - Option A (no changes): package your per‑episode original/download video files
+   - Option B (Matroska with embedded audio/subs/chapters):
+     - For each episode, re‑mux with FFmpeg (no re‑encode) into MKV with multiple audio tracks and optional embedded subtitles + chapters
+     - Place as `S{season}/E{episode}/video.mkv` inside the ZIP
+   - Optional: generate a `bundle_manifest.json` listing items and their hashes inside the ZIP
+3) Upload the Season ZIP via admin bundles API
+   - POST `/api/v1/admin/titles/{title_id}/bundles` → `{upload_url, storage_key, bundle_id}`
+   - Upload your ZIP to `upload_url`
+   - (Optional) PATCH the bundle label/expiry if needed
+4) Do not enable server rebuild
+   - Simply don’t call `/delivery/request-bundle`; instead, clients use `/delivery/bundle-url` directly (presigns the key you uploaded)
+
+User Steps
+1) Discover season on the title page
+2) Click “Download Season ZIP”
+   - Client calls: POST `/api/v1/delivery/bundle-url` with `{storage_key: "bundles/{title}/S{season}.zip"}` → returns presigned GET URL
+3) If users want posters/other extras, provide a separate Extras ZIP (built locally) or let them fetch extras via a batch presign call
+
+Extras ZIP (optional, local)
+- Build `S{season}_extras.zip` containing `poster.jpg`, stills, and selected subtitles (e.g., `S{season}/E{episode}/subs/en.vtt`)
+- Upload to `downloads/{title_id}/extras/S{season}_extras.zip` (use a normal asset upload route)
+- Client obtains presigned GET via POST `/api/v1/delivery/download-url` for that storage key
+
+### C.2 Movies (Local Master + Optional Extras)
+
+Admin Steps
+1) Produce three HLS tiers for streaming (480/720/1080) and register them (same as series)
+2) Build the Full‑quality Master locally
+   - Input: your best original
+   - FFmpeg re‑mux (no re‑encode) to MKV with multiple audio tracks; optional embedded text subtitles (SRT/ASS) and chapters (intro/credits)
+   - Upload to `downloads/{title_id}/master/movie_master.mkv` as a MediaAsset (kind=DOWNLOAD or ORIGINAL)
+   - (Optional) Also upload a compatibility MP4 (H.264 + one audio; external VTTs)
+3) (Optional) Build a Movie Extras ZIP
+   - Include poster and external subtitle files (e.g., `subs/en.vtt`)
+   - Upload to `downloads/{title_id}/extras/movie_extras.zip`
+
+User Steps
+1) Choose “Full‑quality Master (multi‑audio)” → client presigns `/delivery/download-url` for the master MKV
+2) (Optional) “Compatibility MP4 (H.264)” → presign MP4
+3) (Optional) “Subtitles & Extras” → presign extras ZIP via `/delivery/download-url` or fetch items via `/delivery/batch-download-urls`
+
+Why this mode is cost‑optimal
+- No server compute for rebuilds; all heavy work happens once on your workstation/CI
+- Bundles (season ZIPs) and masters are uploaded and then simply presigned for download
+- Streaming uses only three HLS tiers to keep storage + CDN behavior predictable
+
 ## Endpoint Index (by area)
 
 Admin – Assets & Validation
