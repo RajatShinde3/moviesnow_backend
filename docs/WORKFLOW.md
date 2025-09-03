@@ -124,6 +124,96 @@ When a user requests a bundle URL and it is missing/expired:
 
 This keeps storage cheap (no long‑term ZIP retention) and shifts cost to on‑demand compute and transient CDN traffic.
 
+## Movie Pack (Multi‑Audio + Subtitles + Phases) — Recommended Design
+
+Goal: For single‑movie downloads, offer a “Full‑quality Master” that embeds multiple audio tracks and (optionally) subtitles and chapters (intro/credits). Keep a lightweight compatibility option and an Extras ZIP for posters or other assets.
+
+Best‑practice defaults
+- Master file: MKV (no re‑encode). Contains:
+  - Video stream copied from the best original
+  - Multiple audio tracks (EN/HI/MR/FR etc.) with language/default/forced flags
+  - Optional embedded text subtitles (SRT/ASS) when supported; otherwise keep external VTT/SRT
+  - Chapters (phases) for “Intro”, “Credits”, etc. using Matroska chapters
+- Compatibility MP4 (optional): H.264 + one primary audio, external VTT. Generated on demand if needed.
+- Extras ZIP (optional): Poster(s), logos, stills, external subtitles, and a small JSON manifest.
+
+Suggested API (optional to implement)
+- POST `/api/v1/delivery/movie-pack`
+  - Body (example):
+    ```json
+    {
+      "title_id": "...",
+      "audio_languages": ["en","hi","mr","fr"],
+      "subtitle_languages": ["en"],
+      "embed_subtitles": true,
+      "compat": false,
+      "ttl_seconds": 600
+    }
+    ```
+  - Behavior: If a suitable master already exists, presign it. Otherwise, queue an async re‑mux (FFmpeg, `-c copy` video) and return 202 with a job/status. Upload output under `downloads/{title_id}/master/movie_master.mkv` and expire via lifecycle.
+- GET `/api/v1/delivery/movie-pack-status?job_id=...` (or key off `title_id`)
+  - Returns `{status: QUEUED|IN_PROGRESS|READY|ERROR, storage_key?, url?}`.
+
+FFmpeg (re‑mux example)
+- Multi‑audio MKV:
+  ```bash
+  ffmpeg -i input_best.mkv \
+    -map 0:v:0 -map 0:a:m:language:eng -map 0:a:m:language:hin \
+    -map 0:a:m:language:mar -map 0:a:m:language:fra \
+    -c copy -disposition:a:0 default out_master_multi.mkv
+  ```
+- Compatibility MP4 (primary EN audio):
+  ```bash
+  ffmpeg -i input_best.mkv -map 0:v:0 -map 0:a:m:language:eng \
+    -c:v copy -c:a aac -movflags +faststart out_compat.mp4
+  ```
+- Chapters (phases):
+  - Provide a `chapters.txt` in ffmetadata or mkvmerge XML, or supply `-chapters` from a generated file to mark “Intro”/“Credits”. Keep the same data in a sidecar JSON for players.
+
+Extras ZIP (optional)
+- POST `/api/v1/delivery/movie-extras`
+  - Body: `{ "title_id": "...", "subtitle_languages": ["en","es"], "include_poster": true, "ttl_seconds": 600 }`
+  - Output structure:
+    ```
+    poster.jpg
+    subs/en.vtt
+    subs/es.srt
+    extras_manifest.json
+    ```
+- Status endpoint mirrors movie‑pack semantics.
+
+Cost controls
+- Re‑mux only (no transcode) keeps compute low; output files expire automatically (7–30 days lifecycle).
+- Redis cooldown prevents repeated builds within a window.
+
+## Season ZIP + Extras ZIP (Series) — Recommended Design
+
+Default (fast & cheap)
+- Season ZIP: video‑only (one file per episode). Already supported via `/delivery/request-bundle` with on‑demand rebuild and `/delivery/bundle-status`.
+- Extras via separate ZIP (optional): subtitles, poster, and stills.
+
+Optional flags (when requested)
+- Extend bundle request to accept:
+  - `include_subtitles: true` and `subtitle_languages: ["en","hi"]`
+  - (Keep `include_artwork: false` by default; artwork inflates size)
+- Inside ZIP (example):
+  ```
+  S01/E01/video.mkv
+  S01/E01/subs/en.vtt
+  S01/E02/video.mkv
+  ...
+  S01/poster.jpg (if included)
+  bundle_manifest.json
+  ```
+
+Season Extras ZIP (separate)
+- POST `/api/v1/delivery/season-extras` with `{title_id, season_number, subtitle_languages?, include_poster?}` to build an extras‑only archive.
+- Use the same status/presign pattern as bundles.
+
+Why this split works
+- Great UX: Users get fast video ZIP by default; power users fetch extras in one go (extras ZIP) without bloating the main bundle.
+- Low cost: Only build larger packs on demand; lifecycle and cooldown bound the spend.
+
 ## Endpoint Index (by area)
 
 Admin – Assets & Validation
