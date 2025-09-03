@@ -33,61 +33,84 @@ Security: Bucket is private; CloudFront uses OAC; clients receive short‑lived 
 
 ## Typical Admin Workflow (Ingestion → Validation → Publish)
 
-1) Upload assets (originals/downloads/artwork/subtitles)
-   - Most admin endpoints return a presigned PUT for clients to upload directly to S3.
-   - Example (bundles):
-     - POST `/api/v1/admin/titles/{title_id}/bundles` → returns `{upload_url, storage_key, bundle_id}`
-     - Upload the ZIP via the URL; or skip this if you rely on on‑demand rebuilds.
+Step‑by‑step (simple and practical)
 
-2) Finalize/verify metadata
-   - HEAD store size/type: GET `/api/v1/admin/assets/{asset_id}/head`
-   - Store checksum: POST `/api/v1/admin/assets/{asset_id}/checksum` (server computes if small; else provide sha256)
-   - Finalize in one shot (optional): POST `/api/v1/admin/assets/{asset_id}/finalize` with `{size_bytes, content_type, sha256}`
+1) Create the catalog item (Title/Season/Episode)
+   - Use the existing admin Titles/Series routers to create a Title (and Season/Episodes when it’s a series).
+   - You will reference `title_id` (and optionally `episode_id`) in all asset calls.
 
-3) Validate media policy (pre‑publish checks)
+2) Upload media
+   - Artwork: POST `/api/v1/admin/titles/{title_id}/artwork` → presigned PUT → upload (poster/backdrop etc.)
+   - Video originals/downloads: POST `/api/v1/admin/titles/{title_id}/video` → presigned PUT → upload
+   - Subtitles: POST `/api/v1/admin/titles/{title_id}/subtitles` → presigned PUT → upload, track row created
+   - Streams (if managed manually): POST `/api/v1/admin/titles/{title_id}/streams` – configure exactly 3 streamable variants (P480/P720/P1080), HLS only
+   - Tip: Each “create” returns `{upload_url, storage_key, id}`; upload directly to S3 with that URL (multipart supported elsewhere when needed).
+
+3) Finalize/verify asset metadata (fast)
+   - HEAD S3 and cache size/type: GET `/api/v1/admin/assets/{asset_id}/head`
+   - Store checksum: POST `/api/v1/admin/assets/{asset_id}/checksum` (server computes when ≤10MB or provide sha256)
+   - One‑shot finalize (optional): POST `/api/v1/admin/assets/{asset_id}/finalize` with `{size_bytes, content_type, sha256}`
+
+4) Validate streaming/download policy (pre‑publish)
    - GET `/api/v1/admin/titles/{title_id}/validate-media`
-   - Ensures: exactly one streamable HLS per tier (480/720/1080); no audio‑only marked streamable; download assets have size+sha; subtitle defaults are consistent.
+   - Confirms: exactly one HLS streamable per tier (480/720/1080); not audio‑only; downloads have `size_bytes`+`sha256`; subtitle defaults don’t conflict.
+   - Fix any reported issues by editing the specific assets/variants.
 
-4) Manage bundles (optional)
-   - Admin list: GET `/api/v1/admin/titles/{title_id}/bundles`
-   - Detail: GET `/api/v1/admin/bundles/{bundle_id}`
-   - Patch metadata: PATCH `/api/v1/admin/bundles/{bundle_id}` (label/expiry)
-   - Delete: DELETE `/api/v1/admin/bundles/{bundle_id}` (best‑effort S3 delete)
-   - Force rebuild now: POST `/api/v1/admin/titles/{title_id}/rebuild-bundle?season_number=N` (202 Accepted, background job)
+5) (Optional) Season bundles
+   - Short‑lived ZIPs can be uploaded:
+     - POST `/api/v1/admin/titles/{title_id}/bundles` → `{upload_url, storage_key, bundle_id}` → upload ZIP via `upload_url`
+   - Or build on demand (preferred, cheaper): use the public “request bundle” flow below.
+   - Manage:
+     - GET `/api/v1/admin/titles/{title_id}/bundles` (list)
+     - GET `/api/v1/admin/bundles/{bundle_id}` (detail)
+     - PATCH `/api/v1/admin/bundles/{bundle_id}` (label/expiry)
+     - DELETE `/api/v1/admin/bundles/{bundle_id}`
+     - Force rebuild: POST `/api/v1/admin/titles/{title_id}/rebuild-bundle?season_number=N` (async)
 
-5) Optional: One‑time download tokens for premium
+6) (Optional) Premium download tokens
    - Batch create: POST `/api/v1/admin/delivery/download-tokens/batch`
-   - Users redeem via public routes (see “Public Download Flow”).
+   - Distribute tokens to users; they redeem to get a signed URL.
 
-Security (admin): All admin routes require MFA and are rate‑limited. Mutations use Redis locks and Idempotency‑Key snapshots; audit logs record actions.
+Security (admin):
+- MFA enforced; rate‑limited endpoints
+- Idempotency via `Idempotency-Key` on create‑style calls
+- Redis locks serialize destructive or rebuild operations
+- Audit logs record actions (best‑effort)
 
 ## Public Discovery & Download Flow
 
-1) Browse catalog
-   - GET `/api/v1/titles` (search, browse) – cacheable
-   - GET `/api/v1/titles/{title_id}` – cacheable
-   - GET `/api/v1/titles/{title_id}/streams` – public stream variants (ABR info)
-   - GET `/api/v1/titles/{title_id}/subtitles` – available subtitle tracks
+Step‑by‑step (what users do)
 
-2) Download per title/episode (all uploaded qualities/codecs)
-   - Title‑level list: GET `/api/v1/titles/{title_id}/downloads`
-   - Episode‑level list: GET `/api/v1/titles/{title_id}/episodes/{episode_id}/downloads`
-   - Presign a single file: POST `/api/v1/delivery/download-url` with `{storage_key, ttl_seconds, attachment_filename?}`
-   - Presign many: POST `/api/v1/delivery/batch-download-urls` with `{items:[{storage_key,...}], ttl_seconds}`
+1) Discover titles (CDN‑cacheable)
+   - GET `/api/v1/titles` – search/browse
+   - GET `/api/v1/titles/{title_id}` – title detail
+   - GET `/api/v1/titles/{title_id}/streams` – available HLS tiers (480/720/1080)
+   - GET `/api/v1/titles/{title_id}/subtitles` – subtitle tracks
 
-3) Season ZIP bundles (short‑lived; rebuild on demand)
-   - Public list: GET `/api/v1/titles/{title_id}/bundles` – shows active (unexpired) bundles
-   - Manifest only: GET `/api/v1/titles/{title_id}/bundles/{season}/manifest` → presigned GET to JSON manifest
-   - Fetch bundle URL (direct): POST `/api/v1/delivery/bundle-url`
-     - If bundle missing/expired and `rebuild_if_missing=true`, returns 202 and starts rebuild; client retries or polls status
-   - Request bundle (friendly alias): POST `/api/v1/delivery/request-bundle` with `{title_id, season_number}`
-   - Poll status: GET `/api/v1/delivery/bundle-status?title_id=...&season_number=...&presign=true`
+2) Download single files (originals/downloads)
+   - Find options:
+     - GET `/api/v1/titles/{title_id}/downloads` – per‑title & per‑episode lists
+     - GET `/api/v1/titles/{title_id}/episodes/{episode_id}/downloads` – per episode
+   - Get a presigned URL:
+     - POST `/api/v1/delivery/download-url` with `{storage_key, ttl_seconds, attachment_filename?}`
+   - For many at once: POST `/api/v1/delivery/batch-download-urls` with `{items:[{storage_key, attachment_filename?}], ttl_seconds}`
 
-4) Optional one‑time token gate
-   - Admin creates token(s)
-   - User redeems: GET `/api/v1/admin/delivery/download/{token}` (existing public redeem route lives in the codebase; use the public delivery routes above when possible)
+3) Get a Season ZIP (short‑lived and on‑demand)
+   - See available bundles: GET `/api/v1/titles/{title_id}/bundles`
+   - Request by known key: POST `/api/v1/delivery/bundle-url`
+     - If expired/missing and `rebuild_if_missing=true`, API returns 202 (REBUILDING). Retry after ~15s or poll status.
+   - Request by title/season (no key needed): POST `/api/v1/delivery/request-bundle` with `{title_id, season_number}`
+   - Poll until ready (and optionally presign immediately):
+     - GET `/api/v1/delivery/bundle-status?title_id=...&season_number=...&presign=true`
+   - Manifest presigned URL: GET `/api/v1/titles/{title_id}/bundles/{season}/manifest`
 
-Security (public): Reasonable per‑IP token bucket rate limits; optional X‑API‑Key enforcement; response bodies that contain presigned URLs are sent with `Cache-Control: no-store`.
+4) Optional token‑gated downloads
+   - Admin shares a token; user redeems to get a presigned GET URL.
+   - Token is single‑use; redemption is serialized by Redis lock.
+
+Security (public):
+- Per‑IP rate limiting; optional `X-API-Key`
+- All responses with presigned URLs return `Cache-Control: no-store`
 
 ## On‑Demand Bundle Rebuild (How it Works)
 
@@ -163,4 +186,3 @@ Public – Delivery (Presigned GET)
 - Use the validation endpoint during ingest to catch stream/subtitle issues early.
 - Use batch endpoints for efficient presigning when clients fetch multiple files.
 - Monitor Redis and RDS; keep CloudFront/OAC lockstep with bucket policy.
-
