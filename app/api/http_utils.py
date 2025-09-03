@@ -420,3 +420,19 @@ def resolve_get_current_user():
 
 # Export a resolved dependency for convenience in routers
 get_current_user = resolve_get_current_user()
+# Filename sanitization (safe for Content-Disposition)
+def sanitize_filename(name: Optional[str], fallback: str = "download.bin") -> str:
+    """Return a safe filename limited to [A-Za-z0-9._-] and underscores for spaces.
+
+    - Strips leading/trailing whitespace
+    - Replaces whitespace with single underscore
+    - Removes any characters outside A-Za-z0-9._-
+    - Falls back to provided name if empty
+    """
+    s = (name or "").strip()
+    if not s:
+        return fallback
+    import re as _re
+    s = _re.sub(r"\s+", "_", s)
+    s = _re.sub(r"[^A-Za-z0-9._-]", "", s)
+    return s or fallback

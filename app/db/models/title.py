@@ -293,6 +293,16 @@ class Title(Base):
         foreign_keys="[Subtitle.title_id]",
     )
 
+    bundles = relationship(
+        "Bundle",
+        back_populates="title",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        passive_deletes=True,
+        primaryjoin="Bundle.title_id == Title.id",
+        foreign_keys="[Bundle.title_id]",
+    )
+
     watchlisted_by = relationship(
         "WatchlistItem",
         back_populates="title",

@@ -71,6 +71,7 @@ from uuid import UUID, uuid4
 from datetime import datetime, timezone, timedelta
 import base64
 import re
+import hashlib
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
 from fastapi.responses import RedirectResponse
@@ -2171,3 +2172,262 @@ async def delete_video_asset(
     await log_audit_event(db, user=current_user, action="VIDEO_DELETE", status="SUCCESS", request=request,
                           meta_data={"asset_id": str(asset_id), "storage_key": key})
     return {"message": "Deleted"}
+
+
+# ============================================================
+# Assets: HEAD metadata and checksum
+# ============================================================
+
+class ChecksumIn(BaseModel):
+    sha256: Optional[str] = Field(None, description="Client-provided SHA-256 hex (optional if server computes)")
+    force: bool = Field(False, description="If true, overwrite existing checksum")
+
+
+@router.get("/assets/{asset_id}/head", summary="Fetch S3 HEAD metadata and cache in DB")
+@rate_limit("60/minute")
+async def assets_head(
+    asset_id: UUID,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+    m = (await db.execute(select(MediaAsset).where(MediaAsset.id == asset_id))).scalar_one_or_none()
+    if not m:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if not m.storage_key:
+        raise HTTPException(status_code=400, detail="Asset missing storage_key")
+
+    s3 = _ensure_s3()
+    try:
+        head = s3.client.head_object(Bucket=s3.bucket, Key=m.storage_key)  # type: ignore[attr-defined]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"HEAD failed: {e}")
+
+    size = int(head.get("ContentLength", 0))
+    ctype = head.get("ContentType")
+    etag = (head.get("ETag") or "").strip('"')
+
+    # Update DB cache
+    await db.execute(
+        update(MediaAsset)
+        .where(MediaAsset.id == asset_id)
+        .values(bytes_size=size or None, mime_type=ctype or None)
+    )
+    await db.commit()
+
+    return {"size_bytes": size, "content_type": ctype, "etag": etag, "storage_key": m.storage_key}
+
+
+@router.post("/assets/{asset_id}/checksum", summary="Store/verify asset SHA-256")
+@rate_limit("30/minute")
+async def assets_checksum(
+    asset_id: UUID,
+    payload: ChecksumIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+    m = (await db.execute(select(MediaAsset).where(MediaAsset.id == asset_id))).scalar_one_or_none()
+    if not m:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if not m.storage_key:
+        raise HTTPException(status_code=400, detail="Asset missing storage_key")
+
+    sha = (payload.sha256 or "").strip().lower()
+    if not sha:
+        # Best-effort server-side compute if reasonably small
+        max_bytes = 10 * 1024 * 1024  # 10MB
+        size = int(getattr(m, "bytes_size", 0) or 0)
+        if size <= 0:
+            # Try head to discover size
+            try:
+                s3 = _ensure_s3()
+                head = s3.client.head_object(Bucket=s3.bucket, Key=m.storage_key)  # type: ignore[attr-defined]
+                size = int(head.get("ContentLength", 0))
+            except Exception:
+                size = 0
+        if size and size <= max_bytes:
+            try:
+                s3 = _ensure_s3()
+                obj = s3.client.get_object(Bucket=s3.bucket, Key=m.storage_key)  # type: ignore[attr-defined]
+                data = obj["Body"].read()
+                sha = hashlib.sha256(data).hexdigest()
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Checksum compute failed: {e}")
+        else:
+            raise HTTPException(status_code=400, detail="Provide sha256 for large assets (>10MB)")
+
+    # Store if empty or force
+    if m.checksum_sha256 and not payload.force:
+        return {"sha256": m.checksum_sha256, "status": "UNCHANGED"}
+
+    await db.execute(
+        update(MediaAsset)
+        .where(MediaAsset.id == asset_id)
+        .values(checksum_sha256=sha)
+    )
+    await db.commit()
+    return {"sha256": sha, "status": "UPDATED"}
+
+
+class FinalizeAssetIn(BaseModel):
+    size_bytes: Optional[int] = None
+    content_type: Optional[str] = None
+    sha256: Optional[str] = None
+    force: bool = False
+
+
+@router.post("/assets/{asset_id}/finalize", summary="Finalize asset metadata after upload")
+@rate_limit("30/minute")
+async def assets_finalize(
+    asset_id: UUID,
+    payload: FinalizeAssetIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+    m = (await db.execute(select(MediaAsset).where(MediaAsset.id == asset_id))).scalar_one_or_none()
+    if not m:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    updates = {}
+    if payload.size_bytes is not None:
+        if payload.size_bytes < 0:
+            raise HTTPException(status_code=400, detail="size_bytes must be >= 0")
+        updates["bytes_size"] = int(payload.size_bytes)
+    if payload.content_type is not None:
+        updates["mime_type"] = payload.content_type
+    if payload.sha256:
+        if m.checksum_sha256 and not payload.force:
+            # Do not overwrite unless forced
+            pass
+        else:
+            updates["checksum_sha256"] = payload.sha256.strip().lower()
+    if updates:
+        await db.execute(update(MediaAsset).where(MediaAsset.id == asset_id).values(**updates))
+        await db.commit()
+    return {"id": str(asset_id), **updates}
+
+
+@router.get("/titles/{title_id}/validate-media", summary="Validate media policy for a title")
+@rate_limit("30/minute")
+async def validate_media_policy(
+    title_id: UUID,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    """Run non-destructive checks against streaming and download policy.
+
+    Checks
+    - Exactly 3 streamable HLS tiers (480/720/1080) with one per tier.
+    - No audio-only rows marked as streamable.
+    - Download assets have `size_bytes` and `checksum_sha256`.
+    - Subtitle defaults do not conflict per language per scope.
+    """
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+    from app.db.models.stream_variant import StreamVariant
+    from app.schemas.enums import StreamProtocol, StreamTier
+    issues: list[dict] = []
+
+    # Stream variants
+    rows = (await db.execute(select(StreamVariant).where(StreamVariant.media_asset.has(MediaAsset.title_id == title_id)))).scalars().all()
+    # Filter streamable
+    streamable = [r for r in rows if getattr(r, "is_streamable", False)]
+    tiers = {}
+    # Count by (asset, tier) to ensure one per asset/tier
+    per_asset_tier: dict[tuple[str, str], int] = {}
+    for r in streamable:
+        t = getattr(r, "stream_tier", None)
+        if t is None:
+            issues.append({"severity": "error", "code": "STREAMABLE_NO_TIER", "id": str(r.id)})
+            continue
+        t_key = str(t.value if hasattr(t, 'value') else t)
+        tiers.setdefault(t_key, []).append(r.id)
+        key = (str(getattr(r, 'media_asset_id', '')), t_key)
+        per_asset_tier[key] = per_asset_tier.get(key, 0) + 1
+        if getattr(r, "is_audio_only", False):
+            issues.append({"severity": "error", "code": "STREAMABLE_AUDIO_ONLY", "id": str(r.id)})
+        if getattr(r, "protocol", None) and getattr(r, "protocol") != StreamProtocol.HLS:
+            issues.append({"severity": "warning", "code": "STREAMABLE_NOT_HLS", "id": str(r.id)})
+    # Expect exactly one per tier across P480/P720/P1080
+    for required in ("P480", "P720", "P1080"):
+        if required not in tiers:
+            issues.append({"severity": "error", "code": "MISSING_TIER", "tier": required})
+        elif len(tiers[required]) != 1:
+            issues.append({"severity": "error", "code": "MULTI_TIER", "tier": required, "count": len(tiers[required])})
+
+    # Per-asset per-tier uniqueness
+    for (asset_id, tier), count in per_asset_tier.items():
+        if count > 1:
+            issues.append({"severity": "error", "code": "DUP_STREAMABLE_PER_ASSET_TIER", "asset_id": asset_id, "tier": tier, "count": count})
+
+    # Download assets completeness
+    d_assets = (await db.execute(select(MediaAsset).where(MediaAsset.title_id == title_id, MediaAsset.kind.in_([MediaAssetKind.DOWNLOAD, MediaAssetKind.ORIGINAL, MediaAssetKind.VIDEO])))).scalars().all()
+    for a in d_assets:
+        if a.bytes_size is None:
+            issues.append({"severity": "warning", "code": "DOWNLOAD_SIZE_MISSING", "asset_id": str(a.id)})
+        if (a.checksum_sha256 or "").strip() == "":
+            issues.append({"severity": "warning", "code": "DOWNLOAD_SHA_MISSING", "asset_id": str(a.id)})
+
+    # Subtitle defaults per language
+    subs = (await db.execute(select(Subtitle).where(Subtitle.title_id == title_id, Subtitle.active == True))).scalars().all()
+    from collections import defaultdict
+    def_by_lang: dict[str, int] = defaultdict(int)
+    forced_by_lang: dict[str, int] = defaultdict(int)
+    for s in subs:
+        if s.is_default:
+            def_by_lang[s.language] += 1
+        if s.is_forced:
+            forced_by_lang[s.language] += 1
+    for lang, c in def_by_lang.items():
+        if c > 1:
+            issues.append({"severity": "error", "code": "SUBTITLE_MULTI_DEFAULT", "language": lang, "count": c})
+    for lang, c in forced_by_lang.items():
+        if c > 1:
+            issues.append({"severity": "error", "code": "SUBTITLE_MULTI_FORCED", "language": lang, "count": c})
+
+    return {"issues": issues}
+
+
+class BatchTokenItem(BaseModel):
+    storage_key: str
+    ttl_seconds: int = Field(3600, ge=60, le=24*3600)
+
+
+class BatchTokensIn(BaseModel):
+    items: list[BatchTokenItem]
+
+
+@router.post("/delivery/download-tokens/batch", summary="Create multiple one-time download tokens")
+@rate_limit("20/minute")
+async def batch_download_tokens(
+    payload: BatchTokensIn,
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, object]:
+    await _ensure_admin(current_user); await _ensure_mfa(request)
+    max_items = 100
+    if not payload.items or len(payload.items) == 0:
+        raise HTTPException(status_code=400, detail="No items provided")
+    if len(payload.items) > max_items:
+        raise HTTPException(status_code=400, detail=f"Too many items (max {max_items})")
+    results: list[dict] = []
+    for it in payload.items:
+        token = uuid4().hex
+        key = f"download:token:{token}"
+        exp_at = datetime.now(timezone.utc) + timedelta(seconds=it.ttl_seconds)
+        data = {"storage_key": it.storage_key, "one_time": True, "issued_by": str(getattr(current_user, "id", "")), "expires_at": exp_at.isoformat()}
+        try:
+            await redis_wrapper.json_set(key, data, ttl_seconds=it.ttl_seconds)
+            results.append({"token": token, "expires_at": data["expires_at"], "storage_key": it.storage_key})
+        except Exception as e:
+            results.append({"error": str(e), "storage_key": it.storage_key})
+    return {"results": results}

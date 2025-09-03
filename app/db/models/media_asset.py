@@ -50,7 +50,8 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.base_class import Base
-from app.schemas.enums import MediaAssetKind
+from app.schemas.enums import MediaAssetKind, VideoCodec, AudioCodec, HDRFormat
+from app.schemas.media import AssetContainer, StereoscopicMode, LifecycleClass
 
 
 # ──────────────────────────────────────────────────────────────
@@ -94,6 +95,18 @@ class MediaAsset(Base):
     )
     language = Column(String(16), nullable=True, index=True, doc="BCP-47 language tag (e.g., 'en', 'en-US').")
 
+    # === Technical classification (optional) ====================================
+    # Store core codec/container/HDR hints at the asset level for originals and
+    # downloads. Nullable to allow image-only assets.
+    video_codec = Column(SAEnum(VideoCodec, name="video_codec"), nullable=True, index=True)
+    audio_codec = Column(SAEnum(AudioCodec, name="audio_codec"), nullable=True, index=True)
+    container = Column(SAEnum(AssetContainer, name="asset_container"), nullable=True, index=True)
+    hdr = Column(SAEnum(HDRFormat, name="hdr_format"), nullable=True, index=True)
+    stereoscopic = Column(SAEnum(StereoscopicMode, name="stereoscopic_mode"), nullable=True)
+    channels = Column(String(8), nullable=True, doc="Audio layout label (e.g., '2.0', '5.1', '7.1').")
+    bitrate_bps = Column(Integer, nullable=True, doc="Approx overall bitrate for file-based assets.")
+    label = Column(String(128), nullable=True, doc="Human label (e.g., 'Master 1080p', 'Original MKV').")
+
     # ── Storage / Identity ───────────────────────────────────
     storage_key = Column(String(1024), nullable=False, index=True, doc="Opaque storage key (e.g., S3 object key).")
     cdn_url = Column(String(2048), nullable=True, doc="Public CDN URL, if published.")
@@ -116,6 +129,12 @@ class MediaAsset(Base):
         doc="Marks the featured asset for its (scope, kind, language).",
     )
     sort_order = Column(Integer, nullable=False, server_default=text("0"), index=True)
+    lifecycle_class = Column(
+        SAEnum(LifecycleClass, name="lifecycle_class"),
+        nullable=False,
+        server_default=text("'HOT'"),
+        doc="Storage lifecycle hint: HOT/WARM/ARCHIVE",
+    )
 
     # ── Ownership / Audit ────────────────────────────────────
     uploaded_by_id = Column(
@@ -156,6 +175,7 @@ class MediaAsset(Base):
 
         # Numeric/file sanity
         CheckConstraint("(bytes_size IS NULL) OR (bytes_size >= 0)", name="ck_media_assets_size_nonneg"),
+        CheckConstraint("(bitrate_bps IS NULL) OR (bitrate_bps >= 0)", name="ck_media_assets_bitrate_nonneg"),
         CheckConstraint(
             "(width IS NULL OR width > 0) AND (height IS NULL OR height > 0)",
             name="ck_media_assets_dims_positive",
@@ -169,6 +189,7 @@ class MediaAsset(Base):
             "(language IS NULL) OR (length(btrim(language)) > 0)",
             name="ck_media_assets_language_not_blank",
         ),
+        CheckConstraint("(label IS NULL) OR (length(btrim(label)) > 0)", name="ck_media_assets_label_not_blank"),
 
         # Deterministic featured asset per (scope, kind, language)
         Index(
@@ -187,6 +208,8 @@ class MediaAsset(Base):
         Index("ix_media_assets_scope_kind", "title_id", "season_id", "episode_id", "kind"),
         Index("ix_media_assets_scope_sort", "title_id", "season_id", "episode_id", "sort_order"),
         Index("ix_media_assets_kind_lang", "kind", "language"),
+        Index("ix_media_assets_codecs", "video_codec", "audio_codec"),
+        Index("ix_media_assets_container", "container"),
         Index("ix_media_assets_created_at", "created_at"),
         Index("ix_media_assets_tags_gin", "tags", postgresql_using="gin"),
         Index("ix_media_assets_metadata_gin", "metadata", postgresql_using="gin"),

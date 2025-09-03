@@ -33,6 +33,7 @@ from app.db.models.title_genres import TitleGenre  # M2M association
 from app.db.models.media_asset import MediaAsset
 from app.db.models.stream_variant import StreamVariant
 from app.db.models.artwork import Artwork
+from app.db.models.bundle import Bundle
 
 from app.db.models.person import Person
 from app.db.models.credit import Credit
@@ -76,6 +77,7 @@ __all__ = [
     "MediaAsset",
     "StreamVariant",
     "Artwork",
+    "Bundle",
     "Person",
     "Credit",
     # Rights/Compliance/Localization
