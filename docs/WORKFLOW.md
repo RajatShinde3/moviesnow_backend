@@ -214,6 +214,130 @@ Why this split works
 - Great UX: Users get fast video ZIP by default; power users fetch extras in one go (extras ZIP) without bloating the main bundle.
 - Low cost: Only build larger packs on demand; lifecycle and cooldown bound the spend.
 
+---
+
+# Detailed, Step‑By‑Step Workflows (Series & Movies)
+
+This section ties everything together end‑to‑end so product, engineering, and ops can follow the same playbook.
+
+## A. Series Downloads
+
+Two options, both cheap and user‑friendly:
+1) Per‑episode downloads (fine‑grained)
+2) Season ZIP (video‑only by default) with optional Extras ZIP
+
+### A.1 Per‑Episode Downloads (simple)
+
+Prereqs
+- Each episode has one or more ORIGINAL/DOWNLOAD/VIDEO assets (stored under `originals/` or `downloads/`).
+
+Flow
+1) Client lists available options
+   - GET `/api/v1/titles/{title_id}/downloads`
+     - Returns title‑scope assets (movie/season banners) and per‑episode lists
+   - Or for one episode:
+     - GET `/api/v1/titles/{title_id}/episodes/{episode_id}/downloads`
+2) Client presigns chosen files
+   - Single: POST `/api/v1/delivery/download-url` with `{storage_key, ttl_seconds, attachment_filename?}`
+   - Batch: POST `/api/v1/delivery/batch-download-urls` with `{items:[{storage_key, attachment_filename?}], ttl_seconds}`
+
+Notes
+- Fastest/cheapest path for users who want selected episodes or specific encodes/codecs.
+- Use batch for “download manager” experiences.
+
+### A.2 Season ZIP (Video‑Only by Default)
+
+Goal
+- Provide a convenience ZIP that packs the per‑episode video files for a season. ZIPs are short‑lived and rebuilt on demand to minimize storage cost.
+
+Default behavior
+- Video‑only bundle: episodes’ best video assets in a single ZIP.
+- Extras (subtitles, poster) are fetched separately (batch presign) or via an optional Extras ZIP.
+
+Flow (end‑user)
+1) Client asks for bundle (friendly):
+   - POST `/api/v1/delivery/request-bundle` with `{title_id, season_number, ttl_seconds}`
+   - Server HEADs the `bundles/{title_id}/S{season:02}.zip`
+     - If exists → returns `{status: READY, url}` (presigned GET)
+     - If missing → schedules rebuild and returns HTTP 202 `{status: REBUILDING, retry_after_seconds}`
+2) Client polls status or retries request after `retry_after_seconds`:
+   - GET `/api/v1/delivery/bundle-status?title_id=...&season_number=...&presign=true`
+   - Returns `{status: READY, url}` when ZIP is uploaded
+
+Flow (server rebuild job)
+1) Acquire Redis lock (`lock:bundle:rebuild:{title}:{season}`) and honor cooldown (default 3600s)
+2) Select episodes ordered by episode_number; choose one best asset per episode (prefer ORIGINAL > DOWNLOAD > VIDEO)
+3) Stream each S3 object to a temporary file; create ZIP incrementally (low memory)
+4) Upload ZIP with SSE‑S3 to `bundles/{title_id}/S{season:02}.zip`
+5) Write `S{season:02}_manifest.json` next to ZIP listing items (arcname + source_key)
+6) Update/Create `Bundle` row with `{storage_key, size_bytes, sha256, expires_at}`
+
+ZIP contents (example)
+```
+S01/E01/video.mkv
+S01/E02/video.mp4
+...
+```
+
+Manifest contents (example)
+```json
+{
+  "title_id": "...",
+  "season_number": 1,
+  "storage_key": "bundles/<title>/S01.zip",
+  "size_bytes": 123456789,
+  "sha256": "...",
+  "items": [
+    {"arcname": "S01/E01/video.mkv", "source_key": "downloads/<title>/.../E01.mkv"},
+    {"arcname": "S01/E02/video.mp4", "source_key": "downloads/<title>/.../E02.mp4"}
+  ],
+  "generated_at": "2025-01-01T12:34:56Z"
+}
+```
+
+Extras (two convenient ways)
+1) Batch presign (quick, no ZIP): POST `/api/v1/delivery/batch-download-urls` with subtitle/storage keys
+2) Extras ZIP (optional): POST `/api/v1/delivery/season-extras` with `{title_id, season_number, subtitle_languages?, include_poster?}` → 202 + status → presigned URL when ready
+
+Operational controls
+- Lifecycle expiry deletes old ZIPs automatically (7–30 days)
+- Cooldown (Redis) prevents rebuild stampedes (e.g., 3600s)
+- No KMS by default (SSE‑S3)
+
+## B. Movie Downloads
+
+Best default UX
+- Full‑quality Master (MKV): multi‑audio embedded, optional embedded subtitles, Matroska chapters for “Intro”/“Credits”
+- Compatibility MP4 (optional): H.264 + single audio track with external VTT
+- Extras via batch presign or optional Extras ZIP
+
+Flow (end‑user)
+1) Choose download type from title page
+   - “Full‑quality Master (multi‑audio)” → one MKV file
+   - “Compatibility MP4 (H.264)” → optional, for legacy devices
+   - “Subtitles & Extras” → batch presign or Extras ZIP
+2) Presign link(s)
+   - POST `/api/v1/delivery/download-url` (single) or `/api/v1/delivery/batch-download-urls` (many)
+
+Optional: On‑Demand Movie Pack (re‑mux only)
+1) POST `/api/v1/delivery/movie-pack` with `{title_id, audio_languages, subtitle_languages?, embed_subtitles?, ttl_seconds}`
+2) If a matching master exists → presign and return
+3) Otherwise, queue a re‑mux job (no re‑encode):
+   - Keep video stream as is (`-c:v copy`)
+   - Map selected audio tracks and set default/forced flags
+   - Embed compatible text tracks into MKV, or keep external subs for MP4
+   - Add chapters for intro/credits from sidecar metadata
+4) Return HTTP 202; client polls `/api/v1/delivery/movie-pack-status` and receives a presigned URL on READY
+5) Outputs expire automatically (lifecycle)
+
+Extras ZIP (movie)
+- POST `/api/v1/delivery/movie-extras` with `{title_id, subtitle_languages?, include_poster?, ttl_seconds}` → 202 + status → presign
+
+Why this is “best of best”
+- Single master MKV: one file that “just works” with all audios and optional embedded subs/chapters
+- Flexibility: Compatibility MP4 only when needed; extras on demand
+- Low cost: Remux only; lifecycle expiry; no large, always‑on bundles
+
 ## Endpoint Index (by area)
 
 Admin – Assets & Validation
