@@ -95,6 +95,11 @@ from app.schemas.enums import StreamProtocol, Container, StreamTier
 from app.schemas.enums import ArtworkKind, MediaAssetKind, SubtitleFormat
 from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import log_audit_event
+from app.dependencies.admin import (
+    is_admin as _is_admin,
+    ensure_admin as _ensure_admin,
+    ensure_mfa as _ensure_mfa,
+)
 from app.utils.aws import S3Client, S3StorageError
 import boto3
 
@@ -106,31 +111,7 @@ router = APIRouter(tags=["Admin Assets"])
 # 🔐 Access helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _is_admin(user: User) -> bool:
-    """Return True if user is ADMIN or SUPERUSER (portable across schemas)."""
-    try:
-        from app.schemas.enums import OrgRole
-        return getattr(user, "role", None) in {OrgRole.ADMIN, OrgRole.SUPERUSER}
-    except Exception:
-        return bool(getattr(user, "is_superuser", False))
-
-
-async def _ensure_admin(user: User) -> None:
-    if not _is_admin(user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
-
-
-async def _ensure_mfa(request: Request) -> None:
-    """Require a valid access token with `mfa_authenticated=True`."""
-    try:
-        token = (request.headers.get("Authorization", "") or "").split(" ")[-1]
-        claims = await decode_token(token, expected_types=["access"], verify_revocation=True)
-        if not bool(claims.get("mfa_authenticated")):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA required")
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
+ 
 
 
 # ─────────────────────────────────────────────────────────────────────────────

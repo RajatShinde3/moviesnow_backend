@@ -40,6 +40,7 @@ from app.db.models.user import User
 from app.db.session import get_async_db
 from app.schemas.audit import AuditLogOut
 from app.security_headers import set_sensitive_cache
+from app.dependencies.admin import is_admin as _adm_is_admin
 
 router = APIRouter(prefix="/audit-logs", tags=["Admin Audit Logs"])  # admin scope
 
@@ -53,11 +54,7 @@ def _is_admin(user: User) -> bool:
 
     Adjust to your schema (e.g., is_admin / is_superuser / roles).
     """
-    return bool(
-        getattr(user, "is_admin", False)
-        or getattr(user, "is_superuser", False)
-        or ("admin" in (getattr(user, "roles", []) or []))
-    )
+    return _adm_is_admin(user)
 
 
 def _parse_iso8601(ts: str) -> datetime:

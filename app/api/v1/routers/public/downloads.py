@@ -46,7 +46,7 @@ def _asset_public_dict(a: MediaAsset) -> Dict[str, Any]:
     }
 
 
-@router.get("/titles/{title_id}/downloads", summary="List downloadable assets for a title")
+@router.get("/titles/{title_id}/downloads", summary="List downloadable assets for a title (restricted)")
 async def list_downloads(
     title_id: UUID = Path(..., description="Title ID"),
     request: Request = None,
@@ -55,51 +55,19 @@ async def list_downloads(
     _key=Depends(enforce_public_api_key),
     db: AsyncSession = Depends(get_async_db),
 ) -> Dict[str, Any]:
-    # Title-scope assets without episode_id
-    title_assets = (await db.execute(
-        select(MediaAsset).where(
-            MediaAsset.title_id == title_id,
-            MediaAsset.episode_id.is_(None),
-            MediaAsset.kind.in_([MediaAssetKind.ORIGINAL, MediaAssetKind.DOWNLOAD, MediaAssetKind.VIDEO]),
-        ).order_by(MediaAsset.sort_order.asc(), MediaAsset.created_at.asc())
-    )).scalars().all()
+    """Restricted: Do not expose per-episode or raw download items publicly.
 
-    items_title: List[Dict[str, Any]] = [_asset_public_dict(a) for a in title_assets]
-
-    # Episode-scope assets
-    eps = (await db.execute(
-        select(Episode).where(Episode.title_id == title_id)
-    )).scalars().all()
-    episode_map = {e.id: e for e in eps}
-
-    ep_assets = (await db.execute(
-        select(MediaAsset).where(
-            MediaAsset.title_id == title_id,
-            MediaAsset.episode_id.is_not(None),
-            MediaAsset.kind.in_([MediaAssetKind.ORIGINAL, MediaAssetKind.DOWNLOAD, MediaAssetKind.VIDEO]),
-        ).order_by(MediaAsset.episode_id.asc(), MediaAsset.sort_order.asc(), MediaAsset.created_at.asc())
-    )).scalars().all()
-
-    episodes: Dict[str, Dict[str, Any]] = {}
-    for a in ep_assets:
-        eid = str(a.episode_id)
-        e = episode_map.get(a.episode_id)
-        bucket = episodes.setdefault(eid, {
-            "episode_id": eid,
-            "episode_number": getattr(e, 'episode_number', None) if e else None,
-            "items": [],
-        })
-        bucket["items"].append(_asset_public_dict(a))
-
-    # Light caching header (10 minutes)
+    Use bundle and extras ZIP flows via `/delivery/*` endpoints instead.
+    Returns empty lists by policy.
+    """
     if response is not None:
-        response.headers["Cache-Control"] = "public, max-age=600, s-maxage=600, stale-while-revalidate=60"
-    return {"title": items_title, "episodes": list(episodes.values())}
+        response.headers["Cache-Control"] = "public, max-age=60, s-maxage=60, stale-while-revalidate=30"
+    return {"title": [], "episodes": []}
 
 
 @router.get(
     "/titles/{title_id}/episodes/{episode_id}/downloads",
-    summary="List downloadable assets for a specific episode",
+    summary="List downloadable assets for a specific episode (restricted)",
 )
 async def list_episode_downloads(
     title_id: UUID,
@@ -110,14 +78,6 @@ async def list_episode_downloads(
     _key=Depends(enforce_public_api_key),
     db: AsyncSession = Depends(get_async_db),
 ) -> Dict[str, Any]:
-    arows = (await db.execute(
-        select(MediaAsset).where(
-            MediaAsset.title_id == title_id,
-            MediaAsset.episode_id == episode_id,
-            MediaAsset.kind.in_([MediaAssetKind.ORIGINAL, MediaAssetKind.DOWNLOAD, MediaAssetKind.VIDEO]),
-        ).order_by(MediaAsset.sort_order.asc(), MediaAsset.created_at.asc())
-    )).scalars().all()
-    items: List[Dict[str, Any]] = [_asset_public_dict(a) for a in arows]
     if response is not None:
-        response.headers["Cache-Control"] = "public, max-age=600, s-maxage=600, stale-while-revalidate=60"
-    return {"episode_id": str(episode_id), "items": items}
+        response.headers["Cache-Control"] = "public, max-age=60, s-maxage=60, stale-while-revalidate=30"
+    return {"episode_id": str(episode_id), "items": []}

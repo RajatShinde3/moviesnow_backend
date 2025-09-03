@@ -21,22 +21,16 @@ from app.db.models.user import User
 from app.db.models.genre import Genre
 from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import log_audit_event
+from app.dependencies.admin import (
+    is_admin as _is_admin,
+    ensure_admin as _ensure_admin,
+)
 
 
 router = APIRouter(tags=["Admin Genres"])
 
 
-def _is_admin(user: User) -> bool:
-    try:
-        from app.schemas.enums import OrgRole
-        return getattr(user, "role", None) in {OrgRole.ADMIN, OrgRole.SUPERUSER}
-    except Exception:
-        return bool(getattr(user, "is_superuser", False))
-
-
-async def _ensure_admin(user: User) -> None:
-    if not _is_admin(user):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
+ 
 
 
 @router.delete("/genres/{slug}", summary="Delete a genre by slug (safety checks)")
@@ -80,4 +74,3 @@ async def delete_genre_by_slug(
 
 
 __all__ = ["router"]
-

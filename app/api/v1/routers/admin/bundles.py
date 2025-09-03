@@ -20,7 +20,6 @@ Security
 """
 
 from datetime import datetime, timedelta, timezone
-import asyncio
 from typing import Optional, Dict
 from uuid import UUID, uuid4
 
@@ -54,6 +53,17 @@ class BundleCreateIn(BaseModel):
 class BundlePatchIn(BaseModel):
     label: Optional[str] = Field(None, max_length=128)
     expires_at: Optional[datetime] = None  # allow admin to extend expiry
+
+
+class SeasonExtrasCreateIn(BaseModel):
+    season_number: int = Field(..., ge=1)
+    label: Optional[str] = None
+    ttl_days: Optional[int] = Field(None, ge=1, le=60)
+
+
+class MovieExtrasCreateIn(BaseModel):
+    label: Optional[str] = None
+    ttl_days: Optional[int] = Field(None, ge=1, le=60)
 
 
 def _ensure_s3() -> S3Client:
@@ -184,6 +194,61 @@ async def delete_bundle(
     return {"status": "DELETED", "bundle_id": str(bundle_id)}
 
 
+@router.post("/titles/{title_id}/season-extras", summary="Presign upload for season extras ZIP (local-built)")
+@rate_limit("10/minute")
+async def create_season_extras_zip(
+    title_id: UUID,
+    payload: SeasonExtrasCreateIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(lambda: None),
+) -> Dict[str, str]:
+    """Return a presigned PUT for uploading a season extras ZIP you build locally.
+
+    Key layout: `downloads/{title_id}/extras/S{season}_extras.zip`
+    """
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+    # Validate title exists
+    t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Title not found")
+    key = f"downloads/{title_id}/extras/S{int(payload.season_number):02}_extras.zip"
+    try:
+        s3 = _ensure_s3()
+        url = s3.presigned_put(key, content_type="application/zip", public=False)
+        return {"upload_url": url, "storage_key": key}
+    except S3StorageError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.post("/titles/{title_id}/movie-extras", summary="Presign upload for movie extras ZIP (local-built)")
+@rate_limit("10/minute")
+async def create_movie_extras_zip(
+    title_id: UUID,
+    payload: MovieExtrasCreateIn,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(lambda: None),
+) -> Dict[str, str]:
+    """Return a presigned PUT for uploading a movie extras ZIP you build locally.
+
+    Key layout: `downloads/{title_id}/extras/movie_extras.zip`
+    """
+    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
+    t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Title not found")
+    key = f"downloads/{title_id}/extras/movie_extras.zip"
+    try:
+        s3 = _ensure_s3()
+        url = s3.presigned_put(key, content_type="application/zip", public=False)
+        return {"upload_url": url, "storage_key": key}
+    except S3StorageError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
 @router.get("/titles/{title_id}/bundles", summary="List bundles (admin view)")
 @rate_limit("60/minute")
 async def admin_list_bundles(
@@ -272,49 +337,8 @@ async def admin_patch_bundle(
     return await admin_get_bundle(bundle_id, request, db, current_user)
 
 
-@router.post("/titles/{title_id}/rebuild-bundle", summary="Rebuild bundle now (async)")
-@rate_limit("10/minute")
-async def admin_rebuild_bundle(
-    title_id: UUID,
-    season_number: int,
-    request: Request,
-    response: Response,
-    background: BackgroundTasks,
-    db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(lambda: None),
-) -> dict:
-    await _ensure_admin(current_user); await _ensure_mfa(request); set_sensitive_cache(response)
-    # Respect settings: allow disabling server-side rebuilds (minimal-cost mode)
-    from app.core.config import settings
-    if not bool(getattr(settings, "BUNDLE_ENABLE_REBUILD", False)):
-        raise HTTPException(status_code=405, detail="Rebuild is disabled. Build and upload ZIP locally via admin API.")
-    # Ensure title exists
-    t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
-    if not t:
-        raise HTTPException(status_code=404, detail="Title not found")
-    dest_key = f"bundles/{title_id}/S{int(season_number):02}.zip"
-
-    # Cooldown
-    cd_key = f"cooldown:bundle:rebuild:{title_id}:{season_number}"
-    cd_secs = int(getattr(settings, "BUNDLE_REBUILD_COOLDOWN_SECONDS", 3600))
-    try:
-        ttl = await redis_wrapper.client.ttl(cd_key)  # type: ignore
-    except Exception:
-        ttl = -2
-    if isinstance(ttl, int) and ttl > 0:
-        response.status_code = 202
-        return {"status": "COOLDOWN", "retry_after_seconds": ttl}
-
-    # Schedule via shared helper
-    from app.api.v1.routers.delivery import _rebuild_bundle_and_upload  # local import to avoid cycles
-
-    async def _run():
-        await _rebuild_bundle_and_upload(title_id=str(title_id), season_number=int(season_number), dest_key=dest_key)
-
-    try:
-        await redis_wrapper.client.setex(cd_key, cd_secs, "1")  # type: ignore
-    except Exception:
-        pass
-    background.add_task(asyncio.create_task, _run())
-    response.status_code = 202
-    return {"status": "REBUILDING", "storage_key": dest_key}
+"""
+Note: Server-side bundle rebuild endpoint removed to minimize cost.
+Admins should build season ZIPs locally and upload via the presigned PUT
+returned by POST /admin/titles/{title_id}/bundles.
+"""

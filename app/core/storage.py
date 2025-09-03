@@ -9,7 +9,8 @@ Documented S3 key layout (single private bucket, CloudFront OAC):
     s3://{bucket}/
       originals/{title_id}/[episode_id/]{filename.ext}
       downloads/{title_id}/[episode_id/]{quality or source}/{filename.ext}
-      hls/{title_id}/[episode_id/]{ladder}/{files...}
+      streams/{title_id}/{quality}.mp4
+      # legacy: hls/{title_id}/[episode_id/]{ladder}/{files...}
       bundles/{title_id}/S{season:02}.zip
       artwork/title/{title_id}/...
       subs/title/{title_id}/...
@@ -29,7 +30,8 @@ Lifecycle Guardrails
 # Prefix constants (string templates)
 S3_PREFIX_ORIGINALS = "originals/{title_id}/"
 S3_PREFIX_DOWNLOADS = "downloads/{title_id}/"
-S3_PREFIX_HLS = "hls/{title_id}/"
+S3_PREFIX_STREAMS = "streams/{title_id}/"
+S3_PREFIX_HLS = "hls/{title_id}/"  # legacy
 S3_PREFIX_BUNDLES = "bundles/{title_id}/"
 S3_PREFIX_ARTWORK_TITLE = "artwork/title/{title_id}/"
 S3_PREFIX_SUBS_TITLE = "subs/title/{title_id}/"

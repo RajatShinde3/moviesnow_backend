@@ -42,6 +42,11 @@ from app.db.models.token import RefreshToken
 from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import log_audit_event, AuditEvent
 from app.services.token_service import store_refresh_token, revoke_all_refresh_tokens
+from app.dependencies.admin import (
+    is_admin as _is_admin,
+    ensure_admin as _ensure_admin,
+    ensure_mfa as _ensure_mfa,
+)
 
 # Reuse session metadata helper from login service (keeps parity)
 from app.services.auth.login_service import _register_session_and_meta  # type: ignore
@@ -54,30 +59,7 @@ router = APIRouter(tags=["Admin Sessions"])
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧩 Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _is_admin(user: User) -> bool:
-    """True if user has ADMIN or SUPERUSER role (org-free RBAC)."""
-    try:
-        from app.schemas.enums import OrgRole
-        return getattr(user, "role", None) in {OrgRole.ADMIN, OrgRole.SUPERUSER}
-    except Exception:
-        return bool(getattr(user, "is_superuser", False))
-
-
-async def _ensure_admin(user: User) -> None:
-    if not _is_admin(user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
-
-
-async def _ensure_mfa(request: Request) -> None:
-    """Require `mfa_authenticated=True` on the current access token (admin-only ops)."""
-    try:
-        claims = await decode_token(get_bearer_token(request), expected_types=["access"], verify_revocation=True)
-        if not bool(claims.get("mfa_authenticated")):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA required")
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
+ 
 
 
 async def _redis_sismember(key: str, member: str) -> bool:

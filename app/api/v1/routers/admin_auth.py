@@ -68,6 +68,7 @@ from app.services.auth.login_service import (
     _register_session_and_meta,   # type: ignore
     _push_activity_event,         # type: ignore
 )
+from app.dependencies.admin import is_admin as _is_admin
 
 # ── [Router] ─────────────────────────────────────────────────────────────────────────────
 router = APIRouter(tags=["Admin Auth"])
@@ -81,9 +82,7 @@ def _norm_email(email: str) -> str:
     return (email or "").strip().lower()
 
 
-def _is_admin(user: User) -> bool:
-    """True if the user is ADMIN or SUPERUSER (org-free RBAC)."""
-    return getattr(user, "role", None) in {UserRole.ADMIN, UserRole.SUPERUSER}
+ 
 
 
 # ─────────────────────────────────────────────────────────────────────────────

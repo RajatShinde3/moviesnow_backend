@@ -25,9 +25,7 @@ Env vars (examples)
 New routers
 - Delivery: `app/api/v1/routers/delivery.py`
   - POST `/api/v1/delivery/download-url`
-  - POST `/api/v1/delivery/bundle-url` (optional one-time token)
-    - If ZIP missing and `rebuild_if_missing=true`, returns 202 and triggers a background rebuild from episode originals, then clients can retry after ~15s.
-  - GET `/api/v1/delivery/bundle-status` (poll rebuild; optional `presign=true`)
+  - POST `/api/v1/delivery/bundle-url` (optional one-time token) — no rebuild on miss
 - Public bundles: `app/api/v1/routers/public/bundles.py`
   - GET `/api/v1/titles/{title_id}/bundles`
 - Public downloads: `app/api/v1/routers/public/downloads.py`
@@ -38,7 +36,7 @@ New routers
   - GET `/api/v1/admin/titles/{title_id}/bundles`
   - GET `/api/v1/admin/bundles/{bundle_id}`
   - PATCH `/api/v1/admin/bundles/{bundle_id}` (label/expiry)
-  - POST `/api/v1/admin/titles/{title_id}/rebuild-bundle?season_number=N` (202 + cooldown)
+  
 - Admin assets tools in `admin_assets.py`
   - GET `/api/v1/admin/assets/{asset_id}/head`
   - POST `/api/v1/admin/assets/{asset_id}/checksum`
@@ -70,4 +68,4 @@ Notes
 - Bucket uses SSE-S3; no KMS on day-1. CloudFront is single distribution with OAC.
 - Bundles should expire automatically via lifecycle (7–30 days configurable).
 - Presigned GET defaults ~5–10 minutes; tune via request TTL.
-- Rebuild cooldown per (title, season): BUNDLE_REBUILD_COOLDOWN_SECONDS env (default 3600).
+ 

@@ -27,9 +27,9 @@ Security: Bucket is private; CloudFront uses OAC; clients receive short‑lived 
 
 ## Core Policies
 
-- Streaming: Exactly 3 tiers available for playback (HLS only): 480p, 720p, 1080p
-- Downloads: All uploaded originals/download assets remain available for download (no quality change). Optional MP4/H.264 variants for maximum compatibility.
-- Bundles: Season ZIPs are short‑lived; if expired/missing, server rebuilds on demand from originals.
+- Streaming: Exactly 3 variants (progressive files): 480p, 720p, 1080p
+- Downloads: Restricted to season bundles and extras ZIPs only (no per‑episode direct downloads).
+- Bundles: Season ZIPs are uploaded by you locally; server never rebuilds bundles.
 
 ## Typical Admin Workflow (Ingestion → Validation → Publish)
 
@@ -43,7 +43,7 @@ Step‑by‑step (simple and practical)
    - Artwork: POST `/api/v1/admin/titles/{title_id}/artwork` → presigned PUT → upload (poster/backdrop etc.)
    - Video originals/downloads: POST `/api/v1/admin/titles/{title_id}/video` → presigned PUT → upload
    - Subtitles: POST `/api/v1/admin/titles/{title_id}/subtitles` → presigned PUT → upload, track row created
-   - Streams (if managed manually): POST `/api/v1/admin/titles/{title_id}/streams` – configure exactly 3 streamable variants (P480/P720/P1080), HLS only
+   - Streams (if managed manually): POST `/api/v1/admin/titles/{title_id}/streams` – configure exactly 3 streamable variants (480p/720p/1080p), progressive MP4s
    - Tip: Each “create” returns `{upload_url, storage_key, id}`; upload directly to S3 with that URL (multipart supported elsewhere when needed).
 
 3) Finalize/verify asset metadata (fast)
@@ -53,7 +53,7 @@ Step‑by‑step (simple and practical)
 
 4) Validate streaming/download policy (pre‑publish)
    - GET `/api/v1/admin/titles/{title_id}/validate-media`
-   - Confirms: exactly one HLS streamable per tier (480/720/1080); not audio‑only; downloads have `size_bytes`+`sha256`; subtitle defaults don’t conflict.
+   - Confirms: exactly one streamable per tier (480p/720p/1080p); not audio‑only; downloads have `size_bytes`+`sha256`; subtitle defaults don’t conflict.
    - Fix any reported issues by editing the specific assets/variants.
 
 5) (Optional) Season bundles
@@ -65,7 +65,7 @@ Step‑by‑step (simple and practical)
      - GET `/api/v1/admin/bundles/{bundle_id}` (detail)
      - PATCH `/api/v1/admin/bundles/{bundle_id}` (label/expiry)
      - DELETE `/api/v1/admin/bundles/{bundle_id}`
-     - Force rebuild: POST `/api/v1/admin/titles/{title_id}/rebuild-bundle?season_number=N` (async)
+     
 
 6) (Optional) Premium download tokens
    - Batch create: POST `/api/v1/admin/delivery/download-tokens/batch`
@@ -84,7 +84,7 @@ Step‑by‑step (what users do)
 1) Discover titles (CDN‑cacheable)
    - GET `/api/v1/titles` – search/browse
    - GET `/api/v1/titles/{title_id}` – title detail
-   - GET `/api/v1/titles/{title_id}/streams` – available HLS tiers (480/720/1080)
+   - GET `/api/v1/titles/{title_id}/streams` – available stream variants (480p/720p/1080p)
    - GET `/api/v1/titles/{title_id}/subtitles` – subtitle tracks
 
 2) Download single files (originals/downloads)
@@ -99,9 +99,9 @@ Step‑by‑step (what users do)
    - See available bundles: GET `/api/v1/titles/{title_id}/bundles`
    - Request by known key: POST `/api/v1/delivery/bundle-url`
      - If expired/missing and `rebuild_if_missing=true`, API returns 202 (REBUILDING). Retry after ~15s or poll status.
-   - Request by title/season (no key needed): POST `/api/v1/delivery/request-bundle` with `{title_id, season_number}`
+   
    - Poll until ready (and optionally presign immediately):
-     - GET `/api/v1/delivery/bundle-status?title_id=...&season_number=...&presign=true`
+     
    - Manifest presigned URL: GET `/api/v1/titles/{title_id}/bundles/{season}/manifest`
 
 4) Optional token‑gated downloads
@@ -112,15 +112,18 @@ Security (public):
 - Per‑IP rate limiting; optional `X-API-Key`
 - All responses with presigned URLs return `Cache-Control: no-store`
 
-## On‑Demand Bundle Rebuild (How it Works)
+## On‑Demand Bundle Rebuild (Removed)
 
-When a user requests a bundle URL and it is missing/expired:
+Removed in minimal‑cost mode. Server never rebuilds bundles; this section is
+kept for historical reference only.
+
+When a user requests a bundle URL and it was missing/expired (legacy behavior):
 
 1) The API returns 202 and schedules a background job.
 2) The job acquires a Redis lock `lock:bundle:rebuild:{title_id}:{season}` and honors a cooldown (`BUNDLE_REBUILD_COOLDOWN_SECONDS`, default 3600s) to avoid stampedes.
 3) It gathers episodes in order; picks the best available asset per episode (prefer ORIGINAL > DOWNLOAD > VIDEO), streams each object to a temp file, and zips them.
 4) Uploads the ZIP with SSE‑S3; writes a manifest JSON next to it with item list and SHA‑256; updates/creates a `Bundle` row in Postgres.
-5) Clients poll `/delivery/bundle-status` and receive a READY status and/or a presigned GET.
+5) (Removed) Clients do not poll server rebuild status; build ZIPs locally.
 
 This keeps storage cheap (no long‑term ZIP retention) and shifts cost to on‑demand compute and transient CDN traffic.
 
@@ -189,7 +192,7 @@ Cost controls
 ## Season ZIP + Extras ZIP (Series) — Recommended Design
 
 Default (fast & cheap)
-- Season ZIP: video‑only (one file per episode). Already supported via `/delivery/request-bundle` with on‑demand rebuild and `/delivery/bundle-status`.
+- Season ZIP: video-only (one file per episode). Build locally; upload via admin presigned PUT.
 - Extras via separate ZIP (optional): subtitles, poster, and stills.
 
 Optional flags (when requested)
@@ -256,12 +259,12 @@ Default behavior
 
 Flow (end‑user)
 1) Client asks for bundle (friendly):
-   - POST `/api/v1/delivery/request-bundle` with `{title_id, season_number, ttl_seconds}`
+   
    - Server HEADs the `bundles/{title_id}/S{season:02}.zip`
      - If exists → returns `{status: READY, url}` (presigned GET)
      - If missing → schedules rebuild and returns HTTP 202 `{status: REBUILDING, retry_after_seconds}`
 2) Client polls status or retries request after `retry_after_seconds`:
-   - GET `/api/v1/delivery/bundle-status?title_id=...&season_number=...&presign=true`
+   
    - Returns `{status: READY, url}` when ZIP is uploaded
 
 Flow (server rebuild job)
@@ -340,9 +343,9 @@ Why this is “best of best”
 
 ---
 
-## C. Preferred Minimal‑Cost Mode (Local‑Built Downloads, Server‑Only 3‑Tier HLS)
+## C. Preferred Minimal‑Cost Mode (Local‑Built Downloads, 3 Progressive Variants)
 
-If you want to avoid any server‑side rebuild jobs entirely, use this mode. You build ZIPs and master files locally, upload them via presigned PUT, and expose only the three streamable HLS tiers for playback.
+If you want to avoid any server‑side rebuild jobs entirely, use this mode. You build ZIPs and master files locally, upload them via presigned PUT, and expose only three progressive MP4 variants for playback.
 
 Configuration
 - Set `BUNDLE_ENABLE_REBUILD = false` (default in code) to disable server rebuild paths.
@@ -354,21 +357,21 @@ Goal
 - Users download a single Season ZIP that you build locally; no per‑episode downloads and no server rebuilds.
 
 Admin Steps
-1) Produce three HLS tiers for streaming (480p/720p/1080p) for each episode
-   - Upload to `hls/{title_id}/{episode_id}/...`
-   - Create StreamVariant rows: set `is_streamable=true`, `stream_tier=P480|P720|P1080`, `protocol=HLS` (exactly one per tier)
+1) Produce three progressive variants for streaming (480p/720p/1080p) for each episode
+   - Upload one file per variant (e.g., `streams/{title_id}/480p.mp4`, etc.)
+   - Configure the repository or metadata to advertise exactly these three variants
 2) Build the Season ZIP locally (video‑only by default)
    - Option A (no changes): package your per‑episode original/download video files
    - Option B (Matroska with embedded audio/subs/chapters):
      - For each episode, re‑mux with FFmpeg (no re‑encode) into MKV with multiple audio tracks and optional embedded subtitles + chapters
      - Place as `S{season}/E{episode}/video.mkv` inside the ZIP
    - Optional: generate a `bundle_manifest.json` listing items and their hashes inside the ZIP
-3) Upload the Season ZIP via admin bundles API
+3) Upload the Season ZIP via admin bundles API (includes extras if you choose)
    - POST `/api/v1/admin/titles/{title_id}/bundles` → `{upload_url, storage_key, bundle_id}`
    - Upload your ZIP to `upload_url`
    - (Optional) PATCH the bundle label/expiry if needed
 4) Do not enable server rebuild
-   - Simply don’t call `/delivery/request-bundle`; instead, clients use `/delivery/bundle-url` directly (presigns the key you uploaded)
+   - Clients use `/delivery/bundle-url` directly (presigns the key you uploaded)
 
 User Steps
 1) Discover season on the title page
@@ -377,14 +380,14 @@ User Steps
 3) If users want posters/other extras, provide a separate Extras ZIP (built locally) or let them fetch extras via a batch presign call
 
 Extras ZIP (optional, local)
-- Build `S{season}_extras.zip` containing `poster.jpg`, stills, and selected subtitles (e.g., `S{season}/E{episode}/subs/en.vtt`)
-- Upload to `downloads/{title_id}/extras/S{season}_extras.zip` (use a normal asset upload route)
-- Client obtains presigned GET via POST `/api/v1/delivery/download-url` for that storage key
+- If you prefer to keep the main Season ZIP focused, build `S{season}_extras.zip` containing `poster.jpg`, stills, and selected subtitles (e.g., `S{season}/E{episode}/subs/en.vtt`)
+- Obtain a presigned PUT via: POST `/api/v1/admin/titles/{title_id}/season-extras`
+- Client obtains presigned GET via: POST `/api/v1/delivery/download-url` for that storage key
 
 ### C.2 Movies (Local Master + Optional Extras)
 
 Admin Steps
-1) Produce three HLS tiers for streaming (480/720/1080) and register them (same as series)
+1) Produce three progressive tiers for streaming (480p/720p/1080p) and register them (same as series)
 2) Build the Full‑quality Master locally
    - Input: your best original
    - FFmpeg re‑mux (no re‑encode) to MKV with multiple audio tracks; optional embedded text subtitles (SRT/ASS) and chapters (intro/credits)
@@ -392,6 +395,7 @@ Admin Steps
    - (Optional) Also upload a compatibility MP4 (H.264 + one audio; external VTTs)
 3) (Optional) Build a Movie Extras ZIP
    - Include poster and external subtitle files (e.g., `subs/en.vtt`)
+   - Obtain a presigned PUT via: POST `/api/v1/admin/titles/{title_id}/movie-extras`
    - Upload to `downloads/{title_id}/extras/movie_extras.zip`
 
 User Steps
@@ -402,7 +406,7 @@ User Steps
 Why this mode is cost‑optimal
 - No server compute for rebuilds; all heavy work happens once on your workstation/CI
 - Bundles (season ZIPs) and masters are uploaded and then simply presigned for download
-- Streaming uses only three HLS tiers to keep storage + CDN behavior predictable
+- Streaming uses only three progressive tiers to keep storage + CDN behavior predictable
 
 ## Endpoint Index (by area)
 
@@ -415,12 +419,12 @@ Admin – Assets & Validation
 
 Admin – Bundles
 
-- POST `/api/v1/admin/titles/{title_id}/bundles` – presigned PUT for ZIP (optional; on‑demand rebuild can replace this)
+- POST `/api/v1/admin/titles/{title_id}/bundles` — presigned PUT for ZIP
 - GET `/api/v1/admin/titles/{title_id}/bundles` – list bundles (optionally include expired)
 - GET `/api/v1/admin/bundles/{bundle_id}` – inspect a bundle
 - PATCH `/api/v1/admin/bundles/{bundle_id}` – update label/expiry
 - DELETE `/api/v1/admin/bundles/{bundle_id}` – delete DB row + best‑effort delete object
-- POST `/api/v1/admin/titles/{title_id}/rebuild-bundle?season_number=N` – force rebuild now (async)
+ 
 
 Admin – Tokens
 
@@ -430,7 +434,7 @@ Public – Discovery & Downloads
 
 - GET `/api/v1/titles` – browse/search
 - GET `/api/v1/titles/{title_id}` – title detail
-- GET `/api/v1/titles/{title_id}/streams` – stream variants (HLS only, 480/720/1080)
+- GET `/api/v1/titles/{title_id}/streams` – stream variants (480p/720p/1080p)
 - GET `/api/v1/titles/{title_id}/subtitles` – subtitle tracks
 - GET `/api/v1/titles/{title_id}/downloads` – title downloads (movies or per‑season base assets)
 - GET `/api/v1/titles/{title_id}/episodes/{episode_id}/downloads` – per‑episode downloads
@@ -439,11 +443,9 @@ Public – Discovery & Downloads
 
 Public – Delivery (Presigned GET)
 
-- POST `/api/v1/delivery/download-url` – presign single S3 object as attachment
-- POST `/api/v1/delivery/batch-download-urls` – presign multiple objects
-- POST `/api/v1/delivery/bundle-url` – presign bundle; optionally trigger rebuild on miss
-- POST `/api/v1/delivery/request-bundle` – request `{title_id, season_number}` without knowing the key
-- GET  `/api/v1/delivery/bundle-status` – poll status; optional `presign=true`
+- POST `/api/v1/delivery/download-url` – presign season bundle or extras ZIP (restricted prefixes)
+- POST `/api/v1/delivery/batch-download-urls` – presign multiple (same restrictions)
+- POST `/api/v1/delivery/bundle-url` – presign bundle (no rebuild on miss)
 
 ## Scripts (local toolchain)
 
@@ -461,8 +463,8 @@ Public – Delivery (Presigned GET)
 
 ## Operational Best Practices
 
-- Keep bundles short‑lived; rely on on‑demand rebuild to avoid paying for long‑term ZIP storage.
-- Upload originals once; generate compatibility downloads locally only when needed (no MediaConvert).
+- Build season bundles locally; upload via admin presigned PUT.
+- Upload exactly 3 streamable files per title (480p/720p/1080p); no server transcoding.
 - Use the validation endpoint during ingest to catch stream/subtitle issues early.
 - Use batch endpoints for efficient presigning when clients fetch multiple files.
 - Monitor Redis and RDS; keep CloudFront/OAC lockstep with bucket policy.

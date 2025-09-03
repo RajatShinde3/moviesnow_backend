@@ -45,6 +45,11 @@ from app.db.models.availability import Availability
 from app.schemas.enums import TitleType, TitleStatus, TerritoryMode, DistributionKind, DeviceClass
 from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import log_audit_event
+from app.dependencies.admin import (
+    is_admin as _is_admin,
+    ensure_admin as _ensure_admin,
+    ensure_mfa as _ensure_mfa,
+)
 
 
 router = APIRouter(tags=["Admin Titles"])
@@ -53,30 +58,7 @@ router = APIRouter(tags=["Admin Titles"])
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧩 Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _is_admin(user: User) -> bool:
-    try:
-        from app.schemas.enums import OrgRole
-        return getattr(user, "role", None) in {OrgRole.ADMIN, OrgRole.SUPERUSER}
-    except Exception:
-        return bool(getattr(user, "is_superuser", False))
-
-
-async def _ensure_admin(user: User) -> None:
-    if not _is_admin(user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
-
-
-async def _ensure_mfa(request: Request) -> None:
-    """Require `mfa_authenticated=True` on the access token (admin-only ops)."""
-    try:
-        token = request.headers.get("Authorization", "").split(" ")[-1]
-        claims = await decode_token(token, expected_types=["access"], verify_revocation=True)
-        if not bool(claims.get("mfa_authenticated")):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="MFA required")
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
+ 
 
 
 async def _slug_exists(db: AsyncSession, slug: str, *, exclude_id: Optional[UUID] = None) -> bool:

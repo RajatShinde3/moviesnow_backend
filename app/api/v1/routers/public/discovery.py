@@ -573,6 +573,9 @@ def get_stream_url(
             resource_path = str(repo.get_stream_resource_path(tid))
     except Exception as e:
         logger.warning("get_stream_resource_path failed, using default: %s", e)
+    # Restrict to fixed cost-friendly variants
+    if quality not in {QualityEnum.q480p, QualityEnum.q720p, QualityEnum.q1080p}:
+        raise HTTPException(status_code=400, detail="Unsupported quality; allowed: 480p, 720p, 1080p")
     payload = generate_signed_url(
         resource_path=resource_path,
         quality=quality,
@@ -612,6 +615,8 @@ def get_download_url(
             resource_path = str(repo.get_download_resource_path(tid))
     except Exception as e:
         logger.warning("get_download_resource_path failed, using default: %s", e)
+    if quality not in {QualityEnum.q480p, QualityEnum.q720p, QualityEnum.q1080p}:
+        raise HTTPException(status_code=400, detail="Unsupported quality; allowed: 480p, 720p, 1080p")
     payload = generate_signed_url(
         resource_path=resource_path,
         quality=quality,

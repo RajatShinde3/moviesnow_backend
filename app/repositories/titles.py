@@ -208,12 +208,15 @@ class MemoryTitleRepository(TitleRepositoryProtocol):
         return None
 
     def get_stream_variants(self, title_id: str) -> List[Dict[str, Any]]:
-        # default variants; override in custom repo
+        """Default stream variants: 3 progressive files (480p, 720p, 1080p).
+
+        Upload exactly one file per quality per title. No server-side
+        transcoding; files should contain built-in audio/subtitles/chapters.
+        """
         return [
-            {"quality": "auto", "container": "m3u8", "codec": "h264"},
             {"quality": "480p", "bitrate_kbps": 1500, "container": "mp4", "codec": "h264"},
             {"quality": "720p", "bitrate_kbps": 3000, "container": "mp4", "codec": "h264"},
-            {"quality": "1080p", "bitrate_kbps": 6000, "container": "mp4", "codec": "h265"},
+            {"quality": "1080p", "bitrate_kbps": 6000, "container": "mp4", "codec": "h264"},
         ]
 
     def get_subtitles(self, title_id: str) -> List[Dict[str, Any]]:
