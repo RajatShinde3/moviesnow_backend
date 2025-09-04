@@ -25,7 +25,6 @@ Security & Operations
 
 Adjust import paths if your project layout differs.
 """
-from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Imports
@@ -34,9 +33,11 @@ from typing import Optional, Dict, Any, List, Literal
 from uuid import UUID, uuid4
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status, Body
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,7 +47,8 @@ from app.core.security import get_current_user
 from app.core.redis_client import redis_wrapper
 from app.db.session import get_async_db
 from app.security_headers import set_sensitive_cache
-from app.services.audit_log_service import log_audit_event
+# Import the module rather than the function so tests can monkeypatch it reliably
+import app.services.audit_log_service as audit_log_service
 
 # Domain models / enums (align to your app)
 from app.db.models.user import User
@@ -64,10 +66,14 @@ router = APIRouter(tags=["Admin • Streams"])
 _BCP47_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")  # pragmatic BCP‑47‑ish
 
 
-def _json(data: Any, status_code: int = 200) -> JSONResponse:
-    """Return JSONResponse with strict no‑store headers for admin responses."""
+def _json(data: Dict[str, Any], status_code: int = 200) -> JSONResponse:
+    """
+    JSONResponse wrapper that:
+      - serializes non-JSON-native types (datetime, UUID, Enum)
+      - ensures sensitive responses are not cached
+    """
     return JSONResponse(
-        data,
+        jsonable_encoder(data),
         status_code=status_code,
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
@@ -106,16 +112,19 @@ def _height_for_quality(q: str) -> int:
 
 
 def _serialize_stream(v: StreamVariant) -> Dict[str, Any]:
+    def _str_or_none(val):
+        return str(val) if val is not None else None
+
     return {
         "id": str(v.id),
         "media_asset_id": str(v.media_asset_id),
         "url_path": v.url_path,
-        "protocol": str(getattr(v, "protocol", None)),
-        "container": str(getattr(v, "container", None)),
+        "protocol": _str_or_none(getattr(v, "protocol", None)),
+        "container": _str_or_none(getattr(v, "container", None)),
         "height": getattr(v, "height", None),
         "bandwidth_bps": getattr(v, "bandwidth_bps", None),
         "avg_bandwidth_bps": getattr(v, "avg_bandwidth_bps", None),
-        "stream_tier": str(getattr(v, "stream_tier", None)),
+        "stream_tier": _str_or_none(getattr(v, "stream_tier", None)),
         "is_streamable": bool(getattr(v, "is_streamable", False)),
         "is_downloadable": bool(getattr(v, "is_downloadable", False)),
         "is_default": bool(getattr(v, "is_default", False)),
@@ -158,123 +167,187 @@ class StreamPatchIn(BaseModel):
 @rate_limit("10/minute")
 async def create_stream(
     title_id: UUID,
-    payload: StreamCreateIn | Dict[str, Any],
     request: Request,
     response: Response,
+    payload: StreamCreateIn | Dict[str, Any] = Body(..., description="Stream creation payload"),
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    current_user: "User" = Depends(get_current_user),
 ) -> JSONResponse:
-    """Create a stream variant bound to a (new or provided) media asset.
+    """
+    Create a **stream variant** (HLS or MP4) for a title.
 
-    Rules
-    -----
-    - **HLS** → streamable (not downloadable), requires `stream_tier` (derived from quality).
-    - **MP4** → downloadable (not streamable).
-    - If `asset_id` omitted, a holder **MediaAsset(kind=VIDEO)** is created.
+    ## Behavior
+    - **HLS** variants are *streamable* (not downloadable) and must include a derived `stream_tier`
+      based on quality (e.g., 480p → SD, 720p → HD, 1080p → FHD).
+    - **MP4** variants are *downloadable* (not streamable).
+    - If `asset_id` is not provided, a placeholder **MediaAsset(kind=VIDEO)** holder is created and
+      the variant is bound to that new asset.
 
-    Steps
-    -----
-    1. AuthZ/MFA + cache hardening
-    2. Validate title and inputs (quality, url_path, language)
-    3. Idempotency replay if provided
-    4. Resolve/create asset
-    5. Map quality → height/tier; derive flags from type
-    6. Persist variant and commit
-    7. Audit + idempotent snapshot
+    ## Idempotency
+    If you provide an `Idempotency-Key` header, the endpoint will:
+    - On first successful call, store a snapshot of the response for 10 minutes.
+    - On subsequent calls with the same key and title, immediately replay the stored snapshot.
+
+    ## Security
+    - Requires admin privileges + MFA.
+    - Returns `404` if the title or asset (when provided) do not match.
+    - Returns `400/422` on validation issues.
+
+    ## Parameters
+    - `title_id`: The ID of the Title the stream belongs to.
+    - `payload`: Either a validated `StreamCreateIn` model or a raw dict (validated here).
+
+    ## Returns
+    - JSON describing the created stream variant (JSON-safe: datetimes, UUIDs, enums serialized).
+
+    ## Errors
+    - `404 Not Found` – title/asset mismatch.
+    - `400 Bad Request` – invalid asset reference or domain-specific validation errors.
+    - `422 Unprocessable Entity` – schema validation errors (when raw dict payload is invalid).
     """
     # ── [Step 0] Cache hardening ─────────────────────────────────────────────
     set_sensitive_cache(response)
 
-    # Normalize body
+    # ── [Step 1] Normalize & validate body (schema) ─────────────────────────
+    # FastAPI will already validate if the parameter type is StreamCreateIn.
+    # We additionally support dict payloads for flexibility (tests, internal calls).
     if isinstance(payload, dict):
-        payload = StreamCreateIn.model_validate(payload)
+        try:
+            payload = StreamCreateIn.model_validate(payload)
+        except ValidationError as ve:
+            # Surface the same error shape FastAPI uses (422 with 'detail')
+            raise RequestValidationError(ve.errors())
 
-    # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
-    from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
+    # ── [Step 2] AuthZ + MFA ────────────────────────────────────────────────
+    from app.dependencies.admin import (
+        ensure_admin as _ensure_admin,
+        ensure_mfa as _ensure_mfa,
+    )
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
 
-    # ── [Step 2] Validate inputs ────────────────────────────────────────────
+    # ── [Step 3] Upfront invariants (title + domain validation) ─────────────
+    # Ensure the title exists (404 if not).
     await _ensure_title_exists(db, title_id)
-    _ = _height_for_quality(payload.quality)  # validates
-    _ = _tier_for_quality(payload.quality)    # validates
+
+    # Validate quality early; raises on invalid values.
+    _ = _height_for_quality(payload.quality)
+    _ = _tier_for_quality(payload.quality)
+
+    # Normalize/validate language once.
     lang = _validate_language(payload.audio_language)
 
-    # ── [Step 3] Idempotent replay ──────────────────────────────────────────
+    # ── [Step 4] Idempotent replay (if header present) ──────────────────────
     idem_hdr = request.headers.get("Idempotency-Key")
     idem_key = f"idemp:admin:streams:create:{title_id}:{idem_hdr}" if idem_hdr else None
     if idem_key:
         snap = await redis_wrapper.idempotency_get(idem_key)
         if snap:
+            # Replay snapshot as-is (already JSON-safe when stored)
             return _json(snap)
 
-    # ── [Step 4] Resolve or create asset holder ─────────────────────────────
-    asset_id = payload.asset_id
-    if asset_id is None:
-        asset = MediaAsset(
-            title_id=title_id,
-            kind=MediaAssetKind.VIDEO,
-            language=lang,
-            storage_key=f"streams/title/{title_id}/holder_{uuid4().hex}.meta",
+    # ── [Step 5] Resolve/create asset holder in a transaction ───────────────
+    # Use a DB transaction for consistency across the asset+variant write.
+    # Use a SAVEPOINT so this plays nicely if a transaction is already begun.
+    async with db.begin_nested():  # commits on success, rolls back on exception
+        asset_id = payload.asset_id
+        asset_ref = None
+
+        if asset_id is None:
+            # Create a minimal VIDEO asset holder for the variant to bind to.
+            asset = MediaAsset(
+                title_id=title_id,
+                kind=MediaAssetKind.VIDEO,
+                language=lang,
+                storage_key=f"streams/title/{title_id}/holder_{uuid4().hex}.meta",
+            )
+            db.add(asset)
+            await db.flush()  # get asset.id
+            asset_id = asset.id
+            asset_ref = asset
+        else:
+            # Asset must exist, belong to the same title, and be suitable for video stream variants.
+            a = (
+                await db.execute(select(MediaAsset).where(MediaAsset.id == asset_id))
+            ).scalar_one_or_none()
+            if not a or a.title_id != title_id:
+                raise HTTPException(
+                    status_code=400, detail="asset_id not found for this title"
+                )
+            if a.kind != MediaAssetKind.VIDEO:
+                raise HTTPException(
+                    status_code=400, detail="asset_id is not a VIDEO asset"
+                )
+            asset_ref = a
+
+        # Map quality → (height, tier) and derive flags.
+        height = _height_for_quality(payload.quality)
+        tier = _tier_for_quality(payload.quality)
+
+        if payload.type == "hls":
+            protocol = StreamProtocol.HLS
+            container = Container.FMP4
+            is_streamable, is_downloadable = True, False
+        else:  # "mp4"
+            protocol = StreamProtocol.MP4
+            container = Container.MP4
+            is_streamable, is_downloadable = False, True
+
+        # Persist the variant.
+        v = StreamVariant(
+            media_asset_id=asset_id,
+            url_path=payload.url_path,
+            protocol=protocol,
+            container=container,
+            bandwidth_bps=payload.bandwidth_bps,
+            avg_bandwidth_bps=payload.avg_bandwidth_bps,
+            width=None,
+            height=height,
+            is_streamable=is_streamable,
+            is_downloadable=is_downloadable,
+            stream_tier=tier if is_streamable else None,
+            is_default=bool(payload.is_default),
+            audio_language=lang,
+            label=payload.label,
         )
-        db.add(asset)
-        await db.flush()
-        asset_id = asset.id
-    else:
-        # Validate that asset belongs to title and is of a compatible kind
-        a = (await db.execute(select(MediaAsset).where(MediaAsset.id == asset_id))).scalar_one_or_none()
-        if not a or a.title_id != title_id:
-            raise HTTPException(status_code=400, detail="asset_id not found for this title")
-
-    # ── [Step 5] Map quality → tier/height; derive flags from type ──────────
-    height = _height_for_quality(payload.quality)
-    tier = _tier_for_quality(payload.quality)
-
-    if payload.type == "hls":
-        protocol = StreamProtocol.HLS
-        container = Container.FMP4
-        is_streamable, is_downloadable = True, False
-    else:  # mp4
-        protocol = StreamProtocol.MP4
-        container = Container.MP4
-        is_streamable, is_downloadable = False, True
-
-    # ── [Step 6] Persist variant ────────────────────────────────────────────
-    v = StreamVariant(
-        media_asset_id=asset_id,
-        url_path=payload.url_path,
-        protocol=protocol,
-        container=container,
-        bandwidth_bps=payload.bandwidth_bps,
-        avg_bandwidth_bps=payload.avg_bandwidth_bps,
-        width=None,
-        height=height,
-        is_streamable=is_streamable,
-        is_downloadable=is_downloadable,
-        stream_tier=tier if is_streamable else None,
-        is_default=bool(payload.is_default),
-        audio_language=lang,
-        label=payload.label,
-    )
-    db.add(v)
-    await db.flush()
-    await db.commit()
-
-    body = _serialize_stream(v)
-
-    # ── [Step 7] Audit + idempotent snapshot ────────────────────────────────
-    try:
-        await log_audit_event(db, user=current_user, action="STREAM_CREATE", status="SUCCESS", request=request, meta_data={"stream_id": body["id"], "title_id": str(title_id)})
-    except Exception:
-        pass
-    if idem_key:
+        db.add(v)
+        await db.flush()  # ensure `v.id` is populated
         try:
-            await redis_wrapper.idempotency_set(idem_key, body, ttl_seconds=600)
+            if asset_ref is not None:
+                await db.refresh(asset_ref)
         except Exception:
             pass
 
-    return _json(body)
+    # ── [Step 6] Serialize view model (JSON-safe) ───────────────────────────
+    body = _serialize_stream(v)
 
+    # ── [Step 7] Audit (best-effort) + idempotent snapshot ──────────────────
+    try:
+        await audit_log_service.log_audit_event(
+            db,
+            user=current_user,
+            action="STREAM_CREATE",
+            status="SUCCESS",
+            request=request,
+            meta_data={"stream_id": body["id"], "title_id": str(title_id)},
+            commit=False,
+        )
+    except Exception:
+        # Deliberately swallow audit failures so they don't affect the API result.
+        pass
+
+    if idem_key:
+        try:
+            # Store a JSON-safe snapshot for quick replay.
+            await redis_wrapper.idempotency_set(
+                idem_key, jsonable_encoder(body), ttl_seconds=600
+            )
+        except Exception:
+            # Idempotency cache is best-effort; ignore storage errors.
+            pass
+
+    # ── [Step 8] Respond ────────────────────────────────────────────────────
+    return _json(body)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📋 List Stream Variants
@@ -397,7 +470,7 @@ async def patch_stream(
         await db.commit()
 
     try:
-        await log_audit_event(db, user=current_user, action="STREAM_PATCH", status="SUCCESS", request=request, meta_data={"stream_id": str(stream_id), "fields": list(updates.keys())})
+        await audit_log_service.log_audit_event(db, user=current_user, action="STREAM_PATCH", status="SUCCESS", request=request, meta_data={"stream_id": str(stream_id), "fields": list(updates.keys())})
     except Exception:
         pass
 
@@ -442,7 +515,7 @@ async def delete_stream(
     await db.commit()
 
     try:
-        await log_audit_event(db, user=current_user, action="STREAM_DELETE", status="SUCCESS", request=request, meta_data={"stream_id": str(stream_id)})
+        await audit_log_service.log_audit_event(db, user=current_user, action="STREAM_DELETE", status="SUCCESS", request=request, meta_data={"stream_id": str(stream_id)})
     except Exception:
         pass
 
