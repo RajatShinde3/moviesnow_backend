@@ -149,7 +149,12 @@ def should_exempt_request(request: Optional[Request]) -> bool:
       - client IP is TRUSTED, or
       - test bypass is enabled (env) or header indicates bypass.
     """
-    if not RATE_LIMIT_ENABLED:
+    # Re-evaluate env flags at request time so tests/CI can toggle without
+    # re-importing this module.
+    _enabled_env = os.getenv("RATE_LIMIT_ENABLED", "true").strip().lower() == "true"
+    _test_bypass_env = os.getenv("RATE_LIMIT_TEST_BYPASS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    if not _enabled_env:
         return True
     if request is None:  # defensive
         return False
@@ -167,7 +172,7 @@ def should_exempt_request(request: Optional[Request]) -> bool:
         if ip in TRUSTED_IPS:
             return True
 
-        if TEST_BYPASS:
+        if _test_bypass_env:
             # Safe default for big test suites; set RATE_LIMIT_TEST_BYPASS=""
             # in tests that specifically assert rate limiting behavior.
             return True
@@ -218,18 +223,23 @@ limiter: Optional[Limiter] = _make_limiter()
 # ──────────────────────────────────────────────────────────────
 # 🎛 Decorators
 # ──────────────────────────────────────────────────────────────
-def _exempt_noarg() -> bool:
+def _exempt_when(request: Optional[Request] = None) -> bool:
     """
-    Adapter for SlowAPI versions that call `exempt_when()` with no args.
-    Pull the current Request from Limiter's context if available.
+    Works with both SlowAPI styles:
+    - Newer: exempt_when receives the Request
+    - Older: exempt_when receives no args; get Request from limiter context
     """
-    if limiter is None:
-        return False
     try:
-        req = limiter._request_context.get()  # type: ignore[attr-defined]
+        req = request
+        if req is None and limiter is not None:
+            # Fallback to contextvar when middleware provided it
+            try:
+                req = limiter._request_context.get()  # type: ignore[attr-defined]
+            except Exception:
+                req = None
+        return should_exempt_request(req)
     except Exception:
-        req = None
-    return should_exempt_request(req) if req is not None else False
+        return False
 
 
 def _chain(decorators: List[Callable]) -> Callable:
@@ -256,7 +266,7 @@ def rate_limit(*limits: str) -> Callable:
 
     selected = list(limits) if limits else _build_default_limits()
     decorators = [
-        limiter.limit(limit_value, exempt_when=_exempt_noarg)
+        limiter.limit(limit_value, exempt_when=_exempt_when)
         for limit_value in selected
     ]
     return _chain(decorators)

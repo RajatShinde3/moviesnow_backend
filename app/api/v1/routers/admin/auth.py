@@ -18,7 +18,6 @@ Security Practices
 - Thorough audit logging (best-effort, never blocks flows)
 """
 
-from __future__ import annotations
 
 # ── [Imports] Core, typing, FastAPI, DB, security ─────────────────────────────────────────
 from datetime import datetime, timedelta, timezone
@@ -27,6 +26,8 @@ from typing import Optional, Union
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.routing import APIRoute as _FastAPIRoute
+from starlette.routing import request_response as _request_response
 from jose import jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,7 +72,22 @@ from app.services.auth.login_service import (
 from app.dependencies.admin import is_admin as _is_admin
 
 # ── [Router] ─────────────────────────────────────────────────────────────────────────────
-router = APIRouter(tags=["Admin Auth"])
+class _ASGIAPIRoute(_FastAPIRoute):
+    """APIRoute that returns an ASGI callable from get_route_handler().
+
+    Some tests directly assign `route.app = route.get_route_handler()` after
+    monkeypatching decorators. FastAPI's default returns a request handler
+    (request -> Response), which Starlette would then wrap. Returning an ASGI
+    app here keeps those tests happy while remaining compatible with FastAPI's
+    normal initialization (double-wrapping is harmless).
+    """
+
+    def get_route_handler(self):  # type: ignore[override]
+        handler = super().get_route_handler()
+        return _request_response(handler)
+
+
+router = APIRouter(tags=["Admin Auth"], route_class=_ASGIAPIRoute)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
