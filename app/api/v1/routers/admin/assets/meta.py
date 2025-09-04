@@ -22,7 +22,6 @@ Security & Operations
 
 Adjust imports/paths for your project.
 """
-from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Imports
@@ -242,7 +241,17 @@ async def assets_checksum(
         await db.execute(
             update(MediaAsset).where(MediaAsset.id == asset_id).values(checksum_sha256=sha)
         )
-        await db.commit()
+        try:
+            await db.commit()
+        except Exception:
+            # Ensure the transaction is clean for subsequent tests/requests
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            # Explicitly return a 500 response rather than letting raw exceptions
+            # bubble through the middleware stack (which may raise during testing).
+            raise HTTPException(status_code=500, detail="DB commit failed")
 
     try:
         await log_audit_event(db, user=current_user, action="ASSET_CHECKSUM", status="UPDATED", request=request, meta_data={"asset_id": str(asset_id)})

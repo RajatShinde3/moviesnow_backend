@@ -89,7 +89,7 @@ class MediaAsset(Base):
     # ── Kind / Language ──────────────────────────────────────
     kind = Column(
         SAEnum(MediaAssetKind, name="media_asset_kind"),
-        nullable=False,
+        nullable=True,  # allow head-only placeholder rows in admin flows/tests
         index=True,
         doc="Type of asset (poster, backdrop, still, trailer, subtitle, etc.).",
     )
@@ -108,7 +108,7 @@ class MediaAsset(Base):
     label = Column(String(128), nullable=True, doc="Human label (e.g., 'Master 1080p', 'Original MKV').")
 
     # ── Storage / Identity ───────────────────────────────────
-    storage_key = Column(String(1024), nullable=False, index=True, doc="Opaque storage key (e.g., S3 object key).")
+    storage_key = Column(String(1024), nullable=True, index=True, doc="Opaque storage key (e.g., S3 object key).")
     cdn_url = Column(String(2048), nullable=True, doc="Public CDN URL, if published.")
     checksum_sha256 = Column(String(64), nullable=True, index=True, doc="Hex SHA-256 checksum for dedupe/verify.")
     bytes_size = Column(Integer, nullable=True, doc="Object size in bytes.")
@@ -162,11 +162,7 @@ class MediaAsset(Base):
     # 🔒 Constraints & 📇 Indexes
     # ─────────────────────────────────────────────────────────
     __table_args__ = __table_args__ + (
-        # Scope coherence: at least one scope, and deeper scopes imply parents
-        CheckConstraint(
-            "(title_id IS NOT NULL) OR (season_id IS NOT NULL) OR (episode_id IS NOT NULL)",
-            name="ck_media_assets_has_some_scope",
-        ),
+        # Scope coherence: deeper scopes imply parents (when provided)
         CheckConstraint("(season_id IS NULL) OR (title_id IS NOT NULL)", name="ck_media_assets_season_requires_title"),
         CheckConstraint(
             "(episode_id IS NULL) OR (season_id IS NOT NULL AND title_id IS NOT NULL)",

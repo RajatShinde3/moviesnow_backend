@@ -117,12 +117,31 @@ class _SessionProxy:
 
 @pytest.fixture()
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Fresh, isolated DB session per test, with a small proxy for convenience."""
+    """Fresh, isolated DB session per test.
+
+    - Ensures connection search_path + UTC per-session
+    - Yields a thin proxy for convenient `.execute().count()` in tests
+    - Truncates all ORM tables after each test to avoid cross-test leakage
+      (e.g., UNIQUE constraint violations when helpers reuse the same keys)
+    """
     async with SessionFactory() as session:
-        # Just in case a new connection was pulled, enforce search_path + UTC again
+        # Ensure the connection honors our test schema and timezone
         await session.execute(text(f'SET search_path TO "{SCHEMA}"'))
         await session.execute(text("SET TIME ZONE 'UTC'"))
+
+        # Hand session to the test
         yield _SessionProxy(session)
+
+    # Cleanup: truncate all tables in the schema so tests don't leak state
+    # Use a separate connection/transaction so test-level monkeypatching of
+    # AsyncSession.commit (in some tests) can't interfere with cleanup.
+    table_names = list(base.Base.metadata.tables.keys())
+    if table_names:
+        ident_list = ", ".join([f'"{name}"' for name in table_names])
+        stmt = text(f"TRUNCATE TABLE {ident_list} RESTART IDENTITY CASCADE")
+        async with engine.begin() as conn:
+            # search_path is already configured in engine.connect_args
+            await conn.execute(stmt)
 
 def get_override_get_db(session: AsyncSession):
     """FastAPI dependency override using the provided session."""
