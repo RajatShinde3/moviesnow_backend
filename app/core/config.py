@@ -126,6 +126,8 @@ class Settings(BaseSettings):
     AWS_REGION: str = "us-east-1"
     AWS_BUCKET_NAME: Optional[str] = None
     CLOUDFRONT_DOMAIN: Optional[str] = None  # e.g., cdn.example.com or https://cdn.example.com
+    # Optional: CloudFront distribution id used by admin CDN invalidation
+    CLOUDFRONT_DISTRIBUTION_ID: Optional[str] = None
     CDN_SIGN_TTL_SECONDS: int = Field(300, ge=60, le=24 * 60 * 60)  # manifest signed URL TTL
 
     # ── DRM (optional; enable per environment) ────────────────

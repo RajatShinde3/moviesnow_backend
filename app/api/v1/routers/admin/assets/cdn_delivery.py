@@ -30,7 +30,6 @@ Security & Operations
 
 Adjust imports/paths for your project layout.
 """
-from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Imports
@@ -42,7 +41,8 @@ import hashlib
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query
 from fastapi.responses import JSONResponse, RedirectResponse
-
+from pydantic import ValidationError
+from fastapi.exceptions import RequestValidationError
 from app.core.limiter import rate_limit
 from app.core.security import get_current_user
 from app.core.redis_client import redis_wrapper
@@ -129,7 +129,7 @@ class BatchTokensIn(BaseModel):
 # ☁️ CDN: Invalidate
 # ─────────────────────────────────────────────────────────────────────────────
 @router.post("/cdn/invalidate", summary="Invalidate CDN paths/prefixes")
-@rate_limit("6/minute")
+@rate_limit("8/minute")
 async def cdn_invalidate(
     payload: CDNInvalidateIn | Dict[str, Any],
     request: Request,
@@ -382,7 +382,11 @@ async def delivery_download_token(
     set_sensitive_cache(response)
 
     if isinstance(payload, dict):
-        payload = DownloadTokenIn.model_validate(payload)
+        try:
+            payload = DownloadTokenIn.model_validate(payload)
+        except ValidationError as e:
+            # Normalize to FastAPI-style 422
+            raise RequestValidationError(e.errors())
 
     # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
     from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
