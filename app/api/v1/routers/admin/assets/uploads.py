@@ -27,7 +27,6 @@ Security & Operations
 
 Adjust imports/paths to match your project layout.
 """
-from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Imports
@@ -46,7 +45,7 @@ from app.core.limiter import rate_limit
 from app.core.security import get_current_user
 from app.core.redis_client import redis_wrapper
 from app.security_headers import set_sensitive_cache
-from app.services.audit_log_service import log_audit_event
+import app.services.audit_log_service as audit_log_service
 
 from app.db.models.user import User
 from app.utils.aws import S3Client, S3StorageError
@@ -201,7 +200,7 @@ async def uploads_init(
     except Exception:
         pass
     try:
-        await log_audit_event(None, user=current_user, action="UPLOAD_INIT", status="SUCCESS", request=request, meta_data={"storage_key": key})
+        await audit_log_service.log_audit_event(None, user=current_user, action="UPLOAD_INIT", status="SUCCESS", request=request, meta_data={"storage_key": key})
     except Exception:
         pass
 
@@ -266,7 +265,7 @@ async def multipart_create(
     except Exception:
         pass
     try:
-        await log_audit_event(None, user=current_user, action="MULTIPART_CREATE", status="SUCCESS", request=request, meta_data={"storage_key": key, "upload_id": upload_id})
+        await audit_log_service.log_audit_event(None, user=current_user, action="MULTIPART_CREATE", status="SUCCESS", request=request, meta_data={"storage_key": key, "upload_id": upload_id})
     except Exception:
         pass
 
@@ -346,7 +345,7 @@ async def multipart_complete(
         raise HTTPException(status_code=503, detail=f"Complete failed: {e}")
 
     try:
-        await log_audit_event(None, user=current_user, action="MULTIPART_COMPLETE", status="SUCCESS", request=request, meta_data={"storage_key": payload.key, "upload_id": uploadId})
+        await audit_log_service.log_audit_event(None, user=current_user, action="MULTIPART_COMPLETE", status="SUCCESS", request=request, meta_data={"storage_key": payload.key, "upload_id": uploadId})
     except Exception:
         pass
 
@@ -384,7 +383,7 @@ async def multipart_abort(
         raise HTTPException(status_code=503, detail=f"Abort failed: {e}")
 
     try:
-        await log_audit_event(None, user=current_user, action="MULTIPART_ABORT", status="SUCCESS", request=request, meta_data={"storage_key": payload.key, "upload_id": uploadId})
+        await audit_log_service.log_audit_event(None, user=current_user, action="MULTIPART_ABORT", status="SUCCESS", request=request, meta_data={"storage_key": payload.key, "upload_id": uploadId})
     except Exception:
         pass
 
@@ -441,7 +440,7 @@ async def direct_proxy_upload(
         raise HTTPException(status_code=503, detail=str(e))
 
     try:
-        await log_audit_event(None, user=current_user, action="DIRECT_UPLOAD_PROXY", status="SUCCESS", request=request, meta_data={"storage_key": key, "size": len(data)})
+        await audit_log_service.log_audit_event(None, user=current_user, action="DIRECT_UPLOAD_PROXY", status="SUCCESS", request=request, meta_data={"storage_key": key, "size": len(data)})
     except Exception:
         pass
 

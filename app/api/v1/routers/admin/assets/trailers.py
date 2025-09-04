@@ -26,7 +26,6 @@ Security & Operations
 
 Replace or align imports to match your app's package layout if needed.
 """
-from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Imports
@@ -46,7 +45,7 @@ from app.core.security import get_current_user
 from app.core.redis_client import redis_wrapper
 from app.db.session import get_async_db
 from app.security_headers import set_sensitive_cache
-from app.services.audit_log_service import log_audit_event
+import app.services.audit_log_service as audit_log_service
 
 # Domain models / enums (adjust imports to your app)
 from app.db.models.user import User
@@ -230,7 +229,7 @@ async def create_trailer(
         except Exception:
             pass
     try:
-        await log_audit_event(db, user=current_user, action="TRAILER_CREATE", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "asset_id": str(asset.id)})
+        await audit_log_service.log_audit_event(db, user=current_user, action="TRAILER_CREATE", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "asset_id": str(asset.id)})
     except Exception:
         pass
 
@@ -351,7 +350,7 @@ async def patch_trailer(
             await db.commit()
 
     try:
-        await log_audit_event(db, user=current_user, action="TRAILER_PATCH", status="SUCCESS", request=request, meta_data={"trailer_id": str(trailer_id), "fields": list(updates.keys()) if updates else []})
+        await audit_log_service.log_audit_event(db, user=current_user, action="TRAILER_PATCH", status="SUCCESS", request=request, meta_data={"trailer_id": str(trailer_id), "fields": list(updates.keys()) if updates else []})
     except Exception:
         pass
 
@@ -402,7 +401,7 @@ async def make_primary_trailer(
         await db.commit()
 
     try:
-        await log_audit_event(db, user=current_user, action="TRAILER_MAKE_PRIMARY", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "trailer_id": str(trailer_id)})
+        await audit_log_service.log_audit_event(db, user=current_user, action="TRAILER_MAKE_PRIMARY", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "trailer_id": str(trailer_id)})
     except Exception:
         pass
 
@@ -454,7 +453,7 @@ async def delete_trailer(
             pass
 
     try:
-        await log_audit_event(db, user=current_user, action="TRAILER_DELETE", status="SUCCESS", request=request, meta_data={"asset_id": str(trailer_id)})
+        await audit_log_service.log_audit_event(db, user=current_user, action="TRAILER_DELETE", status="SUCCESS", request=request, meta_data={"asset_id": str(trailer_id)})
     except Exception:
         pass
 
