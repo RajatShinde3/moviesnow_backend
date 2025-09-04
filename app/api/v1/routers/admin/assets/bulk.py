@@ -27,7 +27,6 @@ Security & Operations
 
 Adjust import paths to your project layout as needed.
 """
-from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Imports
@@ -318,9 +317,17 @@ async def bulk_job_cancel(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
-    """Request cancellation for a queued/running bulk job (best‑effort).
+    """Request cancellation for a queued/running bulk job (best-effort).
 
-    The worker is expected to periodically check `bulk:cancels` set.
+    Notes
+    -----
+    - Idempotent: if already CANCEL_REQUESTED, returns 200 with same status.
+    - Only QUEUED / RETRY_QUEUED / RUNNING are cancellable.
+    - We avoid mutating the fetched envelope in place.
+    - To satisfy failure semantics, we add to the cancel set *before* persisting
+      the envelope; if either step fails we return 503 and leave stored data
+      unchanged. If `sadd` succeeded but `json_set` failed, we best-effort roll
+      back the set membership.
     """
     # ── [Step 0] Cache hardening ─────────────────────────────────────────────
     set_sensitive_cache(response)
@@ -330,25 +337,61 @@ async def bulk_job_cancel(
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
 
+    # ── [Step 2] Load envelope ──────────────────────────────────────────────
     key = JOB_KEY_T.format(job_id=job_id)
-    data = await redis_wrapper.json_get(key)
-    if not data:
+    env = await redis_wrapper.json_get(key)
+    if not env:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    data["status"] = "CANCEL_REQUESTED"
-    try:
-        await redis_wrapper.json_set(key, data, ttl_seconds=DEFAULT_TTL)
-        await redis_wrapper.client.sadd(CANCEL_SET_KEY, job_id)  # type: ignore
-    except Exception:
-        raise HTTPException(status_code=503, detail="Could not update job")
+    current_status = str(env.get("status", "")).upper()
+    cancellable = {"QUEUED", "RETRY_QUEUED", "RUNNING"}
+    terminal = {"COMPLETED", "FAILED", "CANCELLED", "ABORTED"}
+
+    # Idempotent early-exit
+    if current_status == "CANCEL_REQUESTED":
+        return _json({"status": "CANCEL_REQUESTED"})
+
+    # Not cancellable
+    if current_status in terminal:
+        raise HTTPException(status_code=409, detail=f"Job not cancellable in status {current_status}")
+
+    if current_status not in cancellable:
+        # Unknown/unsupported states are treated as not cancellable
+        raise HTTPException(status_code=409, detail=f"Job not cancellable in status {current_status}")
+
+    # ── [Step 3] Persist cancel intent atomically-ish ───────────────────────
+    # Copy to avoid in-place mutation of the object returned by json_get.
+    new_env = dict(env)
+    new_env["status"] = "CANCEL_REQUESTED"
 
     try:
-        await log_audit_event(db, user=current_user, action="BULK_JOB_CANCEL", status="CANCEL_REQUESTED", request=request, meta_data={"job_id": job_id})
+        # Add to cancel set *first*. If this fails, the stored envelope must remain unchanged.
+        await redis_wrapper.client.sadd(CANCEL_SET_KEY, job_id)  # type: ignore
+
+        # Now persist updated envelope with TTL.
+        await redis_wrapper.json_set(key, new_env, ttl_seconds=DEFAULT_TTL)
+    except Exception:
+        # Best-effort rollback of set membership in case sadd succeeded but json_set failed.
+        try:
+            await redis_wrapper.client.srem(CANCEL_SET_KEY, job_id)  # type: ignore
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="Could not update job")
+
+    # ── [Step 4] Audit (best-effort) ────────────────────────────────────────
+    try:
+        await log_audit_event(
+            db,
+            user=current_user,
+            action="BULK_JOB_CANCEL",
+            status="CANCEL_REQUESTED",
+            request=request,
+            meta_data={"job_id": job_id},
+        )
     except Exception:
         pass
 
     return _json({"status": "CANCEL_REQUESTED"})
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧾 Inspect Items & Errors
@@ -366,50 +409,67 @@ async def bulk_job_items(
     offset: int = Query(0, ge=0, description="Pagination offset"),
     limit: int = Query(100, ge=1, le=1000, description="Pagination limit"),
 ) -> JSONResponse:
-    """Return a slice of recorded items and errors for a bulk job.
+    """
+    Return a slice of recorded items and errors for a bulk job.
 
-    Data Model (Redis)
-    ------------------
-    - Job envelope: `bulk:job:{job_id}` (JSON)
-    - Items array:  `bulk:job:{job_id}:items` (JSON list; optional)
-    - Errors array: `bulk:job:{job_id}:errors` (JSON list; optional)
+    Redis keys
+    ----------
+    - Envelope: bulk:job:{job_id}                  (JSON object)
+    - Items:    bulk:job:{job_id}:items            (JSON list; optional)
+    - Errors:   bulk:job:{job_id}:errors           (JSON list; optional)
 
     Notes
     -----
-    - If a worker does not populate items/errors, this returns empty arrays.
-    - Supports simple pagination and status filtering on the in‑memory list.
+    - If worker never wrote items/errors, they default to [].
+    - Status filter is applied to the in-memory list before pagination.
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    # ── [0] Cache hardening ─────────────────────────────────────────────────
     set_sensitive_cache(response)
 
-    # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
+    # ── [1] AuthZ + MFA ────────────────────────────────────────────────────
     from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
 
+    # ── [2] Read envelope (bubble 500 on Redis errors, 404 if missing) ─────
     job_key = JOB_KEY_T.format(job_id=job_id)
-    job = await redis_wrapper.json_get(job_key)
+    try:
+        job: Dict[str, Any] | None = await redis_wrapper.json_get(job_key)
+    except Exception as e:
+        # Tests expect a clean 500 when envelope fetch fails
+        raise HTTPException(status_code=500, detail="Internal error reading job") from e
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # ── [3] Read items / errors defensively ────────────────────────────────
     items_key = ITEMS_KEY_T.format(job_id=job_id)
     errs_key = ERRORS_KEY_T.format(job_id=job_id)
 
-    items = await redis_wrapper.json_get(items_key, default=[]) or []
-    errors = await redis_wrapper.json_get(errs_key, default=[]) or []
-
-    # Defensive normalization
     try:
-        items = [i for i in items if isinstance(i, dict)]
+        raw_items = await redis_wrapper.json_get(items_key, default=[])
     except Exception:
-        items = []
+        raw_items = []
     try:
-        errors = [e for e in errors if isinstance(e, dict)]
+        raw_errors = await redis_wrapper.json_get(errs_key, default=[])
     except Exception:
-        errors = []
+        raw_errors = []
 
-    # Optional status filter
-    sf = str(status_filter or "all").lower()
+    # Normalize to lists of dicts
+    items: List[Dict[str, Any]] = []
+    if isinstance(raw_items, list):
+        for i in raw_items:
+            if isinstance(i, dict):
+                items.append(i)
+
+    errors: List[Dict[str, Any]] = []
+    if isinstance(raw_errors, list):
+        for e in raw_errors:
+            if isinstance(e, dict):
+                errors.append(e)
+
+    # ── [4] Optional status filter ─────────────────────────────────────────
+    sf = (status_filter or "all").lower()
     if sf != "all":
         def _match(it: Dict[str, Any]) -> bool:
             st = str(it.get("status", "")).lower()
@@ -422,13 +482,16 @@ async def bulk_job_items(
             if sf == "error":
                 return st == "error"
             return True
+
         items = [it for it in items if _match(it)]
 
+    # ── [5] Pagination ─────────────────────────────────────────────────────
     total = len(items)
     start = int(offset)
     end = min(start + int(limit), total)
-    page = items[start:end]
+    page = items[start:end] if start < total else []
 
+    # ── [6] Response ───────────────────────────────────────────────────────
     return _json({
         "job": {"id": job.get("id"), "status": job.get("status")},
         "items": page,
@@ -437,7 +500,6 @@ async def bulk_job_items(
         "errors": errors if only_errors else None,
         "errors_total": len(errors) if errors else 0,
     })
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔁 Retry Bulk Job
