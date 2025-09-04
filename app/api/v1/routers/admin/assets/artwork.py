@@ -231,10 +231,9 @@ async def create_artwork(
     await _ensure_mfa(request)
 
     # ── [Step 2] Validate inputs ────────────────────────────────────────────
-    await _ensure_title_exists(db, title_id)
     ct = (payload.content_type or "").lower()
     if ct not in ALLOWED_IMAGE_MIME:
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Unsupported image content‑type")
+        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Unsupported image content-type")
     lang = _validate_language(payload.language)
     kind = _normalize_kind(payload.kind)
 
@@ -247,28 +246,41 @@ async def create_artwork(
             return snap  # type: ignore[return-value]
 
     # ── [Step 4] Persist DB row ─────────────────────────────────────────────
+    await _ensure_title_exists(db, title_id)
+
+    art_id = uuid4()
+    key = _build_artwork_key(title_id=title_id, kind=kind, artwork_id=art_id, content_type=ct, language=lang)
+    s3 = _ensure_s3()
+    try:
+        upload_url = s3.presigned_put(key, content_type=ct, public=False)
+    except S3StorageError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
     art = Artwork(
+        id=art_id,
         title_id=title_id,
         kind=kind,  # ORM column may be Enum or String; normalized value works for both
         language=lang,
         content_type=ct,
         is_primary=bool(payload.is_primary),
+        storage_key=key,
     )
-    db.add(art)
-    await db.flush()  # obtain art.id without full commit
+    # storage_key set up-front; no need to flush before commit
+    persisted = False
+    try:
+        db.add(art)
+        await db.commit()
+        persisted = True
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
     # ── [Step 5] Presign storage key ────────────────────────────────────────
-    key = _build_artwork_key(title_id=title_id, kind=kind, artwork_id=art.id, content_type=ct, language=lang)
-    try:
-        setattr(art, "storage_key", key)
-    except Exception:
-        pass  # tolerate models without storage_key column
-    await db.commit()
+    # Note: key/presign handled above
 
-    s3 = _ensure_s3()
-    upload_url = s3.presigned_put(key, content_type=ct, public=False)
-
-    body = {"artwork_id": str(art.id), "upload_url": upload_url, "storage_key": key}
+    body = {"artwork_id": str(art_id), "upload_url": upload_url, "storage_key": key}
 
     # Store idempotent snapshot (best‑effort) & audit
     if idem_key:
@@ -277,7 +289,7 @@ async def create_artwork(
         except Exception:
             pass
     try:
-        await log_audit_event(db, user=current_user, action="ARTWORK_CREATE", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "artwork_id": str(art.id)})
+        await log_audit_event(db, user=current_user, action="ARTWORK_CREATE", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "artwork_id": str(art_id), "persisted": bool('persisted' in locals() and persisted)})
     except Exception:
         pass
 
