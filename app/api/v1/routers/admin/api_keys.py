@@ -24,7 +24,6 @@ Security & Ops Hardening
 - Best-effort structured audit logs (never block main flow).
 """
 
-from __future__ import annotations
 
 from typing import List, Dict
 
