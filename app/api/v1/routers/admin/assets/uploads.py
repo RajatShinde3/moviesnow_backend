@@ -1,16 +1,16 @@
 """
-☁️ MoviesNow · Admin Uploads API (single & multipart, direct proxy)
-===================================================================
+📦 MoviesNow · Admin Uploads API (single & multipart, direct proxy)
+==================================================================
 
-Production‑grade, security‑hardened FastAPI routes for **admin uploads** under
-`/api/v1/admin`. Supports S3 presigned single‑part uploads, multipart uploads,
-and a small‑file direct proxy. Implements **MFA‑enforced admin** access,
+Production-grade, security-hardened FastAPI routes for **admin uploads** under
+`/api/v1/admin`. Supports S3 presigned single-part uploads, multipart uploads,
+and a small-file direct proxy. Implements **MFA-enforced admin** access,
 **SlowAPI** rate limits, **idempotency** on create flows, **sensitive cache**
 headers, and **audit logs** that never block the critical path.
 
 Routes (6)
 ----------
-- POST /api/v1/admin/uploads/init                      → Presigned PUT for single‑part upload
+- POST /api/v1/admin/uploads/init                      → Presigned PUT for single-part upload
 - POST /api/v1/admin/uploads/multipart/create          → Create multipart upload (returns uploadId + key)
 - GET  /api/v1/admin/uploads/multipart/{uploadId}/part-url   → Presigned URL for a multipart part
 - POST /api/v1/admin/uploads/multipart/{uploadId}/complete → Complete multipart upload
@@ -19,11 +19,11 @@ Routes (6)
 
 Security & Operations
 ---------------------
-- **Admin‑only** + **MFA** checks on every route.
-- **SlowAPI** per‑route rate limits; responses are `JSONResponse` for clean header injection.
+- **Admin-only** + **MFA** checks on every route.
+- **SlowAPI** per-route rate limits; responses are `JSONResponse` for clean header injection.
 - **Idempotency** via `Idempotency-Key` with Redis snapshot and deterministic keys.
-- **Cache hardening** on presign responses (`Cache‑Control: no-store`).
-- **Audit logs** emitted best‑effort; failures are swallowed.
+- **Cache hardening** on presign responses (`Cache-Control: no-store`).
+- **Audit logs** emitted best-effort; failures are swallowed.
 
 Adjust imports/paths to match your project layout.
 """
@@ -45,7 +45,8 @@ from app.core.limiter import rate_limit
 from app.core.security import get_current_user
 from app.core.redis_client import redis_wrapper
 from app.security_headers import set_sensitive_cache
-import app.services.audit_log_service as audit_log_service
+from app.services.audit_log_service import log_audit_event
+
 
 from app.db.models.user import User
 from app.utils.aws import S3Client, S3StorageError
@@ -81,11 +82,16 @@ _SAFE_SEG_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def _json(data: Any, status_code: int = 200) -> JSONResponse:
-    """Return JSONResponse with strict no‑store headers for admin responses."""
-    return JSONResponse(data, status_code=status_code, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+    """Return JSONResponse with strict no-store headers for admin responses."""
+    return JSONResponse(
+        data,
+        status_code=status_code,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 def _ensure_s3() -> S3Client:
+    """Construct an S3 client or raise 503 if not available."""
     try:
         return S3Client()
     except S3StorageError as e:
@@ -93,11 +99,18 @@ def _ensure_s3() -> S3Client:
 
 
 def _ext_for_content_type(ct: str) -> str:
+    """Map a content-type to a safe file extension; fallback to .bin."""
     return _EXT_MAP.get((ct or "").lower(), "bin")
 
 
 def _sanitize_segment(s: Optional[str], fallback: str) -> str:
-    """Single path segment sanitizer (letters/digits/._- only; spaces→underscore)."""
+    """
+    Sanitize a single path segment.
+
+    - Spaces collapse to underscore
+    - Only letters, digits, dot, underscore, hyphen are kept
+    - Returns `fallback` if result is empty
+    """
     s = (s or fallback).strip()
     s = re.sub(r"\s+", "_", s)
     s = _SAFE_SEG_RE.sub("", s)
@@ -105,12 +118,35 @@ def _sanitize_segment(s: Optional[str], fallback: str) -> str:
 
 
 def _safe_prefix(prefix: Optional[str], default: str) -> str:
-    p = (prefix or default).strip("/ ")
-    p = re.sub(r"[^\w./-]", "", p)
+    """
+    Sanitize a user-supplied prefix **without** performing path resolution.
+
+    Rules
+    -----
+    - Remove leading slashes and backslashes
+    - Drop empty segments and traversal tokens ('.', '..') instead of resolving
+    - Keep only [A-Za-z0-9_.-] per segment; strip other characters
+    - Collapse multiple slashes
+
+    Examples
+    --------
+    '/bad//prefix/../ok'  → 'bad/prefix/ok'
+    '   uploads/title  '  → 'uploads/title'
+    """
+    raw = (prefix or default).replace("\\", "/")
+    parts: List[str] = []
+    for seg in raw.split("/"):
+        if not seg or seg in (".", ".."):
+            continue
+        seg = re.sub(r"[^\w.-]", "", seg)
+        if seg:
+            parts.append(seg)
+    p = "/".join(parts)
     return p or default
 
 
 def _short_hash(value: str, *, length: int = 8) -> str:
+    """Short, deterministic SHA-1 hash (hex)."""
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
 
 
@@ -118,27 +154,32 @@ def _short_hash(value: str, *, length: int = 8) -> str:
 # 🧾 Schemas
 # ─────────────────────────────────────────────────────────────────────────────
 class UploadInitIn(BaseModel):
+    """Input for single-part upload initialization."""
     content_type: str
     key_prefix: Optional[str] = Field("uploads/title", description="Base path prefix; sanitized")
     filename_hint: Optional[str] = None
 
 
 class MultipartCreateIn(BaseModel):
+    """Input to create a multipart upload."""
     content_type: str
     key_prefix: Optional[str] = Field("uploads/multipart", description="Base path prefix; sanitized")
     filename_hint: Optional[str] = None
 
 
 class MultipartCompleteIn(BaseModel):
+    """Input to complete a multipart upload."""
     key: str
     parts: List[Dict[str, str]]  # [{ETag:"...", PartNumber:1}, ...]
 
 
 class MultipartAbortIn(BaseModel):
+    """Input to abort a multipart upload."""
     key: str
 
 
 class DirectProxyIn(BaseModel):
+    """Input for small, direct proxy uploads (base64 payload)."""
     content_type: str
     data_base64: str
     key_prefix: Optional[str] = Field("uploads/direct", description="Base path prefix; sanitized")
@@ -146,7 +187,7 @@ class DirectProxyIn(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔗 Single‑part Presigned Upload
+# 🔗 Single-part Presigned Upload
 # ─────────────────────────────────────────────────────────────────────────────
 @router.post("/uploads/init", summary="Init single upload (presigned PUT)")
 @rate_limit("20/minute")
@@ -156,27 +197,32 @@ async def uploads_init(
     response: Response,
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
-    """Create a presigned **single‑part** PUT URL for arbitrary content.
+    """
+    Create a presigned **single-part** PUT URL for arbitrary content.
 
     Steps
     -----
     1. AuthZ/MFA + cache hardening
-    2. Build deterministic storage key (idempotency‑aware)
+    2. Build deterministic storage key (idempotency-aware)
     3. Return presigned PUT URL
+
+    Returns
+    -------
+    200 JSON
+        `{ "upload_url": str, "storage_key": str }`
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
     set_sensitive_cache(response)
 
     # Normalize body
     if isinstance(payload, dict):
         payload = UploadInitIn.model_validate(payload)
 
-    # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
+    # AuthZ + MFA
     from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
 
-    # ── [Step 2] Build deterministic key (idempotent) ───────────────────────
+    # Deterministic key
     s3 = _ensure_s3()
     ext = _ext_for_content_type(payload.content_type)
     prefix = _safe_prefix(payload.key_prefix, "uploads")
@@ -191,16 +237,24 @@ async def uploads_init(
     if snap:
         return _json(snap)
 
-    # ── [Step 3] Issue presigned URL ────────────────────────────────────────
+    # Presign
     url = s3.presigned_put(key, content_type=payload.content_type, public=False)
     body = {"upload_url": url, "storage_key": key}
 
+    # Snapshot + audit (best-effort)
     try:
         await redis_wrapper.idempotency_set(idem_key, body, ttl_seconds=600)
     except Exception:
         pass
     try:
-        await audit_log_service.log_audit_event(None, user=current_user, action="UPLOAD_INIT", status="SUCCESS", request=request, meta_data={"storage_key": key})
+        await log_audit_event(
+            None,
+            user=current_user,
+            action="UPLOAD_INIT",
+            status="SUCCESS",
+            request=request,
+            meta_data={"storage_key": key},
+        )
     except Exception:
         pass
 
@@ -218,22 +272,24 @@ async def multipart_create(
     response: Response,
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
-    """Initialize a **multipart** upload for large files and return an `uploadId` + `storage_key`.
+    """
+    Initialize a **multipart** upload for large files and return `uploadId` + `storage_key`.
 
     Deterministic key (when `Idempotency-Key` present) ensures replayability.
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    # ── Cache hardening ──────────────────────────────────────────────────────
     set_sensitive_cache(response)
 
+    # Normalize body
     if isinstance(payload, dict):
         payload = MultipartCreateIn.model_validate(payload)
 
-    # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
+    # ── AuthZ + MFA ─────────────────────────────────────────────────────────
     from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
 
-    s3 = _ensure_s3()
+    # ── Build deterministic key (no S3 yet!) ────────────────────────────────
     ext = _ext_for_content_type(payload.content_type)
     prefix = _safe_prefix(payload.key_prefix, "uploads/multipart")
 
@@ -241,12 +297,14 @@ async def multipart_create(
     stem_hint = _sanitize_segment(payload.filename_hint, f"mup_{_short_hash(idem_hdr)}")
     key = f"{prefix}/{stem_hint}.{ext}"
 
-    # Idempotency replay
+    # ── Idempotency replay (bypass S3 entirely) ─────────────────────────────
     idem_key = f"idemp:admin:uploads:multipart:create:{key}:{idem_hdr}"
     snap = await redis_wrapper.idempotency_get(idem_key)
     if snap:
         return _json(snap)
 
+    # ── S3 multipart init (only if not a replay) ────────────────────────────
+    s3 = _ensure_s3()
     try:
         upload = s3.client.create_multipart_upload(
             Bucket=s3.bucket,
@@ -260,12 +318,21 @@ async def multipart_create(
 
     body = {"uploadId": upload_id, "storage_key": key}
 
+    # Best-effort idempotency snapshot + audit
     try:
         await redis_wrapper.idempotency_set(idem_key, body, ttl_seconds=3600)
     except Exception:
         pass
     try:
-        await audit_log_service.log_audit_event(None, user=current_user, action="MULTIPART_CREATE", status="SUCCESS", request=request, meta_data={"storage_key": key, "upload_id": upload_id})
+        # Call module-level symbol so tests can monkeypatch `mod.log_audit_event`
+        await log_audit_event(
+            None,
+            user=current_user,
+            action="MULTIPART_CREATE",
+            status="SUCCESS",
+            request=request,
+            meta_data={"storage_key": key, "upload_id": upload_id},
+        )
     except Exception:
         pass
 
@@ -285,12 +352,18 @@ async def multipart_part_url(
     response: Response = None,
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
-    """Return a presigned **PUT** URL for a specific multipart `partNumber`."""
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    """
+    Return a presigned **PUT** URL for a specific multipart `partNumber`.
+
+    Returns
+    -------
+    200 JSON
+        `{ "upload_url": str }`
+    """
     if response is not None:
         set_sensitive_cache(response)
 
-    # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
+    # AuthZ + MFA
     from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
@@ -321,14 +394,20 @@ async def multipart_complete(
     response: Response,
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
-    """Complete a multipart upload by supplying `{ETag, PartNumber}` for each part."""
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    """
+    Complete a multipart upload by supplying `{ETag, PartNumber}` for each part.
+
+    Returns
+    -------
+    200 JSON
+        `{ "message": "Upload complete", "storage_key": str }`
+    """
     set_sensitive_cache(response)
 
     if isinstance(payload, dict):
         payload = MultipartCompleteIn.model_validate(payload)
 
-    # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
+    # AuthZ + MFA
     from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
@@ -345,7 +424,14 @@ async def multipart_complete(
         raise HTTPException(status_code=503, detail=f"Complete failed: {e}")
 
     try:
-        await audit_log_service.log_audit_event(None, user=current_user, action="MULTIPART_COMPLETE", status="SUCCESS", request=request, meta_data={"storage_key": payload.key, "upload_id": uploadId})
+        await log_audit_event(
+            None,
+            user=current_user,
+            action="MULTIPART_COMPLETE",
+            status="SUCCESS",
+            request=request,
+            meta_data={"storage_key": payload.key, "upload_id": uploadId},
+        )
     except Exception:
         pass
 
@@ -364,14 +450,20 @@ async def multipart_abort(
     response: Response,
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
-    """Abort a multipart upload."""
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    """
+    Abort a multipart upload.
+
+    Returns
+    -------
+    200 JSON
+        `{ "message": "Upload aborted" }`
+    """
     set_sensitive_cache(response)
 
     if isinstance(payload, dict):
         payload = MultipartAbortIn.model_validate(payload)
 
-    # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
+    # AuthZ + MFA
     from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
@@ -383,7 +475,14 @@ async def multipart_abort(
         raise HTTPException(status_code=503, detail=f"Abort failed: {e}")
 
     try:
-        await audit_log_service.log_audit_event(None, user=current_user, action="MULTIPART_ABORT", status="SUCCESS", request=request, meta_data={"storage_key": payload.key, "upload_id": uploadId})
+        await log_audit_event(
+            None,
+            user=current_user,
+            action="MULTIPART_ABORT",
+            status="SUCCESS",
+            request=request,
+            meta_data={"storage_key": payload.key, "upload_id": uploadId},
+        )
     except Exception:
         pass
 
@@ -401,23 +500,37 @@ async def direct_proxy_upload(
     response: Response,
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
-    """Directly proxy small files (≤ 10 MiB) into S3 by base64 payload.
-
-    This is meant for tiny admin assets (icons, thumbnails). For larger files,
-    prefer multipart uploads to avoid memory pressure.
     """
-    # ── [Step 0] Cache hardening ─────────────────────────────────────────────
+    Directly proxy small files (≤ 10 MiB) into S3 by base64 payload.
+
+    Intended for tiny admin assets (icons, thumbnails). For larger files, prefer
+    multipart uploads to avoid memory pressure.
+
+    Returns
+    -------
+    200 JSON
+        `{ "storage_key": str }`
+
+    Raises
+    ------
+    400
+        If the base64 payload is invalid.
+    413
+        If the decoded payload exceeds 10 MiB.
+    503
+        If storage is temporarily unavailable.
+    """
     set_sensitive_cache(response)
 
     if isinstance(payload, dict):
         payload = DirectProxyIn.model_validate(payload)
 
-    # ── [Step 1] AuthZ + MFA ────────────────────────────────────────────────
+    # AuthZ + MFA
     from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
 
-    # ── [Step 2] Decode + size guard ────────────────────────────────────────
+    # Decode + size guard
     try:
         data = base64.b64decode(payload.data_base64, validate=True)
     except Exception:
@@ -440,7 +553,14 @@ async def direct_proxy_upload(
         raise HTTPException(status_code=503, detail=str(e))
 
     try:
-        await audit_log_service.log_audit_event(None, user=current_user, action="DIRECT_UPLOAD_PROXY", status="SUCCESS", request=request, meta_data={"storage_key": key, "size": len(data)})
+        await log_audit_event(
+            None,
+            user=current_user,
+            action="DIRECT_UPLOAD_PROXY",
+            status="SUCCESS",
+            request=request,
+            meta_data={"storage_key": key, "size": len(data)},
+        )
     except Exception:
         pass
 
