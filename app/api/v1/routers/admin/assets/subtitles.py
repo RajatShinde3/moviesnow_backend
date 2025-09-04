@@ -25,7 +25,6 @@ Security & Operations
 
 Replace or align imports to match your app's package layout if needed.
 """
-from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Imports
@@ -34,7 +33,7 @@ from typing import List, Optional, Dict, Any
 from uuid import UUID, uuid4
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status, Body
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update, delete, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,7 +44,8 @@ from app.core.security import get_current_user
 from app.core.redis_client import redis_wrapper
 from app.db.session import get_async_db
 from app.security_headers import set_sensitive_cache
-from app.services.audit_log_service import log_audit_event
+# Import module so tests can monkeypatch audit reliably
+import app.services.audit_log_service as audit_log_service
 
 # Domain models / enums (adjust to your app)
 from app.db.models.user import User
@@ -95,14 +95,15 @@ async def _ensure_title_exists(db: AsyncSession, title_id: UUID) -> None:
         raise HTTPException(status_code=404, detail="Title not found")
 
 
-def _build_subtitle_key(*, title_id: UUID, subtitle_id: UUID, content_type: str, language: str) -> str:
+def _build_subtitle_key(*, title_id: UUID, subtitle_id: UUID, fmt: SubtitleFormat, language: str) -> str:
     """Construct a stable hierarchical storage key for subtitle assets.
 
     Example::
         subs/title/{title_id}/en-US/{subtitle_id}.vtt
     """
     lang = (language or "und").replace("/", "-")
-    return f"subs/title/{title_id}/{lang}/{subtitle_id}.{_ext_for_mime(content_type)}"
+    ext = "VTT" if fmt == SubtitleFormat.VTT else "SRT"
+    return f"subs/title/{title_id}/{lang}/{subtitle_id}.{ext}"
 
 
 def _ensure_mime_matches_format(content_type: str, fmt: SubtitleFormat) -> None:
@@ -110,7 +111,7 @@ def _ensure_mime_matches_format(content_type: str, fmt: SubtitleFormat) -> None:
     if ct not in ALLOWED_SUBS_MIME:
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Unsupported subtitle content‑type")
     if fmt == SubtitleFormat.VTT and ct != "text/vtt":
-        raise HTTPException(status_code=400, detail="For VTT format, content_type must be text/vtt")
+        raise HTTPException(status_code=400, detail="For VTT format, content_type must be text/VTT")
     if fmt == SubtitleFormat.SRT and ct != "application/x-subrip":
         raise HTTPException(status_code=400, detail="For SRT format, content_type must be application/x-subrip")
 
@@ -163,10 +164,10 @@ class SubtitlePatchIn(BaseModel):
 @router.post("/titles/{title_id}/subtitles", summary="Create subtitle (presigned PUT + rows)")
 @rate_limit("10/minute")
 async def create_subtitle(
-    title_id: UUID,
-    payload: SubtitleCreateIn | Dict[str, Any],
     request: Request,
     response: Response,
+    title_id: UUID,
+    payload: SubtitleCreateIn | Dict[str, Any] = Body(..., description="Subtitle creation payload"),
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, str]:
@@ -244,7 +245,7 @@ async def create_subtitle(
         )
 
     # ── [Step 5] Presign storage key ────────────────────────────────────────
-    key = _build_subtitle_key(title_id=title_id, subtitle_id=track.id, content_type=payload.content_type, language=lang)
+    key = _build_subtitle_key(title_id=title_id, subtitle_id=track.id, fmt=payload.format, language=lang)
     try:
         setattr(asset, "storage_key", key)
     except Exception:
@@ -262,7 +263,7 @@ async def create_subtitle(
         except Exception:
             pass
     try:
-        await log_audit_event(db, user=current_user, action="SUBTITLE_CREATE", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "subtitle_id": str(track.id)})
+        await audit_log_service.log_audit_event(db, user=current_user, action="SUBTITLE_CREATE", status="SUCCESS", request=request, meta_data={"title_id": str(title_id), "subtitle_id": str(track.id)})
     except Exception:
         pass
 
@@ -394,7 +395,7 @@ async def patch_subtitle(
         await db.commit()
 
     try:
-        await log_audit_event(
+        await audit_log_service.log_audit_event(
             db, user=current_user, action="SUBTITLE_PATCH", status="SUCCESS", request=request,
             meta_data={"subtitle_id": str(subtitle_id), "fields": list(updates.keys())}
         )
@@ -464,7 +465,7 @@ async def delete_subtitle(
             pass
 
     try:
-        await log_audit_event(db, user=current_user, action="SUBTITLE_DELETE", status="SUCCESS", request=request, meta_data={"subtitle_id": str(subtitle_id)})
+        await audit_log_service.log_audit_event(db, user=current_user, action="SUBTITLE_DELETE", status="SUCCESS", request=request, meta_data={"subtitle_id": str(subtitle_id)})
     except Exception:
         pass
 
