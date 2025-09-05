@@ -217,4 +217,59 @@ Adjusting streaming tiers
 - “How do we upload?” → Presigned PUT (single or multipart) for clients; server‑side proxy only for small files.
 
 
+
+
+## 12) Admin Upload Checklist (Required vs Optional)
+
+Purpose
+- Clarifies which artifacts are required vs optional to support streaming and downloads for Movies and Series.
+
+Summary
+- Nothing is “globally compulsory”: you choose what to offer to users. The backend supports streaming only, downloads only, or both.
+- To enable each user-facing capability, the following artifacts must exist.
+
+Movies
+- Streaming (required for streaming UX):
+  - Prepare HLS streamable variants derived from a MediaAsset.
+  - Ensure you have StreamVariant rows for tiers 1080p/720p/480p with `is_streamable=true` and protocol HLS.
+  - Not required if you don’t intend to let users stream (download-only releases are allowed).
+- Downloads (optional):
+  - Curated movie files under `downloads/{title_id}/...` (e.g., MP4).
+  - For each downloadable file, create a StreamVariant with `protocol=MP4`, container/codec fields set, and `url_path` pointing to the storage key.
+  - Movie “extras” ZIPs (optional) under `downloads/{title_id}/extras/... .zip`.
+
+Series
+- Streaming (required for streaming UX):
+  - Prepare HLS streamable variants for episodes (per-episode variants derived from episode MediaAssets) with `is_streamable=true` and protocol HLS; keep tiers 1080p/720p/480p.
+  - Not required if you only want download delivery.
+- Downloads (optional): choose any combination:
+  - Per‑episode curated files under `downloads/{title_id}/{episode_id}/...` (e.g., MP4). For each file, create a StreamVariant with `protocol=MP4` and `url_path` set to the storage key.
+  - Season bundle ZIP under `bundles/{title_id}/S{season:02}.zip` (recommended for simple download UX and CDN efficiency).
+  - Series “extras” ZIPs under `downloads/{title_id}/extras/... .zip`.
+
+What you must do for each capability
+- Streaming playback
+  - Upload HLS ladders (or generate them) for each Title/Episode you want to stream.
+  - Insert StreamVariant rows for each ladder rendition with `is_streamable=true`, `protocol=HLS`, and the technical fields (container, codecs, width/height, bandwidth).
+  - Keep at most one streamable variant per (asset, tier).
+- Curated video downloads (movies or episodes)
+  - Upload MP4/M4V/MOV/WEBM files under the `downloads/` namespace using admin uploads (single or multipart presigns).
+  - Insert StreamVariant rows for each downloadable file with `protocol=MP4`, `container=MP4` (or appropriate), codec fields, resolution, and `url_path` set to the storage key (relative).
+  - These appear in public download listings and can be presigned via Delivery.
+- Season ZIP downloads (series)
+  - Create a Bundle row (admin bundles) and upload the zip to `bundles/{title_id}/S{season:02}.zip`.
+  - Optionally provide a manifest JSON.
+- Extras ZIPs (movies or series)
+  - Upload curated ZIPs under `downloads/{title_id}/extras/... .zip`.
+
+Recommended key shapes
+- Movies downloadable files: `downloads/{title_id}/video/{quality}/{codec}/{nice_name}.mp4`
+- Episodes downloadable files: `downloads/{title_id}/{episode_id}/video/{quality}/{codec}/{nice_name}.mp4`
+- Season bundles: `bundles/{title_id}/S{season:02}.zip`
+- Extras ZIPs: `downloads/{title_id}/extras/{package_name}.zip`
+
+Notes
+- The public Delivery layer presigns only: `bundles/**.zip`, `downloads/**/extras/**.zip`, and curated video files under `downloads/**` with allowed extensions.
+- Raw masters (e.g., `originals/**`) and HLS internals aren’t presigned for public download.
+
 — End of document —
