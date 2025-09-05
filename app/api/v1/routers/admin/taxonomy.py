@@ -38,7 +38,6 @@ Security & Ops Practices
 
 Adjust imports/paths for your project structure.
 """
-from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 Imports
@@ -49,7 +48,8 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete, insert, and_, or_, func, text
 
@@ -67,7 +67,7 @@ from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import log_audit_event
 
 # Router (admin prefix recommended)
-router = APIRouter(prefix="/api/v1/admin", tags=["Admin • Taxonomy & Credits"])
+router = APIRouter(tags=["Admin • Taxonomy & Credits"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,7 +77,8 @@ _slug_re = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 def _json(data: Any, status_code: int = 200) -> JSONResponse:
-    return JSONResponse(data, status_code=status_code, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+    return JSONResponse(content=jsonable_encoder(data), status_code=status_code, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
 
 
 def _ser_genre(g: Genre) -> Dict[str, Any]:
@@ -155,15 +156,26 @@ class CreditPatchIn(BaseModel):
     is_guest: Optional[bool] = None
     is_cameo: Optional[bool] = None
 
-
-class BlockIn(BaseModel):
-    regions: List[str] = Field(..., description="ISO‑3166‑1 alpha‑2 codes, e.g., ['US','IN']")
-    system: CertificationSystem = CertificationSystem.OTHER
-    rating_code: Optional[str] = Field(None, description="Board‑specific rating (e.g., 'PG‑13', '18')")
-    min_age: Optional[int] = Field(None, ge=0, le=21)
-    notes: Optional[str] = None
+class BlockInLoose(BaseModel):
+    regions: list[str] | None = None
+    system: str
+    rating_code: str | None = None
+    min_age: int | None = None
+    notes: str | None = None
     unpublish: bool = False
 
+    @field_validator("system")
+    @classmethod
+    def _norm_system(cls, v: str) -> str:
+        if not v:
+            return "OTHER"
+        v = v.strip().upper()
+        if v == "TVPG":
+            v = "TV"
+        allowed = {"MPAA", "TV", "BBFC", "CBFC", "FSK", "ACB", "OFLC", "EIRIN", "CNC", "IFCO", "OTHER"}
+        if v not in allowed:
+            raise ValueError("system must be one of: " + ", ".join(sorted(allowed)))
+        return v
 
 class DMCAIn(BaseModel):
     reason: Optional[str] = None
@@ -283,7 +295,7 @@ async def list_genres(
     stmt = stmt.order_by(Genre.display_order.asc().nulls_last(), Genre.name.asc()).offset(offset).limit(limit)
 
     rows = (await db.execute(stmt)).scalars().all() or []
-    return _json([_ser_genre(g) for g in rows])
+    return [_ser_genre(g) for g in rows]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ✏️ Patch genre (row lock + redis lock)
@@ -639,7 +651,7 @@ async def delete_credit(
 @rate_limit("10/minute")
 async def compliance_block_title(
     title_id: UUID,
-    payload: BlockIn | Dict[str, Any],
+    payload: BlockInLoose | Dict[str, Any],
     request: Request,
     response: Response,
     db: AsyncSession = Depends(get_async_db),
@@ -660,7 +672,7 @@ async def compliance_block_title(
     await _ensure_mfa(request)
 
     if isinstance(payload, dict):
-        payload = BlockIn.model_validate(payload)
+        payload = BlockInLoose.model_validate(payload)
 
     async with redis_wrapper.lock(f"lock:admin:compliance:block:{title_id}", timeout=15, blocking_timeout=5):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
@@ -669,7 +681,7 @@ async def compliance_block_title(
 
         regions = [r.strip().upper() for r in (payload.regions or []) if r and r.strip()]
         if not regions or any(len(r) != 2 for r in regions):
-            raise HTTPException(status_code=400, detail="regions must be ISO‑3166‑1 alpha‑2")
+            raise HTTPException(status_code=400, detail="regions must be ISO-3166-1 alpha-2")
 
         for region in regions:
             await db.execute(
