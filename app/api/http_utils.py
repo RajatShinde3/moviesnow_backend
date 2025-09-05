@@ -35,6 +35,10 @@ from fastapi.responses import JSONResponse
 
 # Public re-export used elsewhere in your codebase
 from app.core.cache import TTLCache  # re-export for compatibility
+from app.db.models.availability import Availability  # optional: availability gating
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from datetime import datetime, timezone
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -350,6 +354,68 @@ def require_admin(request: Request):
         return
 
     raise HTTPException(status_code=403, detail="Admin privileges required")
+
+
+# Availability / certification gating (opt-in via env FEATURE_ENFORCE_AVAILABILITY=1)
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return str(v).lower() in {"1", "true", "yes", "on"}
+
+
+def get_request_country(request: Request) -> str:
+    """Best-effort country detection from common proxy/CDN headers.
+    Returns uppercased ISO-3166-1 alpha-2 or empty string if unknown.
+    """
+    for h in ("cf-ipcountry", "x-country", "x-geo-country", "x-app-country"):
+        v = request.headers.get(h) or request.headers.get(h.upper())
+        if v and len(v.strip()) >= 2:
+            return v.strip()[:2].upper()
+    return ""
+
+
+async def enforce_availability_for_download(
+    request: Request,
+    db: AsyncSession,
+    *,
+    title_id: str,
+    episode_id: str | None = None,
+) -> None:
+    """If enabled by env, ensure downloads are allowed by Availability.
+
+    Logic (conservative):
+      - If no Availability rows exist for the scope, allow (backwards compatible).
+      - If rows exist, require at least one active window matching the requester country.
+    """
+    if not _bool_env("FEATURE_ENFORCE_AVAILABILITY", False):
+        return
+    country = get_request_country(request)
+    # If we cannot determine the country, allow (avoid false negatives behind proxies)
+    if not country:
+        return
+    try:
+        q = select(Availability).where(Availability.title_id == title_id)
+        if episode_id:
+            q = q.where(Availability.episode_id == episode_id)
+        result = await db.execute(q)
+        rows = list(result.scalars().all())
+        if not rows:
+            return
+        now = datetime.now(timezone.utc)
+        for av in rows:
+            try:
+                if av.is_active_at(now) and av.applies_to_country(country):
+                    return
+            except Exception:
+                continue
+        raise HTTPException(status_code=403, detail="Not available in your region or window")
+    except HTTPException:
+        raise
+    except Exception:
+        # Fail-open to avoid breaking existing behavior if DB or model errors occur
+        return
 
 
 # ─────────────────────────────────────────────────────────────────────────────

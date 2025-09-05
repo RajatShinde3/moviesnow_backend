@@ -1,163 +1,63 @@
-# app/core/exception_handlers.py
 from __future__ import annotations
 
 """
-MoviesNow — Exception Handlers (production-grade)
--------------------------------------------------
-Structured, secure, and consistent exception handling for FastAPI/Starlette.
+Problem+JSON exception handlers (RFC 7807).
 
-Goals
------
-- One JSON shape for all errors (problem-like), with `request_id` correlation
-- No secret leakage; optionally include debug traces based on env
-- Preserve HTTP semantics (status code, headers like WWW-Authenticate)
-- Helpful, bounded validation details (422)
-- Minimal dependencies; pure FastAPI/Starlette
-
-Environment knobs
------------------
-- `APP_DEBUG` → when set to truthy ("1", "true"), include exception class name
-  and minimal traceback info in logs; response stays generic for 500s.
+FastAPI integrates these via app/main.py when this module is present.
+All HTTP errors are rendered as application/problem+json with a stable schema.
 """
 
-from typing import Any, Dict, List, Optional
-import logging
-import os
-import traceback
-
-from fastapi import Request
+from typing import Dict
+from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
-
-logger = logging.getLogger("moviesnow")
-_DEBUG = os.getenv("APP_DEBUG", "").lower() in {"1", "true", "yes"}
 
 
-# ─────────────────────────────────────────────────────────────
-# 🆔 Request Helper
-# ─────────────────────────────────────────────────────────────
-def get_request_id(request: Request) -> str:
-    """Return the current request id or "N/A".
-
-    The `RequestIDMiddleware` attaches `request.state.request_id`.
-    """
-    return getattr(request.state, "request_id", "N/A")
-
-
-# ─────────────────────────────────────────────────────────────
-# 🧱 Response shaping helper
-# ─────────────────────────────────────────────────────────────
-def _problem_json(
-    *,
-    request: Request,
-    status_code: int,
-    message: str,
-    code: Optional[int] = None,
-    details: Optional[Any] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Build the canonical error body used across handlers.
-
-    Keys:
-    - error: bool (always True)
-    - message: human readable summary
-    - code: HTTP status code
-    - request_id: correlation id
-    - details: optional machine-readable info (e.g., validation)
-    - ...(any vetted extra fields)
-    """
-    body: Dict[str, Any] = {
-        "error": True,
-        "message": str(message or "Error"),
-        "code": int(code or status_code),
-        "request_id": get_request_id(request),
-    }
-    if details is not None:
-        body["details"] = details
-    if extra:
-        # Drop any obviously sensitive keys before merging
-        for k in ("token", "authorization", "password", "secret"):
-            extra.pop(k, None)
-        body.update(extra)
-    return body
-
-
-# ─────────────────────────────────────────────────────────────
-# ⚠️ HTTP Exception Handler
-# ─────────────────────────────────────────────────────────────
-async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """Handle `HTTPException` with structured JSON."""
-    log_extra = {"request_id": get_request_id(request), "path": request.url.path, "status": exc.status_code}
-    logger.warning(f"HTTPException: {exc.detail}", extra=log_extra)
-
-    body = _problem_json(
-        request=request,
-        status_code=exc.status_code,
-        message=str(exc.detail or "HTTP error"),
-        code=exc.status_code,
+def _problem(title: str, detail: str, status_code: int, request: Request) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "type": "about:blank",
+            "title": title,
+            "detail": detail,
+            "status": status_code,
+            "instance": str(request.url),
+        },
+        media_type="application/problem+json",
     )
 
-    # Preserve headers like `WWW-Authenticate`
-    headers = getattr(exc, "headers", None)
-    return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
+
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:  # type: ignore
+    title = exc.__class__.__name__.replace("Exception", "").strip() or "Error"
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    return _problem(title, detail, exc.status_code, request)
 
 
-# ─────────────────────────────────────────────────────────────
-# ❌ Validation Error Handler (422)
-# ─────────────────────────────────────────────────────────────
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Return 422 with compact, bounded validation details."""
-    # Normalize and bound details
-    errors: List[Dict[str, Any]] = []
-    for e in exc.errors()[:100]:  # hard cap to avoid huge payloads
-        errors.append(
-            {
-                "loc": e.get("loc"),
-                "msg": e.get("msg"),
-                "type": e.get("type"),
-            }
-        )
-
-    # Log (sanitized)
-    logger.warning(
-        "Validation error",
-        extra={"request_id": get_request_id(request), "count": len(errors), "path": request.url.path},
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:  # type: ignore
+    detail = "Validation error"
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "type": "about:blank",
+            "title": detail,
+            "detail": detail,
+            "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "instance": str(request.url),
+            "errors": exc.errors(),
+        },
+        media_type="application/problem+json",
     )
 
-    # Shape response
-    body = _problem_json(
-        request=request,
-        status_code=HTTP_422_UNPROCESSABLE_ENTITY,
-        message="Validation failed",
-        code=HTTP_422_UNPROCESSABLE_ENTITY,
-        details=errors,
-    )
-    return JSONResponse(status_code=HTTP_422_UNPROCESSABLE_ENTITY, content=body)
+
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:  # type: ignore
+    # Hide internals; logs elsewhere should capture stack traces.
+    return _problem("Internal Server Error", "An unexpected error occurred.", status.HTTP_500_INTERNAL_SERVER_ERROR, request)
 
 
-# ─────────────────────────────────────────────────────────────
-# 🔥 Global Exception Handler (Fallback 500)
-# ─────────────────────────────────────────────────────────────
-async def global_exception_handler(request: Request, exc: Exception):
-    """Catch-all handler: log details, return generic 500 body.
+__all__ = [
+    "http_exception_handler",
+    "validation_exception_handler",
+    "global_exception_handler",
+]
 
-    In debug mode we log the traceback, but we never include it in the response.
-    """
-    req_id = get_request_id(request)
-    tb = traceback.format_exc() if _DEBUG else None
-    log_extra = {"request_id": req_id, "path": request.url.path, "exc": exc.__class__.__name__}
-
-    if _DEBUG:
-        logger.exception("Unhandled exception", extra={**log_extra, "trace": tb})
-    else:
-        logger.exception("Unhandled exception", extra=log_extra)
-
-    body = _problem_json(
-        request=request,
-        status_code=500,
-        message="Internal Server Error",
-        code=500,
-    )
-    return JSONResponse(status_code=500, content=body)

@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.http_utils import enforce_public_api_key, rate_limit
+from app.api.http_utils import enforce_public_api_key, rate_limit, enforce_availability_for_download
 from app.db.session import get_async_db
 from app.db.models.media_asset import MediaAsset
 from app.db.models.stream_variant import StreamVariant
@@ -220,6 +220,9 @@ async def title_download_manifest(
     * `include_meta=1` adds S3 HEAD meta; failures are soft and ignored.
     """
     ttl = _env_int("PUBLIC_DOWNLOADS_CACHE_TTL", 60)
+    await enforce_availability_for_download(request, db, title_id=str(title_id))
+    # Optional availability gating (title-level)
+    await enforce_availability_for_download(request, db, title_id=str(title_id))
 
     q = (
         select(StreamVariant)
@@ -289,6 +292,8 @@ async def episode_download_manifest(
       alternatives, including delivery guidance.
     """
     ttl = _env_int("PUBLIC_DOWNLOADS_CACHE_TTL", 60)
+    await enforce_availability_for_download(request, db, title_id=str(title_id), episode_id=str(episode_id))
+    # Optional availability gating (episode-level)
     q = (
         select(StreamVariant)
         .join(MediaAsset, StreamVariant.media_asset_id == MediaAsset.id)

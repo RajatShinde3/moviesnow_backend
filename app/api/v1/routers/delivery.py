@@ -42,10 +42,13 @@ from app.api.http_utils import (
     sanitize_filename,
     require_admin,
 )
+from app.api.http_utils import enforce_availability_for_download
+from app.db.session import transactional_async_session
 from app.core.redis_client import redis_wrapper
 from app.security_headers import set_sensitive_cache
 from app.utils.aws import S3Client, S3StorageError
 from app.core.config import settings
+from app.core.metrics import inc_presign, inc_token_minted
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Delivery (Public)"])
@@ -235,6 +238,20 @@ async def delivery_download_url(
     except Exception:
         raise HTTPException(status_code=503, detail="Token verification unavailable")
 
+    # Optional availability gating (infer title/episode from key)
+    try:
+        if os.environ.get("FEATURE_ENFORCE_AVAILABILITY") in {"1", "true", "True"}:
+            parts = key.split("/")
+            if len(parts) >= 2 and parts[0] == "downloads":
+                title_id = parts[1]
+                episode_id = parts[2] if len(parts) >= 3 and len(parts[2]) >= 36 else None
+                async with transactional_async_session() as db:
+                    await enforce_availability_for_download(request, db, title_id=title_id, episode_id=episode_id)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
     s3 = _s3()
     try:
         s3.client.head_object(Bucket=s3.bucket, Key=key)  # type: ignore[attr-defined]
@@ -252,7 +269,12 @@ async def delivery_download_url(
             response_content_disposition=disposition,
             response_content_type=ctype,
         )
+        # Metrics
+        keyspace = "bundles" if key.startswith("bundles/") else ("downloads" if key.startswith("downloads/") else "other")
+        inc_presign(keyspace, "ok")
     except S3StorageError as e:
+        keyspace = "bundles" if key.startswith("bundles/") else ("downloads" if key.startswith("downloads/") else "other")
+        inc_presign(keyspace, "error")
         raise HTTPException(status_code=503, detail=str(e))
 
     # ── [Step 4] Respond (no-store) ─────────────────────────────────────────
@@ -299,6 +321,7 @@ async def delivery_mint_token(
         except Exception:
             raise HTTPException(status_code=503, detail="Token store unavailable")
 
+    inc_token_minted()
     return json_no_store({"token": token, "storage_key": key, "expires_at": expires_at}, response=response)
 
 
