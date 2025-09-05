@@ -55,7 +55,6 @@ from app.schemas.player import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 router = APIRouter(
-    prefix="/player/sessions",
     tags=["Playback"],
     responses={
         400: {"description": "Bad Request"},
@@ -92,6 +91,7 @@ def _respond_202(request: Request) -> Response:
     """Return a 202 with strict no-store and correlation headers."""
     resp = Response(status_code=status.HTTP_202_ACCEPTED)
     resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Pragma"] = "no-cache"
     _echo_correlation_headers(request, resp)
     return resp
 
@@ -145,7 +145,7 @@ def _validate_session_id() -> Path:
 
     Adjust regex/lengths to match your generator.
     """
-    return Path(..., pattern=r"^[A-Za-z0-9_\-]{8,72}$", description="Playback session id")
+    return Path(..., pattern=r"^[A-Za-z0-9_\-]{2,128}$", description="Playback session id")
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -446,7 +446,15 @@ def get_session(
         rec = repo.get_session(session_id)
     except Exception:
         log.exception("get_session: repository error")
-        raise HTTPException(status_code=500, detail="Could not fetch session")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not fetch session",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
     if not rec:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
     return _respond_json(SessionSummary(**rec).model_dump(), status_code=200, request=request)
