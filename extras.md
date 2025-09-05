@@ -11,18 +11,17 @@ Scope
 ## 1) Packaging & What Users Receive
 
 High-level policy
-- Streaming is the primary delivery channel for playable content.
-- Public downloads enumerate only curated archives (ZIPs), not raw per‑episode/video files.
-- Admins can provision downloadable bundles and extras; public delivery is restricted to those keys.
+- Streaming is the primary delivery channel for playback.
+- Public downloads enumerate curated archives (ZIPs) and curated video files placed under the `downloads/` namespace.
+- Admins provision downloadable bundles, extras, and optional per-title/episode video renditions; public delivery is restricted to allowed paths and extensions.
 
 Series vs Movie
 - Series
   - Users stream episodes (via prepared stream variants).
-  - For downloads, users are offered season bundles (ZIP files) when provided by admins.
-  - Per‑episode raw downloads are intentionally not exposed in public flows.
+  - Downloads: users may receive curated per‑episode video files (e.g., MP4) when provided under `downloads/{title_id}/{episode_id}/...`, and/or season bundles (ZIPs).
 - Movies
   - Users stream the movie (via prepared stream variants).
-  - For downloads, “movie extras” can be offered as curated ZIPs. The raw movie file is not exposed as a public direct download by default policy.
+  - Downloads: users may receive curated per‑title video files (e.g., MP4) under `downloads/{title_id}/...`, plus “movie extras” ZIPs.
 
 Practical result for users
 - Stream: choose an allowed quality (see Tiers below); player uses standard ABR or selected rendition.
@@ -32,10 +31,11 @@ Practical result for users
   - No public per‑episode or raw movie file downloads by default.
 
 Policy enforcement location
-- Delivery layer only presigns GET URLs for storage keys in allowed namespaces:
+- Delivery layer presigns GET URLs only for keys in allowed namespaces/extensions:
   - `bundles/{title_id}/... .zip`
   - `downloads/{title_id}/.../extras/... .zip`
-- Other keys (e.g., “originals/…mp4” or raw HLS objects) are not presigned for public download.
+  - `downloads/{title_id}/...` and `downloads/{title_id}/{episode_id}/...` for curated video files with allowed extensions (e.g., `.mp4`, `.m4v`, `.mov`, `.webm`).
+- Other keys (e.g., `originals/...` or raw HLS objects) are not presigned for public download.
 
 
 ## 2) Streaming Model & Media Constraints
@@ -76,9 +76,11 @@ What’s downloadable
   - Optionally accompanied by a JSON manifest (validated and presigned when requested).
 - Extras archives:
   - Path: `downloads/{title_id}/extras/... .zip` (movie or series extras).
+- Curated video files:
+  - Paths under `downloads/{title_id}/...` for movie-level files and `downloads/{title_id}/{episode_id}/...` for episode-level files with allowed extensions.
 
-What’s not downloadable (by default)
-- Raw per-episode video files (e.g., `originals/...mp4`) are not presigned for public download.
+What’s not downloadable
+- Anything outside the `downloads/` or `bundles/` namespaces (e.g., `originals/...`) is not presigned for public download.
 - HLS/DASH objects are not presigned one-by-one for public download.
 
 How users get the ZIP
@@ -150,7 +152,7 @@ Downloading movie extras
 3) A short‑lived presigned GET URL is returned; user downloads the curated extras.
 
 What about downloading the movie or a single episode file?
-- By policy, direct raw downloads are not exposed to the public. If you need to permit that, place the file into an allowed “extras” ZIP or adjust delivery policy (see “Customizing Policy”).
+- Supported: curate and upload video files into the `downloads/` namespace (per title or per episode). They will be listed and presignable for users with short‑lived GET URLs.
 
 
 ## 7) Media Authoring Guidance
@@ -169,9 +171,9 @@ Recommended authoring for downloads
 ## 8) Security, Tokens, and Abuse Controls
 
 Abuse controls in delivery
-- Only presign allowed prefixes (bundles and extras ZIPs).
+- Only presign allowed prefixes: `bundles/`, `downloads/**/extras/**.zip`, and curated video extensions under `downloads/`.
 - Enforce a TTL clamp for signed URLs (min/max seconds) to prevent excessively long links.
-- Optional one‑time tokens can further gate access to a bundle; tokens are redeemed atomically and invalidated.
+- Optional one‑time tokens can further gate access to bundles; tokens are redeemed atomically and invalidated.
 
 General security
 - Signed URL responses are marked “no‑store”.
@@ -216,4 +218,3 @@ Adjusting streaming tiers
 
 
 — End of document —
-

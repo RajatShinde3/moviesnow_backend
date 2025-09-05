@@ -56,6 +56,7 @@ router = APIRouter(tags=["Delivery (Public)"])
 # Allowed object spaces for public delivery (defense-in-depth)
 _ALLOWED_PREFIXES: Tuple[str, ...] = ("bundles/", "downloads/")
 _ALLOWED_ZIP_EXT = ".zip"
+_ALLOWED_VIDEO_EXTS: Tuple[str, ...] = (".mp4", ".m4v", ".mov", ".webm")
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9/_\.\-]+$")  # pragmatic, single-bucket key space
 
 
@@ -95,14 +96,33 @@ def _is_allowed_public_download(key: str) -> bool:
     Public downloads are restricted for cost control and anti-abuse:
     - Season bundles under `bundles/**.zip`
     - Extras zip under `downloads/**/extras/**.zip`
+    - Curated video files under `downloads/**` with allowed extensions (e.g., mp4)
     """
-    if not key.endswith(_ALLOWED_ZIP_EXT):
-        return False
-    if key.startswith("bundles/"):
+    k = key.strip()
+    # Bundles (ZIP only)
+    if k.startswith("bundles/") and k.lower().endswith(_ALLOWED_ZIP_EXT):
         return True
-    if key.startswith("downloads/") and "/extras/" in key:
+    # Extras ZIPs
+    if k.startswith("downloads/") and "/extras/" in k and k.lower().endswith(_ALLOWED_ZIP_EXT):
+        return True
+    # Video files under downloads
+    if k.startswith("downloads/") and any(k.lower().endswith(ext) for ext in _ALLOWED_VIDEO_EXTS):
         return True
     return False
+
+
+def _guess_mime_from_ext(key: str) -> str:
+    """Return a reasonable Content-Type based on file extension."""
+    kl = key.lower()
+    if kl.endswith(".zip"):
+        return "application/zip"
+    if kl.endswith(".mp4") or kl.endswith(".m4v"):
+        return "video/mp4"
+    if kl.endswith(".webm"):
+        return "video/webm"
+    if kl.endswith(".mov"):
+        return "video/quicktime"
+    return "application/octet-stream"
 
 
 async def _redeem_optional_token(token: Optional[str], *, expected_key: Optional[str] = None) -> None:
@@ -202,7 +222,7 @@ async def delivery_download_url(
     # ── [Step 1] Validate key ───────────────────────────────────────────────
     key = _safe_key(payload.storage_key)
     if not _is_allowed_public_download(key):
-        raise HTTPException(status_code=403, detail="Downloads are restricted to season bundles and extras ZIPs")
+        raise HTTPException(status_code=403, detail="Downloads restricted to bundles/extras ZIPs and curated video files under downloads/")
 
     # ── [Step 2] HEAD existence check ───────────────────────────────────────
     s3 = _s3()
@@ -215,11 +235,12 @@ async def delivery_download_url(
     filename = _derive_download_filename(payload.attachment_filename, key)
     disposition = f'attachment; filename="{filename}"' if filename else None
     try:
+        ctype = _guess_mime_from_ext(key)
         url = s3.presigned_get(
             key,
             expires_in=ttl,
             response_content_disposition=disposition,
-            response_content_type="application/zip",  # assert ZIP for public delivery
+            response_content_type=ctype,
         )
     except S3StorageError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -286,11 +307,12 @@ async def delivery_batch_download_urls(
 
             fname = _derive_download_filename(it.attachment_filename, key)
             disp = f'attachment; filename="{fname}"' if fname else None
+            ctype = _guess_mime_from_ext(key)
             url = s3.presigned_get(
                 key,
                 expires_in=ttl,
                 response_content_disposition=disp,
-                response_content_type="application/zip",
+                response_content_type=ctype,
             )
             results.append({"index": idx, "storage_key": it.storage_key, "url": url})
         except Exception as e:
