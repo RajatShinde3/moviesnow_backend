@@ -24,7 +24,6 @@ Security & Operational Hardening
 - Structured audit logs (best-effort; must not block request flow).
 """
 
-from __future__ import annotations
 
 # ── [Imports] ─────────────────────────────────────────────────────────────────────────────
 from typing import Optional, List, Dict
