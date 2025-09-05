@@ -40,6 +40,7 @@ from app.api.http_utils import (
     rate_limit,
     json_no_store,
     sanitize_filename,
+    require_admin,
 )
 from app.core.redis_client import redis_wrapper
 from app.security_headers import set_sensitive_cache
@@ -174,6 +175,7 @@ class DownloadUrlIn(BaseModel):
     attachment_filename: Optional[str] = Field(
         None, description="If set, browsers download as this name"
     )
+    token: Optional[str] = Field(None, description="Optional one-time token to consume")
 
 
 class BatchItem(BaseModel):
@@ -225,6 +227,14 @@ async def delivery_download_url(
         raise HTTPException(status_code=403, detail="Downloads restricted to bundles/extras ZIPs and curated video files under downloads/")
 
     # ── [Step 2] HEAD existence check ───────────────────────────────────────
+    # Optional token redemption (bound to this key)
+    try:
+        await _redeem_optional_token(getattr(payload, "token", None), expected_key=key)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="Token verification unavailable")
+
     s3 = _s3()
     try:
         s3.client.head_object(Bucket=s3.bucket, Key=key)  # type: ignore[attr-defined]
@@ -247,6 +257,49 @@ async def delivery_download_url(
 
     # ── [Step 4] Respond (no-store) ─────────────────────────────────────────
     return json_no_store({"url": url}, response=response)
+
+
+# Admin: Mint one-time download token bound to a storage key
+class MintTokenIn(BaseModel):
+    storage_key: str
+    ttl_seconds: int = Field(600, ge=60, le=86400, description="Token TTL in seconds")
+
+
+@router.post("/delivery/mint-token", summary="Mint one-time token for a download (admin)")
+async def delivery_mint_token(
+    payload: MintTokenIn,
+    request: Request,
+    response: Response,
+    _rl=Depends(rate_limit),
+    _adm=Depends(require_admin),
+) -> Dict[str, object]:
+    set_sensitive_cache(response)
+    key = _safe_key(payload.storage_key)
+    if not _is_allowed_public_download(key):
+        raise HTTPException(status_code=403, detail="Forbidden key namespace")
+
+    # Generate token
+    try:
+        import secrets
+        token = secrets.token_urlsafe(24)
+    except Exception:  # pragma: no cover
+        import uuid
+        token = uuid.uuid4().hex
+
+    ttl = _clamp_ttl(int(payload.ttl_seconds))
+    import time as _time
+    expires_at = int(_time.time()) + ttl
+    data = {"storage_key": key, "expires_at": expires_at}
+    try:
+        await redis_wrapper.json_set(f"download:token:{token}", data)
+        await redis_wrapper.client.expire(f"download:token:{token}", ttl)  # type: ignore
+    except Exception:
+        try:
+            await redis_wrapper.client.setex(f"download:token:{token}", ttl, "1")  # type: ignore
+        except Exception:
+            raise HTTPException(status_code=503, detail="Token store unavailable")
+
+    return json_no_store({"token": token, "storage_key": key, "expires_at": expires_at}, response=response)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

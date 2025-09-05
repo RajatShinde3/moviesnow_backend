@@ -272,4 +272,20 @@ Notes
 - The public Delivery layer presigns only: `bundles/**.zip`, `downloads/**/extras/**.zip`, and curated video files under `downloads/**` with allowed extensions.
 - Raw masters (e.g., `originals/**`) and HLS internals aren’t presigned for public download.
 
+## 13) Added Endpoints (Summary)
+- Public
+  - GET /api/v1/titles/{title_id}/downloads
+  - GET /api/v1/titles/{title_id}/episodes/{episode_id}/downloads
+  - GET /api/v1/titles/{title_id}/download-manifest
+  - GET /api/v1/titles/{title_id}/episodes/{episode_id}/download-manifest
+- Delivery
+  - POST /api/v1/delivery/download-url (supports optional one-time token)
+  - POST /api/v1/delivery/batch-download-urls
+  - POST /api/v1/delivery/bundle-url (token supported)
+  - POST /api/v1/delivery/mint-token (admin)
+- Admin
+  - POST /api/v1/admin/titles/{title_id}/downloads/register
+  - POST /api/v1/admin/titles/{title_id}/episodes/{episode_id}/downloads/register
+  - PATCH /api/v1/admin/streams/{variant_id}/toggle-downloadable
+
 — End of document —

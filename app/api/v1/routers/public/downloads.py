@@ -3,13 +3,15 @@
 # ║ 📦🎧 MoviesNow · Public Downloads (Restricted)                           ║
 # ║                                                                          ║
 # ║ Endpoints (public + optional API key):                                   ║
-# ║  - GET /titles/{title_id}/downloads                 → Title-level list   ║
-# ║  - GET /titles/{title_id}/episodes/{episode_id}/... → Episode-level list ║
+# ║  - GET /titles/{title_id}/download-manifest           → Title manifest   ║
+# ║  - GET /titles/{title_id}/episodes/{episode_id}/...   → Episode manifest ║
+# ║  - GET /titles/{title_id}/downloads                   → Title downloads  ║
+# ║  - GET /titles/{title_id}/episodes/{episode_id}/...   → Episode downloads║
 # ╠──────────────────────────────────────────────────────────────────────────╣
 # ║ Policy                                                                   
 # ║  - Public routes **do not** expose raw per-episode downloadable assets.   ║
 # ║    Serve ZIP bundles via `/delivery/*` instead (cost & abuse control).    ║
-# ║  - These endpoints intentionally return empty lists with helpful hints.    ║
+# ║  - These endpoints intentionally return curated lists and guidance only.   ║
 # ║  - If you later relax policy, only expose ORIGINAL/DOWNLOAD/VIDEO kinds.  ║
 # ║                                                                           
 # ║ Security & Ops                                                            
@@ -23,23 +25,69 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
+from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.http_utils import enforce_public_api_key, rate_limit
 from app.db.session import get_async_db
-from app.db.models.title import Title
 from app.db.models.media_asset import MediaAsset
 from app.db.models.stream_variant import StreamVariant
 from app.schemas.enums import StreamProtocol
+from app.utils.aws import S3Client
 
 router = APIRouter(tags=["Public Downloads"])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📚 Pydantic response models (for nicer OpenAPI)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VariantOut(BaseModel):
+    storage_key: str = Field(..., description="Object key (path) in storage, relative (no leading slash).")
+    quality: Optional[str] = Field(None, description="Human-readable quality label (e.g., '1080p').")
+    width: Optional[int] = Field(None, description="Video width in pixels.")
+    height: Optional[int] = Field(None, description="Video height in pixels.")
+    bandwidth_kbps: int = Field(..., ge=0, description="Approx. bitrate in kbps.")
+    container: Optional[str] = Field(None, description="Container format name (e.g., MP4).")
+    video_codec: Optional[str] = Field(None, description="Video codec name (e.g., H264).")
+    audio_codec: Optional[str] = Field(None, description="Audio codec name (e.g., AAC).")
+    audio_language: Optional[str] = Field(None, description="IETF BCP 47 tag (e.g., 'en', 'hi').")
+    hdr: Optional[str] = Field(None, description="HDR format (if any).")
+    label: Optional[str] = Field(None, description="Curator-provided label for this variant.")
+    # Populated only when include_meta=1
+    size_bytes: Optional[int] = Field(None, ge=0, description="Object size (from HEAD).")
+    etag: Optional[str] = Field(None, description="Storage ETag (from HEAD).")
+
+
+class TitleManifestOut(BaseModel):
+    title_id: str
+    items: List[VariantOut]
+
+
+class EpisodeManifestOut(BaseModel):
+    title_id: str
+    episode_id: str
+    items: List[VariantOut]
+
+
+class TitleDownloadsOut(BaseModel):
+    title_id: str
+    videos: List[VariantOut]
+    alternatives: Dict[str, str]
+
+
+class EpisodeDownloadsOut(BaseModel):
+    title_id: str
+    episode_id: str
+    videos: List[VariantOut]
+    alternatives: Dict[str, str]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ⚙️ Utilities
@@ -53,12 +101,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _compute_etag(payload: Any) -> str:
-    """Strong ETag: quoted SHA-256 of canonical JSON."""
+    """Strong ETag: quoted SHA-256 of canonical JSON bytes."""
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f"\"{hashlib.sha256(raw).hexdigest()}\""
 
 
-def _parse_inm(value: str | None) -> list[str]:
+def _parse_inm(value: Optional[str]) -> list[str]:
     if not value:
         return []
     return [p.strip() for p in value.split(",") if p.strip()]
@@ -76,16 +124,22 @@ def _cached_json(
     payload: Any,
     *,
     ttl: int,
-    extra_headers: Dict[str, str] | None = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> JSONResponse:
     """
     Build a JSON response with **strong ETag** and CDN-friendly caching.
 
-    Steps
+    Behavior
+    --------
+    1) Compute payload ETag (quoted SHA-256 of canonical JSON).
+    2) Honor `If-None-Match` → return 304 (no body) if matches.
+    3) Set `Cache-Control`: public, short TTL with SWR for edge friendliness.
+    4) Add `Vary` for content negotiation, conditional request, and API key.
+
+    Notes
     -----
-    1) Compute payload ETag.
-    2) Honor `If-None-Match` → 304 if matches.
-    3) Set `Cache-Control` with short max-age and SWR.
+    * Using JSONResponse preserves explicit headers and avoids auto validation.
+    * Keep per-route `ttl` short to prevent stale manifests during operations.
     """
     etag = _compute_etag(payload)
     inm = _parse_inm(request.headers.get("If-None-Match") or request.headers.get("if-none-match"))
@@ -97,7 +151,9 @@ def _cached_json(
 
     resp.headers["ETag"] = etag
     resp.headers["Cache-Control"] = f"public, max-age={ttl}, s-maxage={ttl}, stale-while-revalidate=30"
-    resp.headers["Vary"] = "Accept, If-None-Match"
+    resp.headers["Vary"] = "Accept, If-None-Match, X-API-Key"
+    # Helpful hardening for JSON
+    resp.headers["X-Content-Type-Options"] = "nosniff"
     if extra_headers:
         for k, v in extra_headers.items():
             resp.headers[k] = v
@@ -105,28 +161,66 @@ def _cached_json(
     return resp
 
 
-# ╔════════════════════════════════ Endpoints ════════════════════════════════╗
+def _variant_dict(v: StreamVariant) -> Dict[str, Any]:
+    height = getattr(v, "height", None)
+    quality = (f"{height}p" if height else None)
+    return {
+        "storage_key": (getattr(v, "url_path", "") or "").lstrip("/"),
+        "quality": quality,
+        "width": getattr(v, "width", None),
+        "height": height,
+        "bandwidth_kbps": int(getattr(v, "bandwidth_bps", 0) or 0) // 1000,
+        "container": getattr(v, "container", None).name if getattr(v, "container", None) else None,
+        "video_codec": getattr(v, "video_codec", None).name if getattr(v, "video_codec", None) else None,
+        "audio_codec": getattr(v, "audio_codec", None).name if getattr(v, "audio_codec", None) else None,
+        "audio_language": getattr(v, "audio_language", None),
+        "hdr": getattr(v, "hdr", None).name if getattr(v, "hdr", None) else None,
+        "label": getattr(v, "label", None),
+    }
 
+
+# ╔════════════════════════════════ Route: Title Manifest ════════════════════╗
+# ║ 🧊📜  /titles/{title_id}/download-manifest                                  ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 @router.get(
-    "/titles/{title_id}/downloads",
-    summary="List downloadable assets for a title (videos + guidance)",
+    "/titles/{title_id}/download-manifest",
+    summary="Download manifest (title-level curated files)",
+    response_model=TitleManifestOut,
 )
-async def list_downloads(
+async def title_download_manifest(
     request: Request,
-    title_id: UUID = Path(..., description="Title ID (UUID)"),
+    title_id: UUID = Path(..., description="Title ID (UUID)."),
+    include_meta: int = Query(
+        0,
+        ge=0,
+        le=1,
+        description="If 1, performs storage HEAD to include size_bytes and etag per item.",
+    ),
     db: AsyncSession = Depends(get_async_db),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ) -> JSONResponse:
-    """Title-level downloads listing.
+    """
+    Return a curated set of **downloadable** title-level video files (e.g., MP4),
+    optimized for public distribution.
 
-    Returns public, downloadable video renditions (if provisioned) and guidance
-    for bundle/extras delivery. Only variants explicitly marked as downloadable
-    are listed (e.g., progressive MP4s under the downloads namespace).
+    Security
+    --------
+    * Optional `X-API-Key` check (anti-abuse).
+    * Rate-limited via dependency injection.
+
+    Caching
+    -------
+    * Strong ETag + `Cache-Control` (short TTL) for CDN friendliness.
+    * Honors `If-None-Match` → may respond `304 Not Modified`.
+
+    Notes
+    -----
+    * Only progressive/MP4 variants are listed (no HLS/DASH).
+    * `include_meta=1` adds S3 HEAD meta; failures are soft and ignored.
     """
     ttl = _env_int("PUBLIC_DOWNLOADS_CACHE_TTL", 60)
 
-    # Fetch downloadable variants scoped to title (no episode scope)
     q = (
         select(StreamVariant)
         .join(MediaAsset, StreamVariant.media_asset_id == MediaAsset.id)
@@ -134,7 +228,134 @@ async def list_downloads(
             MediaAsset.title_id == title_id,
             MediaAsset.season_id.is_(None),
             MediaAsset.episode_id.is_(None),
-            # Prefer explicit protocol for downloadable files
+            StreamVariant.protocol == StreamProtocol.MP4,
+        )
+        .order_by(StreamVariant.height.desc().nulls_last(), StreamVariant.bandwidth_bps.desc())
+    )
+    result = await db.execute(q)
+    items = [_variant_dict(v) for v in result.scalars().all()]
+
+    if include_meta:
+        try:
+            s3 = S3Client()
+            for it in items:
+                try:
+                    head = s3.client.head_object(Bucket=s3.bucket, Key=it["storage_key"])  # type: ignore[attr-defined]
+                    it["size_bytes"] = int(head.get("ContentLength") or 0)
+                    it["etag"] = head.get("ETag")
+                except Exception:
+                    # Soft-ignore missing objects or HEAD failures
+                    pass
+        except Exception:
+            pass
+
+    payload = {"title_id": str(title_id), "items": items}
+    return _cached_json(request, payload, ttl=ttl)
+
+
+# ╔════════════════════════════════ Route: Episode Manifest ══════════════════╗
+# ║ 🧊📜  /titles/{title_id}/episodes/{episode_id}/download-manifest           ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+@router.get(
+    "/titles/{title_id}/episodes/{episode_id}/download-manifest",
+    summary="Download manifest (episode-level curated files)",
+    response_model=EpisodeManifestOut,
+)
+async def episode_download_manifest(
+    request: Request,
+    title_id: UUID = Path(..., description="Title ID (UUID)."),
+    episode_id: UUID = Path(..., description="Episode ID (UUID)."),
+    include_meta: int = Query(
+        0,
+        ge=0,
+        le=1,
+        description="If 1, performs storage HEAD to include size_bytes and etag per item.",
+    ),
+    db: AsyncSession = Depends(get_async_db),
+    _rl=Depends(rate_limit),
+    _key=Depends(enforce_public_api_key),
+) -> JSONResponse:
+    """
+    Return a curated set of **downloadable** episode-level video files (MP4).
+
+    Semantics
+    ---------
+    * Episode scope only; excludes season/title generic assets.
+    * MP4/progressive variants only (no streaming manifests).
+
+    See also
+    --------
+    * Use `/titles/{title_id}/downloads` or episode variant for human-friendly
+      alternatives, including delivery guidance.
+    """
+    ttl = _env_int("PUBLIC_DOWNLOADS_CACHE_TTL", 60)
+    q = (
+        select(StreamVariant)
+        .join(MediaAsset, StreamVariant.media_asset_id == MediaAsset.id)
+        .where(
+            MediaAsset.title_id == title_id,
+            MediaAsset.episode_id == episode_id,
+            StreamVariant.protocol == StreamProtocol.MP4,
+        )
+        .order_by(StreamVariant.height.desc().nulls_last(), StreamVariant.bandwidth_bps.desc())
+    )
+    result = await db.execute(q)
+    items = [_variant_dict(v) for v in result.scalars().all()]
+
+    if include_meta:
+        try:
+            s3 = S3Client()
+            for it in items:
+                try:
+                    head = s3.client.head_object(Bucket=s3.bucket, Key=it["storage_key"])  # type: ignore[attr-defined]
+                    it["size_bytes"] = int(head.get("ContentLength") or 0)
+                    it["etag"] = head.get("ETag")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    payload = {"title_id": str(title_id), "episode_id": str(episode_id), "items": items}
+    return _cached_json(request, payload, ttl=ttl)
+
+
+# ╔════════════════════════════════ Route: Title Downloads ═══════════════════╗
+# ║ 🧱📥  /titles/{title_id}/downloads                                         ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+@router.get(
+    "/titles/{title_id}/downloads",
+    summary="List downloadable assets for a title (videos + guidance)",
+    response_model=TitleDownloadsOut,
+)
+async def list_downloads(
+    request: Request,
+    title_id: UUID = Path(..., description="Title ID (UUID)."),
+    db: AsyncSession = Depends(get_async_db),
+    _rl=Depends(rate_limit),
+    _key=Depends(enforce_public_api_key),
+) -> JSONResponse:
+    """
+    Title-level **downloads** listing.
+
+    Returns
+    -------
+    * `videos`: Curated progressive MP4 variants (if provisioned).
+    * `alternatives`: Pointers for bundle/extras delivery endpoints.
+
+    Policy
+    ------
+    * Only variants suitable for public downloading are surfaced.
+    * Prefer progressive MP4s under a dedicated downloads namespace.
+    """
+    ttl = _env_int("PUBLIC_DOWNLOADS_CACHE_TTL", 60)
+
+    q = (
+        select(StreamVariant)
+        .join(MediaAsset, StreamVariant.media_asset_id == MediaAsset.id)
+        .where(
+            MediaAsset.title_id == title_id,
+            MediaAsset.season_id.is_(None),
+            MediaAsset.episode_id.is_(None),
             StreamVariant.protocol == StreamProtocol.MP4,
         )
         .order_by(StreamVariant.height.desc().nulls_last(), StreamVariant.bandwidth_bps.desc())
@@ -142,26 +363,9 @@ async def list_downloads(
     result = await db.execute(q)
     variants: List[StreamVariant] = list(result.scalars().all())
 
-    def _mk(v: StreamVariant) -> Dict[str, Any]:
-        height = getattr(v, "height", None)
-        quality = (f"{height}p" if height else None)
-        return {
-            "storage_key": (v.url_path or "").lstrip("/"),
-            "quality": quality,
-            "width": getattr(v, "width", None),
-            "height": height,
-            "bandwidth_kbps": int(getattr(v, "bandwidth_bps", 0) or 0) // 1000,
-            "container": getattr(v, "container", None).name if getattr(v, "container", None) else None,
-            "video_codec": getattr(v, "video_codec", None).name if getattr(v, "video_codec", None) else None,
-            "audio_codec": getattr(v, "audio_codec", None).name if getattr(v, "audio_codec", None) else None,
-            "audio_language": getattr(v, "audio_language", None),
-            "hdr": getattr(v, "hdr", None).name if getattr(v, "hdr", None) else None,
-            "label": getattr(v, "label", None),
-        }
-
     payload: Dict[str, Any] = {
         "title_id": str(title_id),
-        "videos": [_mk(v) for v in variants],
+        "videos": [_variant_dict(v) for v in variants],
         "alternatives": {
             "bundle_list": f"/titles/{title_id}/bundles",
             "delivery_single": "/delivery/download-url",
@@ -171,19 +375,34 @@ async def list_downloads(
     return _cached_json(request, payload, ttl=ttl)
 
 
+# ╔════════════════════════════════ Route: Episode Downloads ═════════════════╗
+# ║ 🧱📥  /titles/{title_id}/episodes/{episode_id}/downloads                   ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 @router.get(
     "/titles/{title_id}/episodes/{episode_id}/downloads",
     summary="List downloadable assets for a specific episode (videos + guidance)",
+    response_model=EpisodeDownloadsOut,
 )
 async def list_episode_downloads(
-    title_id: UUID,
-    episode_id: UUID,
     request: Request,
+    title_id: UUID = Path(..., description="Title ID (UUID)."),
+    episode_id: UUID = Path(..., description="Episode ID (UUID)."),
     db: AsyncSession = Depends(get_async_db),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ) -> JSONResponse:
-    """Episode-level downloads listing (downloadable per-episode renditions)."""
+    """
+    Episode-level **downloads** listing.
+
+    Details
+    -------
+    * Episode-scoped MP4 variants only.
+    * Includes guidance to delivery endpoints for bundles/extras.
+
+    Caching & Validation
+    --------------------
+    * Strong ETag, short TTL, and `Vary: X-API-Key` for safety with public+key.
+    """
     ttl = _env_int("PUBLIC_DOWNLOADS_CACHE_TTL", 60)
 
     q = (
@@ -199,27 +418,10 @@ async def list_episode_downloads(
     result = await db.execute(q)
     variants: List[StreamVariant] = list(result.scalars().all())
 
-    def _mk(v: StreamVariant) -> Dict[str, Any]:
-        height = getattr(v, "height", None)
-        quality = (f"{height}p" if height else None)
-        return {
-            "storage_key": (v.url_path or "").lstrip("/"),
-            "quality": quality,
-            "width": getattr(v, "width", None),
-            "height": height,
-            "bandwidth_kbps": int(getattr(v, "bandwidth_bps", 0) or 0) // 1000,
-            "container": getattr(v, "container", None).name if getattr(v, "container", None) else None,
-            "video_codec": getattr(v, "video_codec", None).name if getattr(v, "video_codec", None) else None,
-            "audio_codec": getattr(v, "audio_codec", None).name if getattr(v, "audio_codec", None) else None,
-            "audio_language": getattr(v, "audio_language", None),
-            "hdr": getattr(v, "hdr", None).name if getattr(v, "hdr", None) else None,
-            "label": getattr(v, "label", None),
-        }
-
     payload: Dict[str, Any] = {
         "title_id": str(title_id),
         "episode_id": str(episode_id),
-        "videos": [_mk(v) for v in variants],
+        "videos": [_variant_dict(v) for v in variants],
         "alternatives": {
             "bundle_list": f"/titles/{title_id}/bundles",
             "delivery_single": "/delivery/download-url",
