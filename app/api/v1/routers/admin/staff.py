@@ -31,8 +31,6 @@ Security & Ops Practices
 - Structured audit logs (best-effort, never block)
 """
 
-from __future__ import annotations
-
 # ── [Imports] ─────────────────────────────────────────────────────────────────────────────
 from typing import List, Dict, Optional
 from uuid import UUID

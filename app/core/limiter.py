@@ -45,6 +45,9 @@ Usage
 """
 
 import os
+import asyncio
+import os as _os
+from functools import wraps
 from typing import Callable, Optional, List, Set
 
 from dotenv import load_dotenv
@@ -254,22 +257,56 @@ def rate_limit(*limits: str) -> Callable:
     """
     Apply per-route limits with MoviesNow exemptions.
 
+    Notes
+    -----
+    - When rate limiting is disabled via `RATE_LIMIT_ENABLED=false`, or
+      tests explicitly bypass via `RATE_LIMIT_TEST_BYPASS=1`, this becomes a
+      no-op to avoid wrapping endpoints with SlowAPI decorators. This keeps
+      route handlers as regular request functions so tests don't need to
+      unwrap ASGI apps across Starlette/SlowAPI versions.
+
     Examples
     --------
     @rate_limit("10/minute")
     @rate_limit("5/second", "100/minute")
     """
+    # If no limiter at all, always no-op.
     if limiter is None:
         def _noop(fn: Callable) -> Callable:
             return fn
         return _noop
 
     selected = list(limits) if limits else _build_default_limits()
-    decorators = [
+    limited_decorator = _chain([
         limiter.limit(limit_value, exempt_when=_exempt_when)
         for limit_value in selected
-    ]
-    return _chain(decorators)
+    ])
+
+    def _decorator(fn: Callable) -> Callable:
+        limited_fn = limited_decorator(fn)
+
+        # Preserve original signature for FastAPI and test unwrapping
+        if asyncio.iscoroutinefunction(fn):
+            @wraps(fn)
+            async def _wrapped(*args, **kwargs):
+                # Read env dynamically each call so tests can flip toggles after import
+                enabled = _os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+                bypass = _os.getenv("RATE_LIMIT_TEST_BYPASS", "").lower() in {"1", "true", "yes", "on"}
+                if not enabled or bypass:
+                    return await fn(*args, **kwargs)
+                return await limited_fn(*args, **kwargs)
+            return _wrapped
+        else:
+            @wraps(fn)
+            def _wrapped(*args, **kwargs):
+                enabled = _os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+                bypass = _os.getenv("RATE_LIMIT_TEST_BYPASS", "").lower() in {"1", "true", "yes", "on"}
+                if not enabled or bypass:
+                    return fn(*args, **kwargs)
+                return limited_fn(*args, **kwargs)
+            return _wrapped
+
+    return _decorator
 
 
 def rate_limit_exempt() -> Callable:
@@ -278,7 +315,31 @@ def rate_limit_exempt() -> Callable:
         def _noop(fn: Callable) -> Callable:
             return fn
         return _noop
-    return limiter.exempt
+
+    def _decorator(fn: Callable) -> Callable:
+        # Preserve signature and unwrap chain
+        if asyncio.iscoroutinefunction(fn):
+            @wraps(fn)
+            async def _wrapped(*args, **kwargs):
+                enabled = _os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+                bypass = _os.getenv("RATE_LIMIT_TEST_BYPASS", "").lower() in {"1", "true", "yes", "on"}
+                if not enabled or bypass:
+                    return await fn(*args, **kwargs)
+                decorated = limiter.exempt(fn)
+                return await decorated(*args, **kwargs)  # type: ignore[misc]
+            return _wrapped
+        else:
+            @wraps(fn)
+            def _wrapped(*args, **kwargs):
+                enabled = _os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+                bypass = _os.getenv("RATE_LIMIT_TEST_BYPASS", "").lower() in {"1", "true", "yes", "on"}
+                if not enabled or bypass:
+                    return fn(*args, **kwargs)
+                decorated = limiter.exempt(fn)
+                return decorated(*args, **kwargs)  # type: ignore[misc]
+            return _wrapped
+
+    return _decorator
 
 
 # ──────────────────────────────────────────────────────────────
