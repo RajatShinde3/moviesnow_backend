@@ -33,7 +33,6 @@ Security & Ops Practices
 - Best-effort structured audit logs (never blocks request flow)
 """
 
-from __future__ import annotations
 
 # ── [Imports] ─────────────────────────────────────────────────────────────────────────────
 from typing import List, Dict, Optional, Any
@@ -42,6 +41,7 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, status
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select, update, delete, and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -196,8 +196,12 @@ async def create_title(
     try:
         data = TitleCreateIn.model_validate(payload)
     except ValidationError as ve:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=ve.errors())
-
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=ve.errors(),
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+    
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
     set_sensitive_cache(response)
@@ -208,11 +212,19 @@ async def create_title(
     if idem_key:
         snap = await redis_wrapper.idempotency_get(idem_key)
         if snap:
-            return JSONResponse(snap, status_code=status.HTTP_200_OK)
+            return JSONResponse(
+                content=jsonable_encoder(snap),
+                status_code=status.HTTP_200_OK,
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
 
     # ── [Step 2] Slug uniqueness guard (defensive 409) ─────────────────────
     if await _slug_exists(db, data.slug):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug already exists")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Slug already exists",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
 
     # ── [Step 3] Persist (single-transaction) ───────────────────────────────
     t = Title(
@@ -255,8 +267,11 @@ async def create_title(
         except Exception:
             pass
 
-    return JSONResponse(body, status_code=status.HTTP_200_OK)
-
+    return JSONResponse(
+        content=jsonable_encoder(body),
+        status_code=status.HTTP_200_OK,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📚 List titles (filters/sort/paginate)
@@ -265,82 +280,118 @@ async def create_title(
 @rate_limit("30/minute")
 async def list_titles(
     request: Request,
-    response: Response,
+    response: Response,  # kept for DI symmetry; we set headers on the final response object below
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
-    type: Optional[TitleType] = Query(None),
-    status_: Optional[TitleStatus] = Query(None, alias="status"),
-    is_published: Optional[bool] = Query(None),
-    q: Optional[str] = Query(None, description="Search name/slug contains (case-insensitive)"),
+    type: Optional[TitleType] = Query(None, description="Filter by title type (e.g., MOVIE, SERIES)."),
+    status_: Optional[TitleStatus] = Query(None, alias="status", description="Filter by lifecycle status."),
+    is_published: Optional[bool] = Query(None, description="Filter by published flag."),
+    q: Optional[str] = Query(None, description="Case-insensitive substring match on name or slug."),
     sort: Optional[str] = Query(
         "-created_at",
-        description="Sort field (prefix '-' for desc). One of: created_at, popularity, rating, release_year",
+        description="Sort field (prefix with '-' for desc). One of: created_at, popularity, rating, release_year.",
     ),
-    limit: int = Query(20, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-):
+    limit: int = Query(20, ge=1, le=200, description="Page size (1..200)."),
+    offset: int = Query(0, ge=0, description="Offset for pagination (>= 0)."),
+) -> JSONResponse:
     """
-    Search and paginate **titles**.
+    Search, filter, sort, and paginate the **Title** catalog.
+
+    Security
+    --------
+    - Requires admin privileges (ensure_admin) and recent MFA (ensure_mfa).
 
     Filters
-    - `type`, `status`, `is_published`, `q` (name/slug contains; case-insensitive)
+    -------
+    - `type`: `TitleType` (e.g., `MOVIE`, `SERIES`)
+    - `status`: `TitleStatus` (e.g., `ANNOUNCED`, `RELEASED`)
+    - `is_published`: boolean
+    - `q`: case-insensitive substring match on `name` or `slug`
 
     Sorting
-    - `created_at`, `popularity`, `rating`, `release_year` (prefix with `-` for desc)
+    -------
+    - Allowed keys: `created_at`, `popularity`, `rating`, `release_year`
+    - Prefix with `-` for descending (default: `-created_at`)
 
     Pagination
-    - `limit` (1..200), `offset` (>=0)
-    - Adds `X-Total-Count` header when feasible (non-fatal if it fails).
+    ----------
+    - `limit` (default 20, range 1..200)
+    - `offset` (default 0)
+
+    Headers
+    -------
+    - `X-Total-Count`: total rows that match filters (best-effort; omitted on failure)
+    - Cache hardened via `Cache-Control: no-store` and `Pragma: no-cache`
+
+    Returns
+    -------
+    - JSON array of serialized titles.
     """
-    # ── [Step 0] Security & cache ───────────────────────────────────────────
+    # ── [Step 0] Security & cache hardening (applied later to final response) ─────
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
-    set_sensitive_cache(response, seconds=0)
 
-    # ── [Step 1] Build filters ──────────────────────────────────────────────
-    conds = []
-    if type:
-        conds.append(Title.type == type)
-    if status_:
-        conds.append(Title.status == status_)
+    # ── [Step 1] Build filter predicates safely ───────────────────────────────────
+    predicates = []
+    if type is not None:
+        predicates.append(Title.type == type)
+    if status_ is not None:
+        predicates.append(Title.status == status_)
     if is_published is not None:
-        conds.append(Title.is_published == bool(is_published))
-    if q:
-        s = q.strip().lower()
-        conds.append(or_(func.lower(Title.name).contains(s), func.lower(Title.slug).contains(s)))
+        predicates.append(Title.is_published == bool(is_published))
 
-    # ── [Step 2] Query & sort ───────────────────────────────────────────────
+    if q:
+        needle = q.strip()
+        if needle:
+            needle = needle.lower()
+            predicates.append(
+                or_(
+                    func.lower(Title.name).contains(needle),
+                    func.lower(Title.slug).contains(needle),
+                )
+            )
+
+    # ── [Step 2] Build base SELECT with sorting ──────────────────────────────────
     stmt = select(Title)
-    if conds:
-        stmt = stmt.where(and_(*conds))
+    if predicates:
+        stmt = stmt.where(and_(*predicates))
+
+    # Allow-list of sortable columns
+    sort_map = {
+        "created_at": Title.created_at,
+        "popularity": Title.popularity_score,
+        "rating": Title.rating_average,
+        "release_year": Title.release_year,
+    }
 
     if sort:
-        desc = sort.startswith("-")
-        key = sort.lstrip("-")
-        col = {
-            "created_at": Title.created_at,
-            "popularity": Title.popularity_score,
-            "rating": Title.rating_average,
-            "release_year": Title.release_year,
-        }.get(key, Title.created_at)
-        stmt = stmt.order_by(col.desc() if desc else col.asc())
+        is_desc = sort.startswith("-")
+        sort_key = sort.lstrip("-")
+        sort_col = sort_map.get(sort_key, Title.created_at)  # graceful fallback
+        stmt = stmt.order_by(sort_col.desc() if is_desc else sort_col.asc())
 
-    # Optional total count (best-effort; won’t block)
+    # ── [Step 3] Optional total count (best-effort, never blocks the main path) ──
     total_count: Optional[int] = None
     try:
-        if conds:
-            total_count = (await db.execute(select(func.count()).select_from(Title).where(and_(*conds)))).scalar_one()
-        else:
-            total_count = (await db.execute(select(func.count()).select_from(Title))).scalar_one()
+        count_stmt = select(func.count()).select_from(Title)
+        if predicates:
+            count_stmt = count_stmt.where(and_(*predicates))
+        total_count = (await db.execute(count_stmt)).scalar_one()
     except Exception:
-        total_count = None
+        total_count = None  # swallow count errors; listing should still work
 
-    # ── [Step 3] Paginate ───────────────────────────────────────────────────
+    # ── [Step 4] Paginate and fetch rows ─────────────────────────────────────────
     stmt = stmt.offset(offset).limit(limit)
     rows = (await db.execute(stmt)).scalars().all() or []
-    _set_total_count_header(response, total_count)
 
-    return JSONResponse([_serialize_title(t) for t in rows])
+    # ── [Step 5] Serialize and construct the final response with headers ─────────
+    body = [_serialize_title(t) for t in rows]
+    encoded = jsonable_encoder(body)  # ← handles datetime to ISO strings
+
+    final = JSONResponse(encoded, status_code=status.HTTP_200_OK)
+    _set_total_count_header(final, total_count)
+    set_sensitive_cache(final, seconds=0)
+    return final
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,9 +417,18 @@ async def get_title(
     # ── [Step 1] Lookup ─────────────────────────────────────────────────────
     t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
     if not t:
-        raise HTTPException(status_code=404, detail="Title not found")
+        # Ensure sensitive cache headers also apply on error responses
+        raise HTTPException(
+            status_code=404,
+            detail="Title not found",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
-    return JSONResponse(_serialize_title(t))
+    # Safe JSON encoding for datetime/date and enums
+    body = jsonable_encoder(_serialize_title(t))
+    final = JSONResponse(body, status_code=status.HTTP_200_OK)
+    set_sensitive_cache(final, seconds=0)
+    return final
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,15 +458,28 @@ async def patch_title(
     # ── [Step 1] Validate updates ───────────────────────────────────────────
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
-        raise HTTPException(status_code=400, detail="No changes provided")
+        raise HTTPException(
+            status_code=400,
+            detail="No changes provided",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
     if "slug" in updates and await _slug_exists(db, str(updates["slug"]), exclude_id=title_id):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug already exists")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Slug already exists",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
 
     # ── [Step 2] Lock + persist ─────────────────────────────────────────────
     async with redis_wrapper.lock(f"lock:admin_titles:patch:{title_id}", timeout=10, blocking_timeout=3):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Title not found",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
         for k, v in updates.items():
             setattr(t, k, v)
         await db.flush()
@@ -421,7 +494,9 @@ async def patch_title(
     except Exception:
         pass
 
-    return JSONResponse(_serialize_title(t))
+    final = JSONResponse(jsonable_encoder(_serialize_title(t)))
+    set_sensitive_cache(final)
+    return final
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,9 +523,15 @@ async def publish_title(
     async with redis_wrapper.lock(f"lock:admin_titles:publish:{title_id}", timeout=10, blocking_timeout=3):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Title not found",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
         if getattr(t, "is_published", False):
-            return JSONResponse({"message": "Already published"})
+            already = JSONResponse({"message": "Already published"})
+            set_sensitive_cache(already)
+            return already
         t.is_published = True
         await db.flush()
         await db.commit()
@@ -462,7 +543,9 @@ async def publish_title(
     except Exception:
         pass
 
-    return JSONResponse({"message": "Published"})
+    final = JSONResponse({"message": "Published"})
+    set_sensitive_cache(final)
+    return final
 
 
 @router.post("/titles/{title_id}/unpublish", summary="Unpublish title")
@@ -486,9 +569,15 @@ async def unpublish_title(
     async with redis_wrapper.lock(f"lock:admin_titles:unpublish:{title_id}", timeout=10, blocking_timeout=3):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Title not found",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
         if not getattr(t, "is_published", False):
-            return JSONResponse({"message": "Already unpublished"})
+            already = JSONResponse({"message": "Already unpublished"})
+            set_sensitive_cache(already)
+            return already
         t.is_published = False
         await db.flush()
         await db.commit()
@@ -500,7 +589,9 @@ async def unpublish_title(
     except Exception:
         pass
 
-    return JSONResponse({"message": "Unpublished"})
+    final = JSONResponse({"message": "Unpublished"})
+    set_sensitive_cache(final)
+    return final
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,7 +626,9 @@ async def delete_title(
     except Exception:
         pass
 
-    return JSONResponse({"message": "Title deleted"})
+    final = JSONResponse({"message": "Title deleted"})
+    set_sensitive_cache(final)
+    return final
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -562,9 +655,15 @@ async def soft_delete_title(
     async with redis_wrapper.lock(f"lock:admin_titles:soft_delete:{title_id}", timeout=10, blocking_timeout=3):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Title not found",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
         if getattr(t, "deleted_at", None) is not None:
-            return JSONResponse({"message": "Already deleted"})
+            already = JSONResponse({"message": "Already deleted"})
+            set_sensitive_cache(already)
+            return already
         await db.execute(update(Title).where(Title.id == title_id).values(deleted_at=func.now()))
         await db.commit()
 
@@ -575,7 +674,9 @@ async def soft_delete_title(
     except Exception:
         pass
 
-    return JSONResponse({"message": "Soft-deleted"})
+    final = JSONResponse({"message": "Soft-deleted"})
+    set_sensitive_cache(final)
+    return final
 
 
 @router.post("/titles/{title_id}/restore", summary="Restore a soft-deleted title")
@@ -599,9 +700,15 @@ async def restore_title(
     async with redis_wrapper.lock(f"lock:admin_titles:restore:{title_id}", timeout=10, blocking_timeout=3):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Title not found",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
         if getattr(t, "deleted_at", None) is None:
-            return JSONResponse({"message": "Already active"})
+            already = JSONResponse({"message": "Already active"})
+            set_sensitive_cache(already)
+            return already
         await db.execute(update(Title).where(Title.id == title_id).values(deleted_at=None))
         await db.commit()
 
@@ -612,7 +719,9 @@ async def restore_title(
     except Exception:
         pass
 
-    return JSONResponse({"message": "Restored"})
+    final = JSONResponse({"message": "Restored"})
+    set_sensitive_cache(final)
+    return final
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -638,7 +747,11 @@ async def get_title_availability(
     # ── [Step 1] Validate parent ────────────────────────────────────────────
     t = (await db.execute(select(Title).where(Title.id == title_id))).scalar_one_or_none()
     if not t:
-        raise HTTPException(status_code=404, detail="Title not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Title not found",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     # ── [Step 2] Query windows ──────────────────────────────────────────────
     rows = (
@@ -649,7 +762,10 @@ async def get_title_availability(
         )
     ).scalars().all() or []
 
-    return JSONResponse([_ser_availability(a) for a in rows])
+    data = jsonable_encoder([_ser_availability(a) for a in rows])
+    final = JSONResponse(data)
+    set_sensitive_cache(final, seconds=0)
+    return final
 
 
 @router.put("/titles/{title_id}/availability", summary="Replace availability windows for a title")
@@ -679,9 +795,17 @@ async def put_title_availability(
     async with redis_wrapper.lock(f"lock:admin_titles:availability:{title_id}", timeout=15, blocking_timeout=5):
         t = (await db.execute(select(Title).where(Title.id == title_id).with_for_update())).scalar_one_or_none()
         if not t:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Title not found",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
         if getattr(t, "deleted_at", None) is not None:
-            raise HTTPException(status_code=409, detail="Title is deleted; restore before changing availability")
+            raise HTTPException(
+                status_code=409,
+                detail="Title is deleted; restore before changing availability",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
 
         # ── [Step 2] Replace windows ────────────────────────────────────────
         await db.execute(delete(Availability).where(Availability.title_id == title_id))
@@ -709,4 +833,6 @@ async def put_title_availability(
     except Exception:
         pass
 
-    return JSONResponse({"message": "Availability updated", "count": len(payload.windows)})
+    final = JSONResponse({"message": "Availability updated", "count": len(payload.windows)})
+    set_sensitive_cache(final)
+    return final
