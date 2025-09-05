@@ -118,21 +118,33 @@ async def update_user_role(
             db, user=current_user, action="USER_ROLE_CHANGED", status="FORBIDDEN", request=request,
             meta_data={"target_user_id": str(user_id), "reason": "insufficient_permissions"},
         )
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     if current_user.id == user_id:
         await log_audit_event(
             db, user=current_user, action="USER_ROLE_CHANGED", status="DENIED_SELF_CHANGE", request=request,
             meta_data={"target_user_id": str(user_id)},
         )
-        raise HTTPException(status_code=400, detail="You cannot change your own role")
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot change your own role",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     if payload.role == UserRole.SUPERUSER and current_user.role != UserRole.SUPERUSER:
         await log_audit_event(
             db, user=current_user, action="USER_ROLE_CHANGED", status="FORBIDDEN_SUPERUSER_ASSIGN", request=request,
             meta_data={"target_user_id": str(user_id), "requested_role": str(payload.role)},
         )
-        raise HTTPException(status_code=403, detail="Only SUPERUSER can assign SUPERUSER")
+        raise HTTPException(
+            status_code=403,
+            detail="Only SUPERUSER can assign SUPERUSER",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     # 4) Idempotency (optional)
     raw_idemp = request.headers.get("Idempotency-Key")
@@ -157,7 +169,11 @@ async def update_user_role(
                 res = await db.execute(stmt)
                 target: Optional[User] = res.scalar_one_or_none()
                 if not target:
-                    raise HTTPException(status_code=404, detail="User not found")
+                    raise HTTPException(
+                        status_code=404,
+                        detail="User not found",
+                        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+                    )
 
                 # SUPERUSER demotion restriction
                 if target.role == UserRole.SUPERUSER and current_user.role != UserRole.SUPERUSER:
@@ -165,7 +181,11 @@ async def update_user_role(
                         db, user=current_user, action="USER_ROLE_CHANGED", status="FORBIDDEN_SUPERUSER_MODIFY", request=request,
                         meta_data={"target_user_id": str(user_id)},
                     )
-                    raise HTTPException(status_code=403, detail="Only SUPERUSER can modify SUPERUSER")
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Only SUPERUSER can modify SUPERUSER",
+                        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+                    )
 
                 if target.role == payload.role:
                     # Idempotent success behavior
@@ -291,13 +311,21 @@ async def deactivate_user(
             db, user=current_user, action=AuditEvent.DEACTIVATE_USER, status="FORBIDDEN", request=request,
             meta_data={"target_user_id": str(user_id)},
         )
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
     if current_user.id == user_id:
         await log_audit_event(
             db, user=current_user, action=AuditEvent.DEACTIVATE_USER, status="DENIED_SELF", request=request,
             meta_data={"target_user_id": str(user_id)},
         )
-        raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot deactivate your own account",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     # 5) Concurrency-safe mutation
     lock_name = f"lock:user_management:deactivate:{user_id}"
@@ -308,7 +336,11 @@ async def deactivate_user(
                 res = await db.execute(stmt)
                 target: Optional[User] = res.scalar_one_or_none()
                 if not target:
-                    raise HTTPException(status_code=404, detail="User not found")
+                    raise HTTPException(
+                        status_code=404,
+                        detail="User not found",
+                        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+                    )
 
                 if not getattr(target, "is_active", True):
                     resp = MessageResponse(message="User is already inactive")
@@ -430,7 +462,11 @@ async def reactivate_user(
             db, user=current_user, action=AuditEvent.REACTIVATE_USER, status="FORBIDDEN", request=request,
             meta_data={"target_user_id": str(user_id)},
         )
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     # 5) Concurrency-safe mutation
     lock_name = f"lock:user_management:reactivate:{user_id}"
@@ -441,7 +477,11 @@ async def reactivate_user(
                 res = await db.execute(stmt)
                 target: Optional[User] = res.scalar_one_or_none()
                 if not target:
-                    raise HTTPException(status_code=404, detail="User not found")
+                    raise HTTPException(
+                        status_code=404,
+                        detail="User not found",
+                        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+                    )
 
                 if getattr(target, "is_active", True):
                     resp = MessageResponse(message="User is already active")
