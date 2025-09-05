@@ -278,8 +278,20 @@ def enforce_public_api_key(request: Request):
 # No-store JSON helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def json_no_store(payload: Any, status_code: int = 200) -> JSONResponse:
-    """Return a JSON response with strict `no-store` caching."""
+def json_no_store(
+    payload: Any,
+    status_code: int = 200,
+    *,
+    request: Optional[Request] = None,
+    response: Optional[Response] = None,
+) -> JSONResponse:
+    """
+    Return a JSON response with strict `no-store` caching.
+
+    Accepts optional `request`/`response` kwargs for compatibility with callers
+    that want to pass through the current Response object; these are ignored
+    here but kept to avoid unexpected-kwarg errors.
+    """
     resp = JSONResponse(content=payload, status_code=status_code)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     resp.headers["Pragma"] = "no-cache"

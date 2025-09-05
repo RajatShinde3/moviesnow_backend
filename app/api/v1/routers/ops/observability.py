@@ -115,7 +115,9 @@ def healthz_head(request: Request, response: Response, _rl=Depends(rate_limit)):
     """HEAD variant of /healthz for super-lightweight probes."""
     set_sensitive_cache(response, seconds=0)
     _echo_correlation_headers(request, response)
-    return Response(status_code=200)
+    # Return the same Response object so headers set above are preserved
+    response.status_code = 200
+    return response
 
 
 def _check_database() -> Dict[str, Any]:
@@ -260,7 +262,8 @@ def readyz_head(request: Request, response: Response, _rl=Depends(rate_limit)):
     """HEAD variant of /readyz (useful for super-lightweight load balancer checks)."""
     set_sensitive_cache(response, seconds=0)
     _echo_correlation_headers(request, response)
-    return Response(status_code=200)
+    response.status_code = 200
+    return response
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,9 +365,8 @@ def debug_audit_logs(
     _echo_correlation_headers(request, response)
     repo = get_audit_repository()
     items, total = repo.list(page=page, page_size=page_size, source=source, actor=actor)
-    return json_no_store(
-        {"items": items, "page": page, "page_size": page_size, "total": total}, response=response
-    )
+    # Use local helper to include correlation headers on the returned response
+    return _no_store_json({"items": items, "page": page, "page_size": page_size, "total": total}, request=request)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
