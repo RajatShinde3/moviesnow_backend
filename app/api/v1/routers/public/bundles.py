@@ -78,7 +78,7 @@ def _json(payload: object, *, status_code: int, request: Request, response: Resp
         # Mirror any already-set cache headers on the outgoing response object
         for k, v in response.headers.items():
             # JSONResponse starts with its own headers object; copy selected cache/correlation keys
-            if k.lower() in {"cache-control", "etag", "x-request-id", "traceparent"}:
+            if k.lower() in {"cache-control", "etag", "pragma", "expires", "x-request-id", "traceparent"}:
                 resp.headers[k] = v
     _echo_correlation_headers(request, resp)
     return resp

@@ -293,8 +293,10 @@ def json_no_store(
     here but kept to avoid unexpected-kwarg errors.
     """
     resp = JSONResponse(content=payload, status_code=status_code)
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    # Tests expect exactly these headers for sensitive responses
+    resp.headers["Cache-Control"] = "no-store"
     resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
     return resp
 
 
