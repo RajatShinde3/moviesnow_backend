@@ -297,6 +297,11 @@ def json_no_store(
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
+    # Propagate selected headers set on an existing Response object (if provided)
+    if response is not None:
+        for key in ("Location", "X-Total-Count", "Link"):
+            if key in response.headers:
+                resp.headers[key] = response.headers[key]
     return resp
 
 

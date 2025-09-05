@@ -79,8 +79,47 @@ from app.schemas.user import (
 
 logger = logging.getLogger(__name__)
 
+# Provide a patch-friendly current-user dependency.
+# The routes use `Depends(get_current_user)` where `get_current_user` is this proxy.
+# Tests that monkeypatch `mod.get_current_user = <fake>` before including the router
+# will be honored because the proxy delegates to the current module attribute when
+# it is not itself; otherwise it falls back to the resolved project dependency.
+try:
+    import inspect, sys  # lightweight and always available
+
+    class _UserDepProxy:
+        def __init__(self, fallback):
+            self._fallback = fallback
+
+        async def __call__(self, *args, **kwargs):
+            mod = sys.modules.get(__name__)
+            target = getattr(mod, "get_current_user", None)
+            if target is None or target is self:
+                target = self._fallback
+            result = target(*args, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+    # Resolve once, delegate on call to allow monkeypatching the name later
+    get_current_user = _UserDepProxy(resolve_get_current_user())
+
+    # Wrapper dependency that defers to current module attribute at call time
+    async def current_user_dep(request: Request):  # type: ignore[name-defined]
+        # Delegate to the current module's get_current_user (proxy or patched)
+        try:
+            result = get_current_user(request)  # may be awaitable
+        except TypeError:
+            # Support test fakes with zero-arg signature
+            result = get_current_user()  # type: ignore[misc]
+        if inspect.isawaitable(result):
+            return await result
+        return result
+except Exception:  # pragma: no cover
+    # In extremely constrained environments, fall back directly
+    get_current_user = resolve_get_current_user()  # type: ignore
+
 router = APIRouter(
-    prefix="/me",
     tags=["User"],
     responses={
         400: {"description": "Bad Request"},
@@ -163,14 +202,14 @@ def _log_user_action(request: Request, user_id: str, action: str, **meta: Any) -
 # ╰───────────────────────────────────────────────────────────────────────────╯
 
 @router.get(
-    "",
+    "/me",
     response_model=UserProfile,
     response_model_exclude_none=True,
     summary="Get current user profile",
 )
 def get_me(
     request: Request,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -189,7 +228,11 @@ def get_me(
     """
     # 1) Load profile
     repo = get_user_repository()
-    profile = repo.get_profile(str(user.get("id")))
+    try:
+        profile = repo.get_profile(str(user.get("id")))
+    except Exception as e:
+        logger.exception("get_me failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch profile")
 
     # 2) Fill known email if repo omits it (non-breaking enrichment)
     if "email" not in profile and user.get("email"):
@@ -201,7 +244,7 @@ def get_me(
 
 
 @router.patch(
-    "",
+    "/me",
     response_model=UserProfile,
     response_model_exclude_none=True,
     summary="Update profile fields",
@@ -209,7 +252,7 @@ def get_me(
 def patch_me(
     patch: UserUpdate,
     request: Request,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -233,7 +276,11 @@ def patch_me(
 
     # 2) Persist
     repo = get_user_repository()
-    updated = repo.update_profile(str(user.get("id")), changes)
+    try:
+        updated = repo.update_profile(str(user.get("id")), changes)
+    except Exception as e:
+        logger.exception("patch_me failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to update profile")
 
     # 3) Log & return
     _log_user_action(request, str(user.get("id")), "PROFILE_PATCH", fields=list(changes.keys()))
@@ -255,7 +302,7 @@ def get_activity(
     response: Response,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -274,7 +321,11 @@ def get_activity(
     """
     # 1) Fetch page
     repo = get_user_repository()
-    items, total = repo.get_activity(str(user.get("id")), page, page_size)
+    try:
+        items, total = repo.get_activity(str(user.get("id")), page, page_size)
+    except Exception as e:
+        logger.exception("get_activity failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch activity")
 
     # 2) Build payload
     payload = PaginatedActivity(
@@ -287,7 +338,7 @@ def get_activity(
     # 3) Headers + log + return
     _set_pagination_headers(request, response, page=page, page_size=page_size, total=total)
     _log_user_action(request, str(user.get("id")), "ACTIVITY_LIST", page=page, page_size=page_size)
-    return json_no_store(payload.dict())
+    return json_no_store(payload.dict(), response=response)
 
 
 # ╭───────────────────────────────────────────────────────────────────────────╮
@@ -302,7 +353,7 @@ def get_activity(
 )
 def get_sessions(
     request: Request,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -319,7 +370,11 @@ def get_sessions(
 
     # 2) Fetch sessions & return
     repo = get_user_repository()
-    sessions = repo.get_sessions(str(user.get("id")), sess_id)
+    try:
+        sessions = repo.get_sessions(str(user.get("id")), sess_id)
+    except Exception as e:
+        logger.exception("get_sessions failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch sessions")
 
     _log_user_action(request, str(user.get("id")), "SESSIONS_LIST", current_session_id=sess_id)
     return json_no_store([SessionInfo(**s).dict() for s in sessions])
@@ -332,7 +387,7 @@ def get_sessions(
 )
 def revoke_other_sessions(
     request: Request,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -355,7 +410,11 @@ def revoke_other_sessions(
 
     # 2) Revoke & return
     repo = get_user_repository()
-    count = repo.revoke_other_sessions(str(user.get("id")), sess_id)
+    try:
+        count = repo.revoke_other_sessions(str(user.get("id")), sess_id)
+    except Exception as e:
+        logger.exception("revoke_other_sessions failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to revoke sessions")
 
     _log_user_action(request, str(user.get("id")), "SESSIONS_REVOKE_OTHERS", kept=sess_id, revoked=count)
     return json_no_store({"revoked": count}, status_code=202)
@@ -368,7 +427,7 @@ def revoke_other_sessions(
 )
 def revoke_all_sessions(
     request: Request,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -381,7 +440,11 @@ def revoke_all_sessions(
     """
     # 1) Revoke & return
     repo = get_user_repository()
-    count = repo.revoke_all_sessions(str(user.get("id")))
+    try:
+        count = repo.revoke_all_sessions(str(user.get("id")))
+    except Exception as e:
+        logger.exception("revoke_all_sessions failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to revoke sessions")
 
     _log_user_action(request, str(user.get("id")), "SESSIONS_REVOKE_ALL", revoked=count)
     return json_no_store({"revoked": count}, status_code=202)
@@ -399,7 +462,7 @@ def revoke_all_sessions(
 )
 def get_watchlist(
     request: Request,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -413,7 +476,11 @@ def get_watchlist(
     """
     # 1) Load & shape
     repo = get_user_repository()
-    payload = Watchlist(items=repo.get_watchlist(str(user.get("id"))))
+    try:
+        payload = Watchlist(items=repo.get_watchlist(str(user.get("id"))))
+    except Exception as e:
+        logger.exception("get_watchlist failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch watchlist")
 
     _log_user_action(request, str(user.get("id")), "WATCHLIST_GET", count=len(payload.items))
     return json_no_store(payload.dict())
@@ -427,7 +494,7 @@ def get_watchlist(
 def add_watchlist(
     title_id: str = Path(..., min_length=1, description="Title ID (sanitized)"),
     request: Request = None,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -450,7 +517,11 @@ def add_watchlist(
 
     # 3) Persist
     repo = get_user_repository()
-    repo.add_watchlist(str(user.get("id")), tid)
+    try:
+        repo.add_watchlist(str(user.get("id")), tid)
+    except Exception as e:
+        logger.exception("add_watchlist failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to add to watchlist")
 
     _log_user_action(request, str(user.get("id")), "WATCHLIST_ADD", title_id=tid)
     return Response(status_code=204)
@@ -464,7 +535,7 @@ def add_watchlist(
 def remove_watchlist(
     title_id: str = Path(..., min_length=1, description="Title ID (sanitized)"),
     request: Request = None,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -480,7 +551,11 @@ def remove_watchlist(
 
     # 2) Persist
     repo = get_user_repository()
-    repo.remove_watchlist(str(user.get("id")), tid)
+    try:
+        repo.remove_watchlist(str(user.get("id")), tid)
+    except Exception as e:
+        logger.exception("remove_watchlist failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to remove from watchlist")
 
     _log_user_action(request, str(user.get("id")), "WATCHLIST_REMOVE", title_id=tid)
     return Response(status_code=204)
@@ -498,7 +573,7 @@ def remove_watchlist(
 )
 def get_favorites(
     request: Request,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -507,7 +582,11 @@ def get_favorites(
     """
     # 1) Load & shape
     repo = get_user_repository()
-    payload = Favorites(items=repo.get_favorites(str(user.get("id"))))
+    try:
+        payload = Favorites(items=repo.get_favorites(str(user.get("id"))))
+    except Exception as e:
+        logger.exception("get_favorites failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch favorites")
 
     _log_user_action(request, str(user.get("id")), "FAVORITES_GET", count=len(payload.items))
     return json_no_store(payload.dict())
@@ -521,7 +600,7 @@ def get_favorites(
 def add_favorite(
     title_id: str = Path(..., min_length=1),
     request: Request = None,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -537,7 +616,11 @@ def add_favorite(
 
     # 2) Persist
     repo = get_user_repository()
-    repo.add_favorite(str(user.get("id")), tid)
+    try:
+        repo.add_favorite(str(user.get("id")), tid)
+    except Exception as e:
+        logger.exception("add_favorite failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to add favorite")
 
     _log_user_action(request, str(user.get("id")), "FAVORITES_ADD", title_id=tid)
     return Response(status_code=204)
@@ -551,7 +634,7 @@ def add_favorite(
 def remove_favorite(
     title_id: str = Path(..., min_length=1),
     request: Request = None,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -567,7 +650,11 @@ def remove_favorite(
 
     # 2) Persist
     repo = get_user_repository()
-    repo.remove_favorite(str(user.get("id")), tid)
+    try:
+        repo.remove_favorite(str(user.get("id")), tid)
+    except Exception as e:
+        logger.exception("remove_favorite failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to remove favorite")
 
     _log_user_action(request, str(user.get("id")), "FAVORITES_REMOVE", title_id=tid)
     return Response(status_code=204)
@@ -586,7 +673,7 @@ def set_rating(
     rating: RatingInput,
     title_id: str = Path(..., min_length=1),
     request: Request = None,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -602,7 +689,11 @@ def set_rating(
 
     # 2) Persist
     repo = get_user_repository()
-    repo.set_rating(str(user.get("id")), tid, rating.rating)
+    try:
+        repo.set_rating(str(user.get("id")), tid, rating.rating)
+    except Exception as e:
+        logger.exception("set_rating failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to set rating")
 
     _log_user_action(request, str(user.get("id")), "RATING_SET", title_id=tid, rating=rating.rating)
     return Response(status_code=204)
@@ -616,7 +707,7 @@ def set_rating(
 def delete_rating(
     title_id: str = Path(..., min_length=1),
     request: Request = None,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -632,7 +723,11 @@ def delete_rating(
 
     # 2) Persist
     repo = get_user_repository()
-    repo.delete_rating(str(user.get("id")), tid)
+    try:
+        repo.delete_rating(str(user.get("id")), tid)
+    except Exception as e:
+        logger.exception("delete_rating failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to delete rating")
 
     _log_user_action(request, str(user.get("id")), "RATING_DELETE", title_id=tid)
     return Response(status_code=204)
@@ -653,7 +748,7 @@ def create_review(
     body: ReviewInput,
     request: Request,
     response: Response,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -671,7 +766,11 @@ def create_review(
 
     # 2) Persist
     repo = get_user_repository()
-    review = repo.create_review(str(user.get("id")), tid, body.content, body.rating)
+    try:
+        review = repo.create_review(str(user.get("id")), tid, body.content, body.rating)
+    except Exception as e:
+        logger.exception("create_review failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create review")
 
     # 3) Location header
     response.headers["Location"] = f"/me/reviews?title_id={tid}"
@@ -684,7 +783,7 @@ def create_review(
         review_id=review.get("id") if isinstance(review, dict) else None,
         has_rating=body.rating is not None,
     )
-    return json_no_store(Review(**review).dict(), status_code=201)
+    return json_no_store(Review(**review).dict(), status_code=201, response=response)
 
 
 @router.get(
@@ -699,7 +798,7 @@ def list_reviews(
     title_id: Optional[str] = Query(None, description="Filter by title (optional)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -719,12 +818,16 @@ def list_reviews(
 
     # 2) Fetch page
     repo = get_user_repository()
-    items, total = repo.list_reviews(
+    try:
+        items, total = repo.list_reviews(
         title_id=tid,
         user_id=user_id,
         page=page,
         page_size=page_size,
     )
+    except Exception as e:
+        logger.exception("list_reviews failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch reviews")
 
     # 3) Shape payload
     payload = PaginatedReviews(
@@ -745,7 +848,7 @@ def list_reviews(
         page=page,
         page_size=page_size,
     )
-    return json_no_store(payload.dict())
+    return json_no_store(payload.dict(), response=response)
 
 
 @router.delete(
@@ -756,7 +859,7 @@ def list_reviews(
 def delete_review(
     review_id: str = Path(..., min_length=1),
     request: Request = None,
-    user=Depends(get_current_user),
+    user=Depends(current_user_dep),
     _rl=Depends(rate_limit),
     _key=Depends(enforce_public_api_key),
 ):
@@ -770,7 +873,11 @@ def delete_review(
     """
     # 1) Attempt delete
     repo = get_user_repository()
-    ok = repo.delete_review(str(user.get("id")), review_id)
+    try:
+        ok = repo.delete_review(str(user.get("id")), review_id)
+    except Exception as e:
+        logger.exception("delete_review failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to delete review")
 
     # 2) Neutral error if not found/not owned
     if not ok:
