@@ -39,7 +39,6 @@ Conventions
 - Slugs/names are accepted as provided but are trimmed server-side before persist.
 """
 
-from __future__ import annotations
 
 # ── [Imports] ─────────────────────────────────────────────────────────────────────────────
 from typing import Optional, List, Dict
