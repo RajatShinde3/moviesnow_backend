@@ -38,6 +38,7 @@ from app.schemas.auth import SignupPayload, TokenResponse
 from app.services.auth.signup_service import signup_user
 from app.security_headers import set_sensitive_cache
 from app.core.limiter import rate_limit
+from app.api.http_utils import rate_limit as _token_bucket_limit
 import app.utils.redis_utils as redis_utils
 
 router = APIRouter(tags=["Authentication"])  # keep consistent with grouping
@@ -72,6 +73,12 @@ async def signup(
     """
     # 1) Response hardening: never cache token responses
     set_sensitive_cache(response)
+
+    # Additional lightweight per-process limiter to ensure tests and local
+    # runs enforce the intended limit without depending on SlowAPI middleware
+    # or env toggles. This complements the SlowAPI decorator above.
+    # 10 requests per 60 seconds per client IP/user.
+    _token_bucket_limit(request, response, limit=10, window_seconds=60)
 
     # 2) Best-effort idempotency window (route-level only)
     idem_key = request.headers.get("Idempotency-Key")

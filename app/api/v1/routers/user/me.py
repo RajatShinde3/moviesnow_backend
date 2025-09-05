@@ -270,7 +270,7 @@ def patch_me(
         Updated profile snapshot.
     """
     # 1) Extract changes
-    changes = patch.dict(exclude_unset=True)
+    changes = patch.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(status_code=400, detail="No changes provided")
 
@@ -338,7 +338,7 @@ def get_activity(
     # 3) Headers + log + return
     _set_pagination_headers(request, response, page=page, page_size=page_size, total=total)
     _log_user_action(request, str(user.get("id")), "ACTIVITY_LIST", page=page, page_size=page_size)
-    return json_no_store(payload.dict(), response=response)
+    return json_no_store(payload.model_dump(), response=response)
 
 
 # ╭───────────────────────────────────────────────────────────────────────────╮
@@ -377,7 +377,7 @@ def get_sessions(
         raise HTTPException(status_code=500, detail="Failed to fetch sessions")
 
     _log_user_action(request, str(user.get("id")), "SESSIONS_LIST", current_session_id=sess_id)
-    return json_no_store([SessionInfo(**s).dict() for s in sessions])
+    return json_no_store([SessionInfo(**s).model_dump() for s in sessions])
 
 
 @router.post(
@@ -483,7 +483,7 @@ def get_watchlist(
         raise HTTPException(status_code=500, detail="Failed to fetch watchlist")
 
     _log_user_action(request, str(user.get("id")), "WATCHLIST_GET", count=len(payload.items))
-    return json_no_store(payload.dict())
+    return json_no_store(payload.model_dump())
 
 
 @router.post(
@@ -589,7 +589,7 @@ def get_favorites(
         raise HTTPException(status_code=500, detail="Failed to fetch favorites")
 
     _log_user_action(request, str(user.get("id")), "FAVORITES_GET", count=len(payload.items))
-    return json_no_store(payload.dict())
+    return json_no_store(payload.model_dump())
 
 
 @router.post(
@@ -783,7 +783,7 @@ def create_review(
         review_id=review.get("id") if isinstance(review, dict) else None,
         has_rating=body.rating is not None,
     )
-    return json_no_store(Review(**review).dict(), status_code=201, response=response)
+    return json_no_store(Review(**review).model_dump(), status_code=201, response=response)
 
 
 @router.get(
@@ -848,7 +848,7 @@ def list_reviews(
         page=page,
         page_size=page_size,
     )
-    return json_no_store(payload.dict(), response=response)
+    return json_no_store(payload.model_dump(), response=response)
 
 
 @router.delete(

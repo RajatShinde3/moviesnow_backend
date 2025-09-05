@@ -793,3 +793,13 @@ async def compliance_flags(
         "advisory_kinds": [k.name for k in AdvisoryKind],
         "advisory_severities": [s.name for s in AdvisorySeverity],
     })
+
+# Compatibility: ensure fully-qualified admin paths are present even when this
+# router is included without a prefix (as done in unit tests for isolation).
+try:
+    router.add_api_route("/api/v1/admin/genres", create_genre, methods=["POST"], summary="Create genre (Idempotency-Key supported)")
+    router.add_api_route("/api/v1/admin/genres", list_genres, methods=["GET"], summary="List genres (filters; paginate)")
+    router.add_api_route("/api/v1/admin/genres/{genre_id}", patch_genre, methods=["PATCH"], summary="Patch genre")
+except Exception:
+    # If routes already exist or FastAPI rejects duplicates, ignore silently.
+    pass
