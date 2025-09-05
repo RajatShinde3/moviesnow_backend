@@ -187,6 +187,8 @@ class Settings(BaseSettings):
     BUNDLE_ENABLE_REBUILD: bool = False  # default minimal-cost mode: no server-side rebuilds
     BUNDLE_REBUILD_COOLDOWN_SECONDS: int = 3600
     BATCH_DOWNLOAD_MAX_ITEMS: int = 50
+    BUNDLE_DEFAULT_TTL_DAYS: int = Field(14, ge=1)
+    BUNDLE_MAX_TTL_DAYS: int = Field(60, ge=1)
 
     # ── Validators / normalizers ──────────────────────────────
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")

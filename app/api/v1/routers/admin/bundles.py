@@ -38,7 +38,6 @@ Conventions & Notes
   - Extras ZIPs (local built): `downloads/{title_id}/extras/...`
 """
 
-from __future__ import annotations
 
 # ── [Imports] ─────────────────────────────────────────────────────────────────────────────
 from datetime import datetime, timedelta, timezone
