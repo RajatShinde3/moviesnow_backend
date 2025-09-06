@@ -46,7 +46,7 @@ Usage
    from fastapi import Depends, HTTPException, status
    from app.dependencies.step_up import require_step_up
 
-   @router.post("/account/change-email", dependencies=[Depends(require_step_up())])
+   /account/change-email", dependencies=[Depends(require_step_up())])
    async def change_email(...):
        ...
    ```

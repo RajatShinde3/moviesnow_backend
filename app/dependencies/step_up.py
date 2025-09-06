@@ -32,7 +32,7 @@ Option A (simple gate; you only need to check, not read the claims):
     from fastapi import Depends
     from app.dependencies.step_up import step_up_required
 
-    @router.post("/account/change-email", dependencies=[Depends(step_up_required(require_mfa=True, one_time=True))])
+    /change-email", dependencies=[Depends(step_up_required(require_mfa=True, one_time=True))])
     async def change_email(...):
         ...
 

@@ -41,7 +41,7 @@ from .discovery import cache_json_response  # type: ignore
 
 
 log = logging.getLogger(__name__)
-router = APIRouter(prefix="", tags=["Public Schedule"])
+router = APIRouter(tags=["Public Schedule"])
 
 
 def _epoch(dt: datetime) -> int:
