@@ -12,6 +12,9 @@ Shared helpers for API routers:
 - Public API key enforcement (header/query, rotation & hashed support)
 - Admin check (key-based or user-role based with dev fallback)
 - Webhook HMAC verification (rotating secrets)
+- Availability gating (optional)
+- Safe filename sanitization
+- No-store JSON helper
 
 Notes
 -----
@@ -21,6 +24,7 @@ Notes
   `None` on success or raise `HTTPException` on failure.
 """
 
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import ipaddress
@@ -32,17 +36,49 @@ from typing import Any, Dict, Mapping, Optional
 
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # Public re-export used elsewhere in your codebase
 from app.core.cache import TTLCache  # re-export for compatibility
 from app.db.models.availability import Availability  # optional: availability gating
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from datetime import datetime, timezone
+
+# Optional metrics hook (lightweight; do-nothing fallback)
+try:  # pragma: no cover
+    from app.core.metrics import inc_limiter_block  # type: ignore
+except Exception:  # pragma: no cover
+    def inc_limiter_block() -> None:  # type: ignore
+        return None
+
+
+__all__ = [
+    # ID & filename
+    "sanitize_title_id",
+    "sanitize_filename",
+    # Client IP
+    "get_client_ip",
+    # Limiter (compat shim)
+    "rate_limit",
+    # API key / admin
+    "enforce_public_api_key",
+    "require_admin",
+    # JSON helper
+    "json_no_store",
+    # Availability
+    "enforce_availability_for_download",
+    "get_request_country",
+    # Webhooks
+    "verify_webhook_signature",
+    # Current user resolution
+    "resolve_get_current_user",
+    "get_current_user",
+    # Re-export
+    "TTLCache",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ID Sanitization
+# 🧩 ID Sanitization
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SANITIZE_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -53,16 +89,18 @@ def sanitize_title_id(title_id: str) -> str:
     """Validate a title identifier.
 
     Accepts:
-      - Slugs matching `[A-Za-z0-9_-]{1,128}`
+      - Slugs matching ``[A-Za-z0-9_-]{1,128}``
       - UUID-like strings (8–36 chars, hex with hyphens)
 
-    Returns the original `title_id` when valid; otherwise raises HTTP 400.
+    Returns
+    -------
+    str
+        The original ``title_id`` when valid.
 
-    Steps
-    -----
-    1) Test against slug regex.
-    2) Test against relaxed UUID regex.
-    3) Raise if both fail.
+    Raises
+    ------
+    HTTPException
+        400 when the format is invalid.
     """
     if _SANITIZE_SLUG_RE.match(title_id) or _SANITIZE_UUID_RE.match(title_id):
         return title_id
@@ -70,36 +108,48 @@ def sanitize_title_id(title_id: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Client IP Resolution
+# 🌐 Client IP Resolution (proxy/CDN aware, opt-in)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_ip(value: Optional[str]) -> Optional[str]:
+    """Parse an IP (v4/v6) possibly containing zone IDs or ports; return None if invalid."""
     if not value:
         return None
     try:
-        # Strip port if present (e.g. "1.2.3.4:12345")
-        host = value.split("%")[0].split(":")[0] if value.count(":") == 1 else value
-        ipaddress.ip_address(host.strip())
-        return host.strip()
+        # Remove IPv6 zone id (e.g., "fe80::1%eth0")
+        value = value.split("%", 1)[0].strip()
+
+        # If it's an IPv6 literal in brackets "[::1]:1234"
+        if value.startswith("["):
+            host = value.split("]", 1)[0].lstrip("[")
+        else:
+            # Split off port only if it's ipv4:port form (one ':')
+            host = value.split(":")[0] if value.count(":") == 1 else value
+
+        ipaddress.ip_address(host)
+        return host
     except Exception:
         return None
 
 
 def get_client_ip(request: Request) -> str:
-    """Determine the best-guess client IP.
+    """Determine the best-guess client IP for logging and rate limiting.
 
     Trust behavior (opt-in)
     -----------------------
     • By default, uses the socket peer address.
-    • If `TRUST_FORWARD_HEADERS=1` is set, will consult (in order):
-        1) `CF-Connecting-IP`
-        2) `True-Client-IP`
-        3) `X-Real-Ip`
-        4) `X-Forwarded-For` (first IP)
-    • You can constrain trust further with `TRUSTED_PROXY_ONLY=1` which will only
+    • If ``TRUST_FORWARD_HEADERS=1`` is set, will consult (in order):
+        1) ``CF-Connecting-IP``
+        2) ``True-Client-IP``
+        3) ``X-Real-Ip``
+        4) ``X-Forwarded-For`` (first IP)
+    • You can constrain trust further with ``TRUSTED_PROXY_ONLY=1`` which will only
       use forwarded headers if the socket peer is a private (RFC1918/4193) address.
 
-    Returns "unknown" when no address can be determined.
+    Returns
+    -------
+    str
+        The best-effort client IP or ``"unknown"`` when not determinable.
     """
     peer = request.client.host if request.client and request.client.host else None
     peer_ip = _parse_ip(peer)
@@ -113,21 +163,22 @@ def get_client_ip(request: Request) -> str:
     # If restricted, require that peer is from a private range to trust headers.
     if proxy_only:
         try:
-            if not peer_ip or ipaddress.ip_address(peer_ip).is_private is False:
+            if not peer_ip or not ipaddress.ip_address(peer_ip).is_private:
                 return peer_ip or "unknown"
         except Exception:
             return peer_ip or "unknown"
 
-    # Check common headers set by CDNs/proxies
+    # Normalize case-insensitive access once
+    headers = MappingProxyType({k.lower(): v for k, v in request.headers.items()})  # type: ignore
+
     for hdr in ("cf-connecting-ip", "true-client-ip", "x-real-ip"):
-        ip = _parse_ip(request.headers.get(hdr) or request.headers.get(hdr.title()))
+        ip = _parse_ip(headers.get(hdr))
         if ip:
             return ip
 
-    xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+    xff = headers.get("x-forwarded-for")
     if xff:
-        # Use first hop (left-most) which should be the original client if your
-        # edge properly appends.
+        # Use first hop (left-most) which should be the original client if your edge appends.
         first = xff.split(",")[0].strip()
         ip = _parse_ip(first)
         if ip:
@@ -137,7 +188,7 @@ def get_client_ip(request: Request) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lightweight Token-Bucket Limiter (per-process)
+# ⏳ Lightweight Token-Bucket Limiter (per-process)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _TokenBucket:
@@ -169,7 +220,6 @@ class _TokenBucket:
         with self._lock:
             if self.tokens >= 1.0:
                 return 0
-            # tokens_deficit / (rate/per) = seconds
             deficit = 1.0 - self.tokens
             sec = deficit / (self.rate / self.per)
             return max(0, int(sec + 0.999))  # ceil
@@ -184,63 +234,36 @@ def rate_limit(
     limit: int = 120,
     window_seconds: int = 60,
 ):
-    """Per-IP+method+path token-bucket limiter (process-local).
+    """Deprecated adapter: SlowAPI handles rate limiting globally.
 
-    Headers set on response:
-      - `X-RateLimit-Limit`: configured limit
-      - `X-RateLimit-Remaining`: integer tokens left (floored)
-      - `X-RateLimit-Window`: window in seconds
-      - `Retry-After`: seconds until next token (when 429)
+    This dependency is a no-op to avoid double limiting. The actual enforcement
+    is performed by SlowAPI's middleware/decorators configured in `app.core.limiter`.
 
-    Steps
-    -----
-    1) Build a key from IP + HTTP method + normalized path.
-    2) Create or reuse a token bucket.
-    3) Attempt to consume one token; on failure, raise 429.
+    Kept for backwards-compatibility with existing route signatures that include
+    ``_rl=Depends(rate_limit)``.
     """
-    ip = get_client_ip(request)
-    key = f"{ip}:{request.method}:{request.url.path}"
-    bucket = _rate_buckets.get(key)
-    if not bucket:
-        bucket = _TokenBucket(limit, window_seconds)
-        _rate_buckets[key] = bucket
-
-    allowed = bucket.allow(1)
-
-    # Observability-friendly headers
-    remaining = max(0, int(bucket.tokens))
-    response.headers["X-RateLimit-Limit"] = str(limit)
-    response.headers["X-RateLimit-Remaining"] = str(remaining)
-    response.headers["X-RateLimit-Window"] = str(window_seconds)
-
-    if not allowed:
-        retry_after = bucket.seconds_until_next_token()
-        response.headers["Retry-After"] = str(retry_after)
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded",
-        )
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public API Key Enforcement
+# 🔑 Public API Key Enforcement
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compare_ct(a: str, b: str) -> bool:
-    """Constant-time string comparison."""
+    """Constant-time string comparison to resist timing attacks."""
     return hmac.compare_digest(str(a), str(b))
 
 
-def enforce_public_api_key(request: Request):
+def enforce_public_api_key(request: Request) -> None:
     """Optionally require a public API key for read-only endpoints.
 
     Allowed sources (checked in order):
-      1) `X-API-Key` header (case-insensitive)
-      2) `api_key` query parameter
+      1) ``X-API-Key`` header (case-insensitive)
+      2) ``api_key`` query parameter
 
     Rotation & hashing:
-      - `PUBLIC_API_KEY` may contain a single key or a comma-separated list.
-      - Alternatively, set `PUBLIC_API_KEY_SHA256` with one or more hex digests.
+      - ``PUBLIC_API_KEY`` may contain a single key or a comma-separated list.
+      - Alternatively, set ``PUBLIC_API_KEY_SHA256`` with one or more hex digests.
         The provided key is SHA-256 hashed and compared against the list.
 
     Behavior:
@@ -255,11 +278,9 @@ def enforce_public_api_key(request: Request):
     if not keys and not hashes:
         return  # Not enforced
 
-    provided = (
-        request.headers.get("x-api-key")
-        or request.headers.get("X-API-Key")
-        or request.query_params.get("api_key")
-    )
+    # Normalize header access once
+    hdrs = {k.lower(): v for k, v in request.headers.items()}
+    provided = hdrs.get("x-api-key") or request.query_params.get("api_key")
     if not provided:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
@@ -279,7 +300,7 @@ def enforce_public_api_key(request: Request):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# No-store JSON helper
+# 🧳 No-store JSON helper (sensitive responses)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def json_no_store(
@@ -295,13 +316,31 @@ def json_no_store(
     Accepts optional `request`/`response` kwargs for compatibility with callers
     that want to pass through the current Response object; these are ignored
     here but kept to avoid unexpected-kwarg errors.
+
+    Propagates selected headers (`Location`, `X-Total-Count`, `Link`) from an
+    upstream Response if supplied.
     """
-    resp = JSONResponse(content=payload, status_code=status_code)
-    # Tests expect exactly these headers for sensitive responses
+    def _to_plain(obj: Any) -> Any:
+        try:
+            if hasattr(obj, "model_dump"):
+                return obj.model_dump()  # Pydantic v2
+            if hasattr(obj, "dict"):
+                return obj.dict()  # Pydantic v1 or dummy with dict()
+        except Exception:
+            pass
+        if isinstance(obj, (list, tuple)):
+            return [_to_plain(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _to_plain(v) for k, v in obj.items()}
+        return obj
+
+    content = _to_plain(payload)
+    resp = JSONResponse(content=content, status_code=status_code)
+    # Tests often expect exactly these headers for sensitive responses
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
-    # Propagate selected headers set on an existing Response object (if provided)
+
     if response is not None:
         for key in ("Location", "X-Total-Count", "Link"):
             if key in response.headers:
@@ -310,24 +349,28 @@ def json_no_store(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Admin Requirement
+# 🛡️ Admin Requirement
 # ─────────────────────────────────────────────────────────────────────────────
 
-def require_admin(request: Request):
+def require_admin(request: Request) -> None:
     """Require administrative privileges.
 
     Strategy (ordered):
-      1) If `ADMIN_API_KEY` is set → require `X-Admin-Key` (constant-time).
-      2) Else, attempt to resolve `get_current_user` and allow if:
-         • dict user with `is_superuser`/`is_admin`/`role == 'admin'`, or
+      1) If ``ADMIN_API_KEY`` is set → require ``X-Admin-Key`` (constant-time).
+      2) Else, attempt to resolve ``get_current_user`` and allow if:
+         • dict user with ``is_superuser``/``is_admin``/``role == 'admin'``, or
          • object user with those attributes.
-      3) Dev fallback: if `ALLOW_DEV_AUTH=1` and `X-Admin: true`, allow.
+      3) Dev fallback: if ``ALLOW_DEV_AUTH=1`` and ``X-Admin: true``, allow.
 
-    Raises HTTP 401/403 on failure.
+    Raises
+    ------
+    HTTPException
+        401/403 on failure.
     """
     admin_key = os.environ.get("ADMIN_API_KEY")
     if admin_key:
-        provided = request.headers.get("x-admin-key") or request.headers.get("X-Admin-Key")
+        hdrs = {k.lower(): v for k, v in request.headers.items()}
+        provided = hdrs.get("x-admin-key")
         if not provided or not _compare_ct(provided, admin_key):
             raise HTTPException(status_code=401, detail="Invalid or missing admin key")
         return
@@ -348,15 +391,16 @@ def require_admin(request: Request):
                 return
 
     # Dev fallback
-    if os.environ.get("ALLOW_DEV_AUTH") in {"1", "true", "True"} and (
-        request.headers.get("x-admin") == "true" or request.headers.get("X-Admin") == "true"
-    ):
+    hdrs = {k.lower(): v for k, v in request.headers.items()}
+    if os.environ.get("ALLOW_DEV_AUTH") in {"1", "true", "True"} and hdrs.get("x-admin") == "true":
         return
 
     raise HTTPException(status_code=403, detail="Admin privileges required")
 
 
-# Availability / certification gating (opt-in via env FEATURE_ENFORCE_AVAILABILITY=1)
+# ─────────────────────────────────────────────────────────────────────────────
+# 🌏 Availability / certification gating (opt-in)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _bool_env(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
@@ -367,7 +411,11 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 def get_request_country(request: Request) -> str:
     """Best-effort country detection from common proxy/CDN headers.
-    Returns uppercased ISO-3166-1 alpha-2 or empty string if unknown.
+
+    Returns
+    -------
+    str
+        Uppercased ISO-3166-1 alpha-2 code or empty string if unknown.
     """
     for h in ("cf-ipcountry", "x-country", "x-geo-country", "x-app-country"):
         v = request.headers.get(h) or request.headers.get(h.upper())
@@ -383,18 +431,25 @@ async def enforce_availability_for_download(
     title_id: str,
     episode_id: str | None = None,
 ) -> None:
-    """If enabled by env, ensure downloads are allowed by Availability.
+    """If enabled by env, ensure downloads are allowed by `Availability`.
 
     Logic (conservative):
       - If no Availability rows exist for the scope, allow (backwards compatible).
       - If rows exist, require at least one active window matching the requester country.
+      - If the country is unknown (proxy) fail-open to avoid false negatives.
+
+    Raises
+    ------
+    HTTPException
+        403 if Availability is enforced and no active window matches.
     """
     if not _bool_env("FEATURE_ENFORCE_AVAILABILITY", False):
         return
+
     country = get_request_country(request)
-    # If we cannot determine the country, allow (avoid false negatives behind proxies)
     if not country:
-        return
+        return  # fail-open if we cannot determine country
+
     try:
         q = select(Availability).where(Availability.title_id == title_id)
         if episode_id:
@@ -419,7 +474,7 @@ async def enforce_availability_for_download(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Webhook HMAC Verification
+# 🔐 Webhook HMAC Verification
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def verify_webhook_signature(
@@ -433,25 +488,29 @@ async def verify_webhook_signature(
 
     Configuration
     -------------
-    • `secret_env`: env var name holding one or more shared secrets. Supports
+    • ``secret_env``: env var name holding one or more shared secrets. Supports
       comma-separated rotation (any match accepts).
-    • `header_name`: HTTP header carrying the signature (default `X-Signature`).
-    • `scheme`: expected prefix (default `sha256=`), e.g., "sha256=".
+    • ``header_name``: HTTP header carrying the signature (default ``X-Signature``).
+    • ``scheme``: expected prefix (default ``sha256=``).
 
     Behavior
     --------
-    • If `secret_env` is unset/empty → returns True (verification disabled).
+    • If ``secret_env`` is unset/empty → returns True (verification disabled).
     • If header missing or malformed → returns False.
-    • Computes `HMAC_SHA256(secret, body)` and constant-time compares to header.
+    • Computes ``HMAC_SHA256(secret, body)`` and constant-time compares to header.
 
-    Returns True/False (no exceptions); callers should raise on False.
+    Returns
+    -------
+    bool
+        True when verified or disabled; False on verification failure.
     """
     raw = os.environ.get(secret_env, "")
     if not raw:
         return True  # not enforced
     secrets = [s.strip() for s in raw.split(",") if s.strip()]
 
-    sig = request.headers.get(header_name) or request.headers.get(header_name.lower())
+    hdrs = {k.lower(): v for k, v in request.headers.items()}
+    sig = hdrs.get(header_name.lower())
     if not sig or not sig.startswith(scheme):
         return False
 
@@ -466,17 +525,17 @@ async def verify_webhook_signature(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Current user resolution (best-effort)
+# 👤 Current user resolution (best-effort)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_get_current_user():
-    """Resolve the project's `get_current_user` dependency.
+    """Resolve the project's ``get_current_user`` dependency.
 
     Tries a few common locations. If none is available, provides a dev-only
-    fallback that extracts identity from headers when `ALLOW_DEV_AUTH=1`.
+    fallback that extracts identity from headers when ``ALLOW_DEV_AUTH=1``.
 
     Dev fallback headers:
-      • `X-User-Id`, `X-User-Email`
+      • ``X-User-Id``, ``X-User-Email``
     """
     candidates = [
         ("app.api.deps", "get_current_user"),
@@ -505,19 +564,32 @@ def resolve_get_current_user():
 
 # Export a resolved dependency for convenience in routers
 get_current_user = resolve_get_current_user()
-# Filename sanitization (safe for Content-Disposition)
-def sanitize_filename(name: Optional[str], fallback: str = "download.bin") -> str:
-    """Return a safe filename limited to [A-Za-z0-9._-] and underscores for spaces.
 
-    - Strips leading/trailing whitespace
-    - Replaces whitespace with single underscore
-    - Removes any characters outside A-Za-z0-9._-
-    - Falls back to provided name if empty
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📦 Safe filename for Content-Disposition
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sanitize_filename(name: Optional[str], fallback: str = "download.bin") -> str:
+    """Return a safe filename limited to ``[A-Za-z0-9._-]`` and underscores for spaces.
+
+    Steps
+    -----
+    - Strip leading/trailing whitespace
+    - Replace any run of whitespace with a single underscore
+    - Remove any characters outside ``A-Za-z0-9._-``
+    - If empty, fall back to ``fallback``
+
+    Examples
+    --------
+    >>> sanitize_filename("  My File (Final).mp4  ")
+    'My_File_Final.mp4'
+    >>> sanitize_filename("", fallback="file.bin")
+    'file.bin'
     """
     s = (name or "").strip()
     if not s:
         return fallback
-    import re as _re
-    s = _re.sub(r"\s+", "_", s)
-    s = _re.sub(r"[^A-Za-z0-9._-]", "", s)
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9._-]", "", s)
     return s or fallback

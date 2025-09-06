@@ -1,40 +1,47 @@
 # app/api/v1/routers/admin_downloads.py
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 🛠️📥 MoviesNow · Admin Downloads                                         ║
-# ║                                                                          ║
-# ║ Purpose: Curate downloadable MP4 variants and reconcile S3 inventory.    ║
-# ║                                                                          ║
-# ║ Endpoints (admin-only; MFA; rate-limited; no-store):                     ║
-# ║  - POST  /titles/{title_id}/downloads/register           → Upsert Title  ║
-# ║  - POST  /titles/{title_id}/episodes/{episode_id}/...    → Upsert Ep     ║
-# ║  - PATCH /streams/{variant_id}/toggle-downloadable        → Toggle flag   ║
-# ║  - GET   /titles/{title_id}/downloads/inventory           → S3 vs DB      ║
-# ╠──────────────────────────────────────────────────────────────────────────╣
-# ║ Policy                                                                   
-# ║  - All registered assets **must** live under `downloads/` namespace.      ║
-# ║  - Only progressive MP4 (or similar) should be flagged downloadable.      ║
-# ║  - Registration is **idempotent**: existing variants are updated.         ║
-# ║                                                                           
-# ║ Security & Ops                                                            
-# ║  - Requires Admin + MFA; per-route rate limits.                           ║
-# ║  - `Cache-Control: no-store` for admin responses.                          ║
-# ║  - Neutral errors; no sensitive storage internals leaked.                 ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+#  🛠️📥 MoviesNow · Admin Downloads
+#
+#  Purpose: Curate downloadable MP4 variants and reconcile S3 inventory.
+#
+#  Endpoints (admin-only; MFA; rate-limited; no-store):
+#   - POST  /titles/{title_id}/downloads/register           → Upsert Title
+#   - POST  /titles/{title_id}/episodes/{episode_id}/...    → Upsert Ep
+#   - PATCH /streams/{variant_id}/toggle-downloadable       → Toggle flag
+#   - GET   /titles/{title_id}/downloads/inventory          → S3 vs DB
+#
+#  Policy
+#  - All registered assets **must** live under `downloads/` namespace.
+#  - Only progressive MP4 (or similar) should be flagged downloadable.
+#  - Registration is **idempotent**: existing variants are updated.
+#
+#  Security & Ops
+#  - Requires Admin + MFA; per-route rate limits.
+#  - `Cache-Control: no-store` for admin responses.
+#  - Neutral errors; no sensitive storage internals leaked.
+#
 
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, Path, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    Path,
+    Query,
+    status,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.limiter import rate_limit
-from app.core.security import get_current_user
 from app.db.session import get_async_db
-from app.db.models.user import User
 from app.db.models.title import Title
 from app.db.models.episode import Episode
 from app.db.models.media_asset import MediaAsset
@@ -42,17 +49,21 @@ from app.db.models.stream_variant import StreamVariant
 from app.schemas.enums import StreamProtocol, Container, VideoCodec, AudioCodec
 from app.security_headers import set_sensitive_cache
 from app.utils.aws import S3Client
-
 from app.dependencies.admin import ensure_admin as _ensure_admin, ensure_mfa as _ensure_mfa
 
-router = APIRouter(tags=["Admin Downloads"])
+router = APIRouter(tags=["Admin · Downloads"])
+
+__all__ = ["router"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📚 Pydantic models (request/response)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RegisterDownloadIn(BaseModel):
-    storage_key: str = Field(..., description="Object key under downloads/ namespace (e.g., downloads/{title_id}/.../file.mp4)")
+    storage_key: str = Field(
+        ...,
+        description="Object key under downloads/ namespace (e.g., downloads/{title_id}/.../file.mp4)",
+    )
     width: Optional[int] = Field(None, ge=1)
     height: Optional[int] = Field(None, ge=1)
     bandwidth_bps: Optional[int] = Field(None, ge=1, description="Approx bitrate in bits per second.")
@@ -61,6 +72,7 @@ class RegisterDownloadIn(BaseModel):
     audio_codec: Optional[AudioCodec] = Field(None, description="AAC recommended.")
     audio_language: Optional[str] = Field(None, description="IETF BCP 47 (e.g., 'en', 'hi').")
     label: Optional[str] = Field(None, description="Curator label (e.g., 'Director Cut').")
+    sha256: Optional[str] = Field(None, description="Optional hex SHA-256 checksum for integrity.")
 
 
 class RegisterDownloadOut(BaseModel):
@@ -114,9 +126,11 @@ class TitleDownloadsInventoryOut(BaseModel):
 
 _ALLOWED_DOWNLOAD_EXTS = (".mp4", ".m4v", ".mov", ".webm", ".zip")
 
+
 def _allowed_download_ext(key: str) -> bool:
     k = key.lower()
     return any(k.endswith(ext) for ext in _ALLOWED_DOWNLOAD_EXTS)
+
 
 def _ensure_downloads_key(key: str) -> str:
     """
@@ -185,11 +199,22 @@ def _apply_variant_fields(v: StreamVariant, payload: RegisterDownloadIn) -> None
         setattr(v, "is_downloadable", True)
 
 
+def _is_hex_sha256(s: Optional[str]) -> bool:
+    s = (s or "").strip().lower()
+    if len(s) != 64:
+        return False
+    try:
+        int(s, 16)
+        return True
+    except Exception:
+        return False
+
+
 async def _upsert_variant(
     db: AsyncSession,
     asset: MediaAsset,
     payload: RegisterDownloadIn,
-) -> tuple[StreamVariant, bool]:
+) -> Tuple[StreamVariant, bool]:
     """
     Create or update a StreamVariant for the given asset and url_path.
     Returns (variant, created).
@@ -236,6 +261,15 @@ def _best_effort_s3_head(key: str) -> Optional[bool]:
     "/titles/{title_id}/downloads/register",
     summary="Register (upsert) a title-level downloadable file",
     response_model=RegisterDownloadOut,
+    responses={
+        201: {"description": "Created"},
+        200: {"description": "Updated"},
+        400: {"description": "Validation error"},
+        401: {"description": "Unauthorized (admin/MFA)"},
+        403: {"description": "Forbidden"},
+        404: {"description": "Title not found"},
+        503: {"description": "S3 error (neutral)"},
+    },
 )
 @rate_limit("20/minute")
 async def register_title_download(
@@ -244,15 +278,11 @@ async def register_title_download(
     request: Request = ...,
     response: Response = ...,
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    _adm=Depends(_ensure_admin),
+    _mfa=Depends(_ensure_mfa),
 ) -> RegisterDownloadOut:
     """
     Upsert a **downloadable** progressive file for a *title* scope.
-
-    Security
-    --------
-    * Requires admin privileges and MFA enforcement.
-    * Rate-limited to mitigate automation/abuse.
 
     Semantics
     ---------
@@ -265,8 +295,6 @@ async def register_title_download(
     * Performs best-effort HEAD to check object existence (no failure on miss).
     """
     set_sensitive_cache(response)  # no-store
-    await _ensure_admin(current_user)
-    await _ensure_mfa(request)
 
     key = _ensure_downloads_key(payload.storage_key)
 
@@ -277,8 +305,24 @@ async def register_title_download(
     s3_exists = _best_effort_s3_head(key)
 
     asset = await _get_or_create_asset_for_title(db, title_id, key)
+    # Optionally persist checksum on the asset for integrity tracking
+    if payload.sha256:
+        sha = payload.sha256.strip().lower()
+        if not _is_hex_sha256(sha):
+            raise HTTPException(status_code=400, detail="Invalid sha256 hex")
+        try:
+            # Only set if empty to avoid unintended overwrites
+            if not getattr(asset, "checksum_sha256", None):
+                setattr(asset, "checksum_sha256", sha)
+        except Exception:
+            # Defensive: don't block registration on attribute assignment in odd ORM configs
+            pass
+
     v, created = await _upsert_variant(db, asset, payload)
     await db.commit()
+
+    # Dynamic 201 on creation; 200 on update
+    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
 
     return RegisterDownloadOut(
         message="registered" if created else "updated",
@@ -296,6 +340,15 @@ async def register_title_download(
     "/titles/{title_id}/episodes/{episode_id}/downloads/register",
     summary="Register (upsert) an episode-level downloadable file",
     response_model=RegisterDownloadOut,
+    responses={
+        201: {"description": "Created"},
+        200: {"description": "Updated"},
+        400: {"description": "Validation error"},
+        401: {"description": "Unauthorized (admin/MFA)"},
+        403: {"description": "Forbidden"},
+        404: {"description": "Episode not found"},
+        503: {"description": "S3 error (neutral)"},
+    },
 )
 @rate_limit("20/minute")
 async def register_episode_download(
@@ -305,7 +358,8 @@ async def register_episode_download(
     request: Request = ...,
     response: Response = ...,
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    _adm=Depends(_ensure_admin),
+    _mfa=Depends(_ensure_mfa),
 ) -> RegisterDownloadOut:
     """
     Upsert a **downloadable** progressive file for an *episode* scope.
@@ -321,8 +375,6 @@ async def register_episode_download(
     * Best-effort HEAD to probe existence (optional).
     """
     set_sensitive_cache(response)  # no-store
-    await _ensure_admin(current_user)
-    await _ensure_mfa(request)
 
     key = _ensure_downloads_key(payload.storage_key)
 
@@ -335,8 +387,21 @@ async def register_episode_download(
     s3_exists = _best_effort_s3_head(key)
 
     asset = await _get_or_create_asset_for_episode(db, ep, key)
+    # Optionally persist checksum on the asset for integrity tracking
+    if payload.sha256:
+        sha = payload.sha256.strip().lower()
+        if not _is_hex_sha256(sha):
+            raise HTTPException(status_code=400, detail="Invalid sha256 hex")
+        try:
+            if not getattr(asset, "checksum_sha256", None):
+                setattr(asset, "checksum_sha256", sha)
+        except Exception:
+            pass
+
     v, created = await _upsert_variant(db, asset, payload)
     await db.commit()
+
+    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
 
     return RegisterDownloadOut(
         message="registered" if created else "updated",
@@ -354,6 +419,13 @@ async def register_episode_download(
     "/streams/{variant_id}/toggle-downloadable",
     summary="Toggle is_downloadable on a stream variant",
     response_model=ToggleDownloadableOut,
+    responses={
+        200: {"description": "OK"},
+        400: {"description": "Variant does not support downloadable flag"},
+        401: {"description": "Unauthorized (admin/MFA)"},
+        403: {"description": "Forbidden"},
+        404: {"description": "Variant not found"},
+    },
 )
 @rate_limit("30/minute")
 async def toggle_downloadable(
@@ -361,7 +433,8 @@ async def toggle_downloadable(
     request: Request = ...,
     response: Response = ...,
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    _adm=Depends(_ensure_admin),
+    _mfa=Depends(_ensure_mfa),
 ) -> ToggleDownloadableOut:
     """
     Flip the `is_downloadable` flag on a variant (when supported by the model).
@@ -372,8 +445,6 @@ async def toggle_downloadable(
     * Returns the new flag state after persistence.
     """
     set_sensitive_cache(response)  # no-store
-    await _ensure_admin(current_user)
-    await _ensure_mfa(request)
 
     v = (await db.execute(select(StreamVariant).where(StreamVariant.id == variant_id))).scalars().first()
     if not v:
@@ -397,6 +468,13 @@ async def toggle_downloadable(
     "/titles/{title_id}/downloads/inventory",
     summary="Reconcile S3 downloads/ keys with DB variants (title scope)",
     response_model=TitleDownloadsInventoryOut,
+    responses={
+        200: {"description": "OK"},
+        400: {"description": "Bad prefix"},
+        401: {"description": "Unauthorized (admin/MFA)"},
+        403: {"description": "Forbidden"},
+        503: {"description": "S3 error (neutral)"},
+    },
 )
 @rate_limit("10/minute")
 async def title_downloads_inventory(
@@ -410,7 +488,8 @@ async def title_downloads_inventory(
     limit: int = Query(1000, ge=1, le=1000, description="Max objects per page."),
     continuation_token: Optional[str] = Query(None, description="S3 pagination token."),
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    _adm=Depends(_ensure_admin),
+    _mfa=Depends(_ensure_mfa),
 ) -> TitleDownloadsInventoryOut:
     """
     List objects under `downloads/{title_id}/...` in S3 and compare against DB
@@ -428,8 +507,6 @@ async def title_downloads_inventory(
     * S3 errors are surfaced as HTTP 503 with a neutral message.
     """
     set_sensitive_cache(response)  # no-store
-    await _ensure_admin(current_user)
-    await _ensure_mfa(request)
 
     pfx_default = f"downloads/{title_id}/"
     pfx = (prefix or pfx_default).lstrip("/")
@@ -445,8 +522,8 @@ async def title_downloads_inventory(
         kwargs["ContinuationToken"] = continuation_token
     try:
         resp = client.list_objects_v2(**kwargs)  # type: ignore[attr-defined]
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"S3 list error")
+    except Exception:
+        raise HTTPException(status_code=503, detail="S3 list error")
 
     for obj in (resp.get("Contents") or []):
         key = obj.get("Key")
@@ -454,12 +531,14 @@ async def title_downloads_inventory(
             continue
         if not _allowed_download_ext(key):
             continue
-        s3_keys.append({
-            "key": key,
-            "size_bytes": int(obj.get("Size") or 0),
-            "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
-            "etag": obj.get("ETag"),
-        })
+        s3_keys.append(
+            {
+                "key": key,
+                "size_bytes": int(obj.get("Size") or 0),
+                "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
+                "etag": obj.get("ETag"),
+            }
+        )
 
     next_token = resp.get("NextContinuationToken")
 
@@ -483,28 +562,34 @@ async def title_downloads_inventory(
     for key, item in s3_index.items():
         v = db_index.get(key)
         if v is not None:
-            matches.append(InventoryMatchOut(
-                key=key,
-                variant_id=str(getattr(v, "id", "")),
-                height=getattr(v, "height", None),
-                width=getattr(v, "width", None),
-            ))
+            matches.append(
+                InventoryMatchOut(
+                    key=key,
+                    variant_id=str(getattr(v, "id", "")),
+                    height=getattr(v, "height", None),
+                    width=getattr(v, "width", None),
+                )
+            )
         else:
-            s3_only.append(InventoryS3OnlyOut(
-                key=item["key"],
-                size_bytes=item["size_bytes"],
-                last_modified=item["last_modified"],
-                etag=item["etag"],
-            ))
+            s3_only.append(
+                InventoryS3OnlyOut(
+                    key=item["key"],
+                    size_bytes=item["size_bytes"],
+                    last_modified=item["last_modified"],
+                    etag=item["etag"],
+                )
+            )
 
     for url_path, v in db_index.items():
         if url_path not in s3_index:
-            db_only.append(InventoryDBOnlyOut(
-                variant_id=str(getattr(v, "id", "")),
-                url_path=url_path,
-                height=getattr(v, "height", None),
-                width=getattr(v, "width", None),
-            ))
+            db_only.append(
+                InventoryDBOnlyOut(
+                    variant_id=str(getattr(v, "id", "")),
+                    url_path=url_path,
+                    height=getattr(v, "height", None),
+                    width=getattr(v, "width", None),
+                )
+            )
 
     return TitleDownloadsInventoryOut(
         title_id=str(title_id),

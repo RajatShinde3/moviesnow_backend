@@ -40,6 +40,7 @@ except Exception:
 # -- Middlewares & security ---------------------------------------------------
 from app.middleware.request_id import RequestIDMiddleware
 from app.security_headers import install_security, configure_cors
+from app.middleware.admin_ip_allowlist import AdminIPAllowlistMiddleware
 
 # -- Rate limiting ------------------------------------------------------------
 from slowapi.errors import RateLimitExceeded
@@ -154,6 +155,18 @@ def create_app() -> FastAPI:
     # 3) CORS (allow-list/regex via env; exposes X-Request-ID, ETag, etc.)
     configure_cors(app)
 
+    # 3.5) Optional Admin IP allowlist (path-scoped)
+    try:
+        allow_csv = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()
+        if allow_csv:
+            allow = [p.strip() for p in allow_csv.split(",") if p.strip()]
+            api_prefix = getattr(settings, "API_V1_STR", "/api/v1")
+            admin_prefix = f"{api_prefix.rstrip('/')}/admin"
+            app.add_middleware(AdminIPAllowlistMiddleware, admin_prefix=admin_prefix, allowlist=allow)
+            logger.info("Admin IP allowlist enabled for %s", admin_prefix)
+    except Exception:
+        logger.exception("Failed to enable Admin IP allowlist middleware")
+
     # 4) GZip (safe defaults)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -166,6 +179,23 @@ def create_app() -> FastAPI:
             logger.warning("⚠️ RateLimiter not installed (module missing)")
     except Exception:
         logger.exception("Failed to install rate limiter")
+
+    # Optional maintenance schedulers (best-effort)
+    try:
+        # Token cleanup scheduler (expired/revoked)
+        from app.utils.token_cleanup import start_token_cleanup_scheduler  # type: ignore
+        if os.getenv("TOKEN_CLEANUP_SCHEDULER", "true").lower() == "true":
+            start_token_cleanup_scheduler()
+    except Exception:
+        logger.info("Token cleanup scheduler not started")
+
+    try:
+        # JWKS rotation/prune scheduler
+        from app.utils.jwks_rotation import start_jwks_scheduler  # type: ignore
+        if os.getenv("JWKS_SCHEDULER", "true").lower() == "true":
+            start_jwks_scheduler()
+    except Exception:
+        logger.info("JWKS scheduler not started")
 
     # 6) Strip/override Server header at the end of the chain
     @app.middleware("http")

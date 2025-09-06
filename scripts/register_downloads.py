@@ -68,7 +68,7 @@ def main() -> int:
         else:
             url = f"{base}/admin/titles/{it['title_id']}/downloads/register"
         payload = {k: v for k, v in it.items() if k in {
-            "storage_key", "width", "height", "bandwidth_bps", "container", "video_codec", "audio_codec", "audio_language", "label"
+            "storage_key", "width", "height", "bandwidth_bps", "container", "video_codec", "audio_codec", "audio_language", "label", "sha256"
         }}
         try:
             res = _request(url, payload)
@@ -82,4 +82,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

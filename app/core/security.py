@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from uuid import UUID, uuid4
 import logging
+import os
 
 import pyotp
 from fastapi import Depends, HTTPException, Request
@@ -139,7 +140,7 @@ async def create_access_token(
     if session_id:
         payload["session_id"] = session_id
 
-    token = jwt.encode(payload, settings.JWT_SECRET_KEY.get_secret_value(), algorithm=ALGORITHM)
+    token = await _sign_jwt(payload, default_alg=ALGORITHM)
 
     # Track JTI for fast revocation checks
     redis_key = f"access:jti:{jti}"
@@ -239,6 +240,23 @@ def generate_mfa_token(user_id: str, expires_in_minutes: int = 5) -> str:
         payload["aud"] = AUDIENCE
 
     return jwt.encode(payload, settings.JWT_SECRET_KEY.get_secret_value(), algorithm=ALGORITHM)
+
+
+async def _sign_jwt(payload: Dict[str, Any], *, default_alg: str) -> str:
+    """
+    Sign a JWT using RS256 private JWK when `JWT_SIGN_WITH_JWKS=1` and available;
+    otherwise fall back to HS secret with configured algorithm.
+    """
+    if str(getattr(settings, "JWT_SIGN_WITH_JWKS", os.getenv("JWT_SIGN_WITH_JWKS", "0"))).lower() in {"1", "true", "yes", "on"}:
+        try:
+            from app.services.jwks_service import get_active_private_jwk  # local import to avoid cycles
+            jwk = await get_active_private_jwk()
+            if isinstance(jwk, dict) and jwk.get("kty") in {"RSA", "EC"}:
+                alg = jwk.get("alg") or "RS256"
+                return jwt.encode(payload, jwk, algorithm=alg)
+        except Exception:
+            logger.warning("JWKS signing unavailable; falling back to HS secret")
+    return jwt.encode(payload, settings.JWT_SECRET_KEY.get_secret_value(), algorithm=default_alg)
 
 
 __all__ = [

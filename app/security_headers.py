@@ -81,7 +81,8 @@ class SecurityHeadersConfig:
     csp_report_uri: Optional[str] = os.getenv("CSP_REPORT_URI") or None
 
     # Other security headers
-    referrer_policy: str = os.getenv("REFERRER_POLICY", "strict-origin-when-cross-origin")
+    # Default to the most private option; override via REFERRER_POLICY if needed
+    referrer_policy: str = os.getenv("REFERRER_POLICY", "no-referrer")
     permissions_policy: str = os.getenv(
         "PERMISSIONS_POLICY",
         "accelerometer=(), autoplay=(), camera=(), display-capture=(), geolocation=(), "
@@ -325,7 +326,15 @@ def configure_cors(
         allow_credentials=allow_credentials,
         allow_methods=list(allow_methods),
         allow_headers=list(allow_headers),
-        expose_headers=["ETag", "Location", "Retry-After", "X-Request-ID"],
+        expose_headers=[
+            "ETag",
+            "Location",
+            "Retry-After",
+            "X-Request-ID",
+            "X-RateLimit-Limit",
+            "X-RateLimit-Remaining",
+            "X-RateLimit-Window",
+        ],
         max_age=3600,
     )
 

@@ -14,7 +14,7 @@ Exports
 - admin_user_mfa: same as above, but enforces `mfa_authenticated` claim
 """
 
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import Depends, HTTPException, Request, status
 
@@ -43,7 +43,7 @@ def is_admin(user: User) -> bool:
         )
 
 
-async def ensure_admin(user: User) -> None:
+async def ensure_admin(user: Any = Depends(get_current_user)) -> None:
     if not is_admin(user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
@@ -86,4 +86,3 @@ __all__ = [
     "admin_user",
     "admin_user_mfa",
 ]
-

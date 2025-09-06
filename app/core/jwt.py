@@ -20,6 +20,7 @@ Notes
 
 from typing import Optional, Sequence, Dict, Any
 import logging
+import os
 
 from fastapi import HTTPException, Request, status
 from jose import jwt, JWTError, ExpiredSignatureError
@@ -120,12 +121,32 @@ async def decode_token(
         # other defaults verify exp/nbf/iat
     }
 
-    # 1) Decode & base checks
+    # 1) Decode & base checks (supports JWKS-based verification when enabled)
     try:
+        use_jwks = str(getattr(settings, "JWT_VERIFY_WITH_JWKS", os.getenv("JWT_VERIFY_WITH_JWKS", "0"))).lower() in {"1", "true", "yes", "on"}
+        key = settings.JWT_SECRET_KEY.get_secret_value()
+        algs = [settings.JWT_ALGORITHM]
+        if use_jwks:
+            try:
+                header = jwt.get_unverified_header(token)
+                kid = header.get("kid")
+                alg = header.get("alg")
+                if kid and alg:
+                    from app.services.jwks_service import get_public_jwks  # local import to avoid cycles
+                    jwks = await get_public_jwks()
+                    for k in jwks.get("keys", []):
+                        if k.get("kid") == kid and k.get("alg") == alg:
+                            key = k
+                            algs = [alg]
+                            break
+            except Exception:
+                # Fall back to symmetric secret
+                pass
+
         payload = jwt.decode(
             token,
-            settings.JWT_SECRET_KEY.get_secret_value(),
-            algorithms=[settings.JWT_ALGORITHM],
+            key,
+            algorithms=algs,
             options=options,
             audience=audience if audience else None,
             issuer=issuer if issuer else None,
