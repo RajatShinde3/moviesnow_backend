@@ -35,7 +35,7 @@ import time
 from typing import Any, Dict, Mapping, Optional
 
 from fastapi import HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import ORJSONResponse, JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -335,7 +335,7 @@ def json_no_store(
         return obj
 
     content = _to_plain(payload)
-    resp = JSONResponse(content=content, status_code=status_code)
+    resp = ORJSONResponse(content=content, status_code=status_code)
     # Tests often expect exactly these headers for sensitive responses
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Pragma"] = "no-cache"

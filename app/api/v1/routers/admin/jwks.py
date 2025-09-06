@@ -8,10 +8,13 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 from pydantic import BaseModel, Field
+import logging
 try:
     from pydantic import RootModel  # Pydantic v2
 except Exception:  # pragma: no cover
     RootModel = None  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 from app.core.limiter import rate_limit
 from app.security_headers import set_sensitive_cache
@@ -110,15 +113,19 @@ async def jwks_rotate(
     set_sensitive_cache(response)
     try:
         info = await rotate_key()
+        logger.info("jwks.rotate ok kid=%s", info.get("kid"))
         return RotateOut(kid=info["kid"], public_jwk=info["public_jwk"])  # type: ignore[index]
     except KeyError as e:
         # service returned unexpected payload shape
+        logger.exception("jwks.rotate payload missing: %s", e)
         raise HTTPException(status_code=500, detail=f"Rotation payload missing: {e}")
     except ValueError as e:
         # domain-level validation/constraints from service
+        logger.info("jwks.rotate bad request: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         # collisions, contention, or service-signaled conflicts
+        logger.info("jwks.rotate conflict: %s", e)
         raise HTTPException(status_code=409, detail=str(e))
 
 

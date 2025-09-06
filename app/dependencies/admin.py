@@ -43,8 +43,13 @@ def is_admin(user: User) -> bool:
         )
 
 
-async def ensure_admin(user: Any = Depends(get_current_user)) -> None:
-    if not is_admin(user):
+async def ensure_admin(current_user: User = Depends(get_current_user)) -> None:
+    """Enforce admin role for the current user.
+
+    Accept the authenticated user via dependency injection and retain strong typing
+    so FastAPI does not attempt to model a Pydantic field for the DB `User`.
+    """
+    if not is_admin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
 

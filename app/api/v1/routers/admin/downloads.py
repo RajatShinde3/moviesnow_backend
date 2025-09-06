@@ -24,6 +24,8 @@
 from __future__ import annotations
 
 from typing import Optional, Dict, Any, List, Tuple
+import posixpath
+import logging
 from uuid import UUID
 
 from fastapi import (
@@ -124,7 +126,7 @@ class TitleDownloadsInventoryOut(BaseModel):
 # ⚙️ Helpers & validation
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ALLOWED_DOWNLOAD_EXTS = (".mp4", ".m4v", ".mov", ".webm", ".zip")
+_ALLOWED_DOWNLOAD_EXTS = {".mp4", ".m4v", ".mov", ".webm", ".zip"}
 
 
 def _allowed_download_ext(key: str) -> bool:
@@ -140,13 +142,15 @@ def _ensure_downloads_key(key: str) -> str:
     - Must use an allowed extension (to reduce noise)
     """
     k = (key or "").strip().lstrip("/")
-    if not k.startswith("downloads/"):
-        raise HTTPException(status_code=400, detail="storage_key must be under downloads/")
-    if ".." in k.split("/"):
+    norm = posixpath.normpath(k)
+    if norm.startswith("../") or "/../" in norm or norm == "..":
         raise HTTPException(status_code=400, detail="storage_key may not contain parent directory segments")
-    if not _allowed_download_ext(k):
-        raise HTTPException(status_code=400, detail=f"storage_key must end with one of: {', '.join(_ALLOWED_DOWNLOAD_EXTS)}")
-    return k
+    if not norm.startswith("downloads/"):
+        raise HTTPException(status_code=400, detail="storage_key must be under downloads/")
+    if not _allowed_download_ext(norm):
+        exts = ", ".join(sorted(_ALLOWED_DOWNLOAD_EXTS))
+        raise HTTPException(status_code=400, detail=f"storage_key must end with one of: {exts}")
+    return norm
 
 
 async def _get_or_create_asset_for_title(db: AsyncSession, title_id: UUID, storage_key: str) -> MediaAsset:
@@ -517,12 +521,16 @@ async def title_downloads_inventory(
     s3 = S3Client()
     client = s3.client
     s3_keys: List[Dict[str, Any]] = []
-    kwargs: Dict[str, Any] = {"Bucket": s3.bucket, "Prefix": pfx, "MaxKeys": limit}
+    kwargs: Dict[str, Any] = {"Bucket": s3.bucket, "Prefix": pfx, "MaxKeys": min(limit, 1000)}
     if continuation_token:
         kwargs["ContinuationToken"] = continuation_token
     try:
         resp = client.list_objects_v2(**kwargs)  # type: ignore[attr-defined]
-    except Exception:
+    except Exception as e:
+        try:
+            logging.getLogger(__name__).info("s3.list_objects_v2 failed: %s", e)
+        except Exception:
+            pass
         raise HTTPException(status_code=503, detail="S3 list error")
 
     for obj in (resp.get("Contents") or []):

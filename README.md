@@ -440,3 +440,18 @@ Get delivery URL (public)
 
 This guide intentionally documents internal details for maintainers and reviewers. When introducing changes, please update only the relevant sections, keeping security and operational guarantees (no-store, rate limits, idempotency, locks, neutral errors) intact.
 
+## Schedule API (Upcoming Releases)
+
+New public endpoints under `/api/v1`:
+
+- `GET /api/v1/schedule/upcoming` — Upcoming releases per region.
+  - Params: `days` (1–180, default 30), `country` (ISO alpha-2, optional; auto-detected from headers if missing), `type` (`MOVIE|SERIES`, optional), `limit` (1–200, default 50).
+  - Response: earliest upcoming Availability window per Title for that region, with `poster_url` and `trailer_url` where available.
+
+- `GET /api/v1/schedule/worldwide` — Upcoming releases with GLOBAL availability.
+  - Params: `days`, `type`, `limit` as above.
+
+Admin manages scheduling data via availability windows:
+- `GET /api/v1/admin/titles/{title_id}/availability`
+- `PUT /api/v1/admin/titles/{title_id}/availability`
+

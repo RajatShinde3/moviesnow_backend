@@ -32,6 +32,8 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
+import logging
+logger = logging.getLogger(__name__)
 
 from app.core.limiter import rate_limit
 from app.security_headers import set_sensitive_cache
@@ -166,7 +168,8 @@ async def mint_signed_cookies(
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
         from cryptography.hazmat.primitives.serialization import load_pem_private_key
-    except Exception:
+    except Exception as e:
+        logger.info("cdn.signed-cookies unavailable: %s", e)
         raise HTTPException(status_code=503, detail="Signing unavailable")
 
     # Build canned policy
@@ -190,7 +193,8 @@ async def mint_signed_cookies(
             padding.PKCS1v15(),
             hashes.SHA1(),
         )
-    except Exception:
+    except Exception as e:
+        logger.info("cdn.signed-cookies signing failed: %s", e)
         raise HTTPException(status_code=503, detail="Signing failed")
 
     sig_b64 = _urlsafe_b64_nopad(signature)

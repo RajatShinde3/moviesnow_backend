@@ -30,7 +30,7 @@ Security notes
 
 from fastapi import APIRouter
 
-from .public import discovery_router, bundles_router, downloads_router
+from .public import discovery_router, bundles_router, downloads_router, schedule_router
 from .user import me_router
 from .player import sessions_router
 from .ops import observability_router
@@ -64,6 +64,7 @@ def build_v1_router() -> APIRouter:
     r.include_router(discovery_router)
     r.include_router(downloads_router)
     r.include_router(bundles_router)
+    r.include_router(schedule_router)
     r.include_router(me_router, prefix="/user")
     r.include_router(sessions_router)
     r.include_router(observability_router)
