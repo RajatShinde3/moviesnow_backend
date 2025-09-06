@@ -455,3 +455,27 @@ Admin manages scheduling data via availability windows:
 - `GET /api/v1/admin/titles/{title_id}/availability`
 - `PUT /api/v1/admin/titles/{title_id}/availability`
 
+## Deployment Quickstart
+
+- Build a production image
+  - Dockerfile provided. Build locally: `docker build -t moviesnow:local .`
+- Local development
+  - Copy `.env.example` to `.env` and fill minimal values (JWT_SECRET_KEY).
+  - Start stack: `docker compose up --build` (brings up Postgres, Redis, API).
+- Production (compose example)
+  - Copy `.env.production.example` into your secret manager or `.env.production` (do not commit real secrets).
+  - Adjust `FRONTEND_ORIGINS`, CSP directives, and rate limits.
+  - `docker compose -f docker-compose.prod.yml up --build -d`.
+- CI/CD
+  - GitHub Actions workflows are provided: CI tests, Lint, Security scans, and Release to GHCR on tags `v*`.
+
+## Production Checklist
+
+- Secrets: Never commit real keys. Rotate any existing keys in `.env` and use a secret manager.
+- HTTPS + HSTS: Set `ENABLE_HTTPS_REDIRECT=true` and non-zero HSTS in prod.
+- CORS: Restrict `FRONTEND_ORIGINS` to exact domains.
+- Docs: Disable with `ENABLE_DOCS=false` in production if desired.
+- Admin: Configure IP allowlist via `ADMIN_IP_ALLOWLIST` and enforce MFA.
+- Rate limits: Set `DEFAULT_RATE_LIMIT` and `RATELIMIT_STORAGE_URI=${REDIS_URL}`.
+- Observability: Consider `LOG_JSON=1` and `SENTRY_DSN`.
+
