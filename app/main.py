@@ -29,6 +29,7 @@ import os
 from fastapi import FastAPI, Request
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import JSONResponse, Response
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 # -- Logging bootstrap (Loguru + stdlib intercept) ----------------------------
 # Importing sets up handlers/format; ignore the symbol with _ alias.
@@ -148,6 +149,13 @@ def create_app() -> FastAPI:
 
     # ── Middlewares (order matters) ─────────────────────────────────────────
     app.add_middleware(RequestIDMiddleware)  # 1) Correlation ID
+
+    # 1.5) Trusted hosts protection (mitigates host header attacks)
+    try:
+        allowed_hosts = getattr(settings, "TRUSTED_HOSTS", ["localhost", "127.0.0.1"]) or ["localhost", "127.0.0.1"]
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+    except Exception:
+        logger.exception("Failed to enable TrustedHostMiddleware")
 
     # 2) Security headers + HTTPS redirect (config via env)
     install_security(app)

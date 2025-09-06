@@ -1,28 +1,45 @@
+################################################################################
+# Python / FastAPI project .gitignore (neat, production‑ready)
+################################################################################
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 
 # Virtual environments
-.venv/*
-env/
-.vs/*
-.vs
+.venv/
 venv/
+env/
 ENV/
 env.bak/
-*.env
-# Distribution / packaging
+venv.bak/
+
+# Environment files (keep examples tracked)
+.env
+.env.*
+!.env.example
+!.env.production.example
+.envrc
+
+# Build / packaging
 build/
-develop-eggs/
 dist/
+sdist/
+develop-eggs/
+downloads/
 eggs/
 .eggs/
 lib/
 lib64/
 parts/
-sdist/
 var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Installer logs
 pip-log.txt
@@ -43,39 +60,51 @@ nosetests.xml
 coverage.xml
 *.cover
 *.py,cover
-
-# pytest
 .pytest_cache/
+.hypothesis/
 
-# mypy
+# Type checkers / linters
 .mypy_cache/
 .dmypy.json
 dmypy.json
+.ruff_cache/
 
-# FastAPI / Starlette
+# FastAPI / runtime
+logs/
 *.log
+*.log.*
+*.pid
+*.gz
 *.sqlite3
+test.db
+tmp_*
 
-# VS Code / JetBrains
+# Editors / IDEs
 .vscode/
 .idea/
+.vs/
 
-# Mac / Linux / Windows system files
+# OS files
 .DS_Store
 Thumbs.db
 
-# Docker
-**/__pycache__/
-*.log
-*.pid
-*.gz
+# Docker / Compose
+docker-compose.override.yml
 
-# Local SQLite DB for testing
-test.db
+# Terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+*.tfvars.json
+.terragrunt-cache/
 
-# Jupyter and IPython
-.ipynb_checkpoints
+# Jupyter / IPython
+.ipynb_checkpoints/
 *.ipynb
 
-# AWS config
+# AWS local config (never commit real creds)
 .aws/
+
+# Docs build (Sphinx)
+docs/_build/

@@ -33,6 +33,8 @@ services:
       POSTGRES_SERVER: db
       REDIS_URL: redis://redis:6379/0
       ENABLE_HTTPS_REDIRECT: "true"
+      TOKEN_CLEANUP_SCHEDULER: "false"
+      JWKS_SCHEDULER: "false"
     depends_on:
       db:
         condition: service_healthy
@@ -40,7 +42,24 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
-    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--log-level", "info"]
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--log-level", "info", "--proxy-headers", "--forwarded-allow-ips=*"]
+
+  worker:
+    build: .
+    env_file:
+      - .env.production
+    environment:
+      POSTGRES_SERVER: db
+      REDIS_URL: redis://redis:6379/0
+      # Enable schedulers in worker
+      TOKEN_CLEANUP_SCHEDULER: "true"
+      JWKS_SCHEDULER: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "scripts/worker.py"]
 
 volumes:
   pg_data:

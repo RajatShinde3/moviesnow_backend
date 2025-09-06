@@ -34,6 +34,10 @@ pytest
 pytest-asyncio
 pytest-dotenv
 pytest-mock
-freezegun
-Faker
-httpx
+ freezegun
+ Faker
+ httpx
+
+# AWS SDK
+boto3
+apscheduler
