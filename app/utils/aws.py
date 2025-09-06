@@ -13,42 +13,47 @@ Hardened, production-ready S3 wrapper used by:
 
 🎯 Goals
 --------
-- Safe presigned PUT/GET (v4 signing) with optional SSE/KMS
-- Explicit timeouts + retry policy
+- Safe presigned PUT/GET (SigV4) with optional SSE/KMS
+- Explicit timeouts + bounded retries
 - Defensive key normalization (no leading slash, no `..`)
-- Pluggable creds (env/role/IRSA) with explicit override if provided
+- Pluggable creds (env / role / IRSA) with explicit override if provided
 - Optional CDN base URL for public asset links
 - Zero secret leakage in logs
 
-🔗 Compatibility
----------------
-Routers call these directly (do **not** rename):
-- `S3Client`, `S3StorageError`
-- `S3Client.presigned_put(...)`
-- `S3Client.presigned_get(...)`
-- `S3Client.put_bytes(...)`
-- `S3Client.delete(...)`
-- `S3Client.client` (for multipart: create/part/complete/abort)
+🔗 Contract (do **not** rename these)
+-------------------------------------
+- Class: `S3Client`, `S3StorageError`
+- Methods: `S3Client.presigned_put(...)`
+           `S3Client.presigned_get(...)`
+           `S3Client.put_bytes(...)`
+           `S3Client.delete(...)`
+           `S3Client.client`   # used externally for multipart ops
+           (plus helpers: `head`, `exists`, `cdn_url`, `object_url`)
+
+Implementation notes
+--------------------
+- This module is intentionally **thin** over boto3 to keep failure modes
+  familiar and observable. Validation focuses on *inputs we control*
+  (keys, headers), while S3-specific errors bubble as S3StorageError.
 """
 
-from typing import Dict, Optional, Tuple, Any
+from typing import Any, Dict, Optional
 import logging
-import os
 import re
 
 try:
-    from pydantic import SecretStr  # for type hints only
+    # Optional: only for type hints; code works without pydantic
+    from pydantic import SecretStr  # type: ignore
 except Exception:  # pragma: no cover
     SecretStr = str  # type: ignore
 
+import boto3
 import botocore
 from botocore.config import Config as BotoConfig
-import boto3
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧱 Exceptions
@@ -59,19 +64,27 @@ class S3StorageError(RuntimeError):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧱 Helpers (key normalization, env access)
+# 🧰 Key and value validation
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Keep keys strict: readable + safe across tools, CDNs, and logs.
 _KEY_ALLOWED_RE = re.compile(r"[A-Za-z0-9._\-/+=@() ]+")
-
 
 def _normalize_key(key: str) -> str:
     """
-    🧰 Normalize and validate S3 keys:
-      - strip whitespace
-      - drop leading `/`
-      - collapse `//`
-      - reject traversal (`..`) and disallowed characters
+    Normalize and validate S3 object keys.
+
+    Steps
+    -----
+    1) Coerce to str, strip whitespace
+    2) Remove leading '/'
+    3) Collapse '//' runs
+    4) Reject path traversal ('..') and disallowed characters
+
+    Raises
+    ------
+    S3StorageError
+        If key is empty or contains unsafe characters.
     """
     k = str(key or "").strip().lstrip("/")
     k = re.sub(r"/{2,}", "/", k)
@@ -85,11 +98,11 @@ def _normalize_key(key: str) -> str:
 
 
 def _secret_value(v: Optional[SecretStr | str]) -> Optional[str]:
+    """Return the underlying secret string without raising if not SecretStr."""
     if v is None:
         return None
     try:
-        # pydantic SecretStr
-        return v.get_secret_value() if hasattr(v, "get_secret_value") else str(v)
+        return v.get_secret_value() if hasattr(v, "get_secret_value") else str(v)  # type: ignore[attr-defined]
     except Exception:
         return str(v)
 
@@ -100,32 +113,42 @@ def _secret_value(v: Optional[SecretStr | str]) -> Optional[str]:
 
 class S3Client:
     """
-    📦 High-level S3 wrapper with safe defaults.
+    High-level S3 wrapper with safe defaults.
 
     Parameters
     ----------
-    bucket : Optional[str]
-        Bucket name. Defaults to `settings.AWS_BUCKET_NAME`.
-    region_name : Optional[str]
-        Region. Defaults to `settings.AWS_REGION` (falls back to bucket location if empty).
-    endpoint_url : Optional[str]
-        Custom endpoint (S3-compatible). Defaults to `settings.AWS_S3_ENDPOINT_URL` if present.
-    cdn_base_url : Optional[str]
-        CDN base (e.g., https://cdn.example.com). If set, `cdn_url()` joins this with keys.
+    bucket : str | None
+        Destination bucket. Defaults to `settings.AWS_BUCKET_NAME`.
+    region_name : str | None
+        Region to use for the client. Defaults to `settings.AWS_REGION`.
+        If not provided anywhere, we attempt to infer from bucket location.
+    endpoint_url : str | None
+        Custom S3-compatible endpoint (e.g., LocalStack/MinIO). Defaults
+        to `settings.AWS_S3_ENDPOINT_URL` if present.
+    cdn_base_url : str | None
+        If set, `cdn_url()` joins this with normalized keys for public links.
+        Defaults to `settings.CDN_BASE_URL` or `settings.cdn_base_url`.
     use_public_acls : bool
-        For rare cases where ACLs are allowed. Defaults False (modern buckets disable ACLs).
-    sse_mode : Optional[str]
-        Server-side encryption mode: "AES256" or "aws:kms". Defaults from `settings.AWS_SSE_MODE`.
-    kms_key_id : Optional[str]
-        KMS key id/arn. Defaults from `settings.AWS_KMS_KEY_ID`.
+        If True and the bucket allows ACLs, `presigned_put`/`put_bytes`
+        can request `ACL=public-read`. Defaults False.
+    sse_mode : str | None
+        "AES256" or "aws:kms". Defaults from `settings.AWS_SSE_MODE`.
+    kms_key_id : str | None
+        KMS key id/arn when `sse_mode="aws:kms"`. Defaults from settings.
 
     Notes
     -----
-    - Credentials: If explicit `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` exist in settings,
-      they are used. Otherwise, rely on the **standard AWS credential chain** (env, profile, IAM role, IRSA).
-    - Retries: Standard botocore retries with bounded attempts.
-    - Timeouts: small connect timeout + moderate read timeout to fail fast.
+    * Credentials:
+        - If `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` are in settings,
+          they are used explicitly; otherwise we rely on the standard AWS
+          credential chain (env, profile, ECS/EC2 role, IRSA).
+    * Retries/Timeouts:
+        - Bounded retry policy (5 attempts) and short connect timeout help fail fast.
     """
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 🔧 Construction
+    # ────────────────────────────────────────────────────────────────────────
 
     def __init__(
         self,
@@ -138,23 +161,23 @@ class S3Client:
         sse_mode: Optional[str] = None,
         kms_key_id: Optional[str] = None,
     ) -> None:
-        # ── Read config from settings
+        # 1) Resolve configuration from explicit args → settings
         self.bucket = bucket or getattr(settings, "AWS_BUCKET_NAME", None)
         if not self.bucket:
             raise S3StorageError("AWS_BUCKET_NAME not configured")
 
-        region_cfg = region_name or getattr(settings, "AWS_REGION", None)
+        region_cfg   = region_name  or getattr(settings, "AWS_REGION", None)
         endpoint_cfg = endpoint_url or getattr(settings, "AWS_S3_ENDPOINT_URL", None)
 
         # Optional CDN base (normalized, no trailing slash)
         cdn_env = cdn_base_url or getattr(settings, "cdn_base_url", None) or getattr(settings, "CDN_BASE_URL", None)
         self._cdn_base = (cdn_env or "").rstrip("/")
 
-        # SSE defaults
-        self._sse_mode = sse_mode or getattr(settings, "AWS_SSE_MODE", None)
+        # SSE defaults (never log these)
+        self._sse_mode  = sse_mode  or getattr(settings, "AWS_SSE_MODE", None)
         self._kms_key_id = kms_key_id or getattr(settings, "AWS_KMS_KEY_ID", None)
 
-        # ── Build boto3 client with safe defaults
+        # 2) Build the boto3 client with safe defaults
         cfg = BotoConfig(
             signature_version="s3v4",
             retries={"max_attempts": 5, "mode": "standard"},
@@ -163,7 +186,6 @@ class S3Client:
             s3={"addressing_style": "virtual"},
         )
 
-        # Use explicit keys only if provided; otherwise rely on default chain
         ak = getattr(settings, "AWS_ACCESS_KEY_ID", None)
         sk = _secret_value(getattr(settings, "AWS_SECRET_ACCESS_KEY", None))
         st = _secret_value(getattr(settings, "AWS_SESSION_TOKEN", None))
@@ -173,12 +195,9 @@ class S3Client:
             client_kwargs["region_name"] = region_cfg
         if endpoint_cfg:
             client_kwargs["endpoint_url"] = endpoint_cfg
-
         if ak and sk:
-            client_kwargs.update(
-                aws_access_key_id=ak,
-                aws_secret_access_key=sk,
-            )
+            client_kwargs["aws_access_key_id"] = ak
+            client_kwargs["aws_secret_access_key"] = sk
             if st:
                 client_kwargs["aws_session_token"] = st
 
@@ -187,17 +206,17 @@ class S3Client:
         except Exception as e:  # pragma: no cover
             raise S3StorageError(f"Failed to create S3 client: {e}") from e
 
-        # If region not specified, try to infer from bucket location (once)
+        # 3) Region inference (best effort)
         self.region = region_cfg or self._infer_region_safely()
 
-        # ACL policy flag (most modern buckets have ACLs disabled)
+        # 4) ACL flag (most modern buckets have ACLs disabled)
         self._use_public_acls = bool(use_public_acls)
 
-        # Safe, minimal `__repr__` (no secrets)
+        # 5) Safe, minimal repr (no secrets, no URLs)
         self._repr = f"S3Client(bucket={self.bucket}, region={self.region}, endpoint={'yes' if endpoint_cfg else 'no'})"
 
     # ────────────────────────────────────────────────────────────────────────
-    # 🔐  Signed URL helpers
+    # 🔐 Signed URL helpers
     # ────────────────────────────────────────────────────────────────────────
 
     def presigned_put(
@@ -212,29 +231,34 @@ class S3Client:
         extra_headers: Optional[Dict[str, str]] = None,
     ) -> str:
         """
-        🔐 Generate a presigned PUT URL (v4) for direct-to-S3 uploads.
+        Generate a **presigned PUT** URL for direct-to-S3 uploads.
 
         Parameters
         ----------
         key : str
             Object key (will be normalized; no leading `/`, no `..`).
         content_type : str
-            MIME type clients **must** include on upload.
+            MIME type clients **must** include on upload (`Content-Type` header).
         public : bool
-            If True and bucket allows ACLs, sets `ACL=public-read`.
+            If True and bucket allows ACLs, also requests `ACL=public-read`.
         expires_in : int
-            URL TTL seconds (default 15m).
-        cache_control : Optional[str]
-            Optional response caching directive to store with object metadata.
-        content_disposition : Optional[str]
+            URL TTL in seconds (default 900s = 15m).
+        cache_control : str | None
+            Value to store as object `Cache-Control` metadata.
+        content_disposition : str | None
             Optional `Content-Disposition` metadata.
-        extra_headers : Optional[Dict[str, str]]
-            Additional request parameters (e.g., SSE headers). Values are **not** logged.
+        extra_headers : dict[str,str] | None
+            Extra params merged into the request (e.g., SSE headers).
 
         Returns
         -------
         str
             Fully signed URL for HTTP PUT.
+
+        Raises
+        ------
+        S3StorageError
+            On signing failure or invalid key.
         """
         k = _normalize_key(key)
 
@@ -246,7 +270,7 @@ class S3Client:
 
         # Server-side encryption policy
         sse_mode = (extra_headers or {}).get("ServerSideEncryption") or self._sse_mode
-        kms_key = (extra_headers or {}).get("SSEKMSKeyId") or self._kms_key_id
+        kms_key  = (extra_headers or {}).get("SSEKMSKeyId")          or self._kms_key_id
         if sse_mode:
             params["ServerSideEncryption"] = sse_mode
             if sse_mode == "aws:kms" and kms_key:
@@ -259,21 +283,19 @@ class S3Client:
         if public and self._use_public_acls:
             params["ACL"] = "public-read"
 
-        # Merge any additional safe headers
+        # Merge extra headers safely (never override core identity fields)
         for hk, hv in (extra_headers or {}).items():
-            # Protect core parameters from being clobbered by mistake
             if hk in {"Bucket", "Key", "Expires"}:
                 continue
             params[hk] = hv
 
         try:
-            url = self.client.generate_presigned_url(
+            return self.client.generate_presigned_url(
                 ClientMethod="put_object",
                 Params=params,
                 ExpiresIn=int(expires_in),
                 HttpMethod="PUT",
             )
-            return url
         except Exception as e:
             raise S3StorageError(f"Failed to create presigned PUT: {e}") from e
 
@@ -286,18 +308,23 @@ class S3Client:
         response_content_disposition: Optional[str] = None,
     ) -> str:
         """
-        🔐 Generate a short-lived presigned GET URL.
+        Generate a short-lived **presigned GET** URL.
 
         Parameters
         ----------
         key : str
-            Object key.
+            Object key (normalized).
         expires_in : int
-            TTL in seconds (default 5m).
-        response_content_type : Optional[str]
-            Force response content-type (useful for downloads/previews).
-        response_content_disposition : Optional[str]
-            e.g., `attachment; filename="..."` for downloads.
+            TTL seconds (default 300s = 5m).
+        response_content_type : str | None
+            Optional override for the `Content-Type` returned to the client.
+        response_content_disposition : str | None
+            e.g., `attachment; filename="..."` to force downloads.
+
+        Returns
+        -------
+        str
+            Fully signed URL for HTTP GET.
         """
         k = _normalize_key(key)
         params: Dict[str, Any] = {"Bucket": self.bucket, "Key": k}
@@ -316,7 +343,7 @@ class S3Client:
             raise S3StorageError(f"Failed to create presigned GET: {e}") from e
 
     # ────────────────────────────────────────────────────────────────────────
-    # 🚀  Direct server-side ops (small files, best-effort delete)
+    # 🚀 Direct server-side ops (small files, best-effort delete)
     # ────────────────────────────────────────────────────────────────────────
 
     def put_bytes(
@@ -331,12 +358,18 @@ class S3Client:
         extra_args: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
-        🚀 Upload small payloads from the server (<= ~10MB ideal).
+        Upload a small payload from the server (≤ ~10MB ideal).
 
         Notes
         -----
-        Prefer presigned PUT from clients. This is used by the
-        `/uploads/direct-proxy` endpoint for tiny objects.
+        Prefer presigned PUT from clients to reduce server egress and
+        improve parallelism. This exists for tiny writes or service-side
+        generated content.
+
+        Raises
+        ------
+        S3StorageError
+            On upload failure or invalid key.
         """
         k = _normalize_key(key)
         args: Dict[str, Any] = {
@@ -353,7 +386,7 @@ class S3Client:
 
         # SSE defaulting
         sse_mode = (extra_args or {}).get("ServerSideEncryption") or self._sse_mode
-        kms_key = (extra_args or {}).get("SSEKMSKeyId") or self._kms_key_id
+        kms_key  = (extra_args or {}).get("SSEKMSKeyId")          or self._kms_key_id
         if sse_mode:
             args["ServerSideEncryption"] = sse_mode
             if sse_mode == "aws:kms" and kms_key:
@@ -362,7 +395,7 @@ class S3Client:
         if public and self._use_public_acls:
             args["ACL"] = "public-read"
 
-        # Merge extra args (safe)
+        # Merge extra args (keep core fields protected)
         for karg, varg in (extra_args or {}).items():
             if karg in {"Bucket", "Key", "Body"}:
                 continue
@@ -375,27 +408,36 @@ class S3Client:
 
     def delete(self, key: str) -> bool:
         """
-        🧹 Best-effort delete (swallows 'Not Found' as success).
-        Returns True when request went through; False only on explicit error.
+        Best-effort delete.
+
+        Behavior
+        --------
+        - Returns True on successful request submission.
+        - Returns True for "NoSuchKey" (idempotent delete).
+        - Returns False only on non-ignorable errors (logged at WARNING).
         """
         k = _normalize_key(key)
         try:
             self.client.delete_object(Bucket=self.bucket, Key=k)
             return True
-        except self.client.exceptions.NoSuchKey:
+        except getattr(self.client, "exceptions", object()).NoSuchKey:  # type: ignore[attr-defined]
             return True
         except Exception as e:
             logger.warning("delete_object failed (non-fatal): %s", e)
             return False
 
     # ────────────────────────────────────────────────────────────────────────
-    # 🌐  Public/CDN URL helpers
+    # 🌐 Public URL helpers
     # ────────────────────────────────────────────────────────────────────────
 
     def cdn_url(self, key: str) -> Optional[str]:
         """
-        🌐 Build a CDN URL for a key if a CDN base is configured.
-        Returns None when not configured.
+        Build a CDN URL for a normalized key if a CDN base is configured.
+
+        Returns
+        -------
+        str | None
+            The CDN URL (e.g., https://dxxx.cloudfront.net/path) or None.
         """
         if not self._cdn_base:
             return None
@@ -403,53 +445,71 @@ class S3Client:
 
     def object_url(self, key: str) -> str:
         """
-        🌐 Build a direct S3 HTTPS URL (non-signed, private objects still require auth).
+        Build a direct S3 HTTPS URL (non-signed). Private objects will still
+        require auth at fetch time.
+
         For custom endpoints, uses the configured endpoint host.
         """
         k = _normalize_key(key)
-        # Custom endpoint?
         ep = getattr(self.client, "meta", None)
         if ep and getattr(ep, "endpoint_url", None):
             base = str(ep.endpoint_url).rstrip("/")
             return f"{base}/{self.bucket}/{k}"
-        # AWS standard form
         region = self.region or "us-east-1"
         return f"https://{self.bucket}.s3.{region}.amazonaws.com/{k}"
 
     # ────────────────────────────────────────────────────────────────────────
-    # 🔎  Metadata helpers
+    # 🔎 Metadata helpers
     # ────────────────────────────────────────────────────────────────────────
 
     def head(self, key: str) -> Optional[Dict[str, Any]]:
-        """HEAD the object; returns metadata or None if not found."""
+        """
+        HEAD the object and return metadata dictionary or None if not found.
+
+        Safe failure: returns None for common "not found" cases.
+        """
         k = _normalize_key(key)
         try:
             resp = self.client.head_object(Bucket=self.bucket, Key=k)
+            # boto3 returns a dict-like; cast to plain dict to detach from botocore model
             return dict(resp or {})
-        except self.client.exceptions.NoSuchKey:
+        except getattr(self.client, "exceptions", object()).NoSuchKey:  # type: ignore[attr-defined]
+            return None
+        except botocore.exceptions.ClientError as e:
+            # Normalize 404/403-without-object into None; others bubble via debug
+            code = e.response.get("Error", {}).get("Code")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return None
+            logger.debug("head_object client error: %s", e)
             return None
         except Exception as e:
-            logger.debug("head_object error: %s", e)
+            logger.debug("head_object unexpected error: %s", e)
             return None
 
     def exists(self, key: str) -> bool:
-        """Boolean existence check using HEAD."""
+        """Boolean existence check using `HEAD`."""
         return self.head(key) is not None
 
     # ────────────────────────────────────────────────────────────────────────
-    # 🧪  Internals
+    # 🧪 Internals
     # ────────────────────────────────────────────────────────────────────────
 
     def _infer_region_safely(self) -> Optional[str]:
-        """Try to read the bucket's region without failing the client."""
+        """
+        Try to read the bucket's region without failing the client.
+
+        Returns
+        -------
+        str | None
+            Region or None if not discoverable (we tolerate failure here).
+        """
         try:
             resp = self.client.get_bucket_location(Bucket=self.bucket)
             loc = resp.get("LocationConstraint")
-            # us-east-1 returns None in older APIs
+            # Old APIs return None for us-east-1
             return loc or "us-east-1"
         except Exception as e:
             logger.debug("get_bucket_location failed: %s", e)
-            # Fall back to env/defaults; not fatal
             return getattr(settings, "AWS_REGION", None)
 
     def __repr__(self) -> str:  # pragma: no cover

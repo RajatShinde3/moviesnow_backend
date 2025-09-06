@@ -10,12 +10,12 @@ headers, and **audit logs** that never block the critical path.
 
 Routes (6)
 ----------
-- POST /api/v1/admin/uploads/init                      → Presigned PUT for single-part upload
-- POST /api/v1/admin/uploads/multipart/create          → Create multipart upload (returns uploadId + key)
-- GET  /api/v1/admin/uploads/multipart/{uploadId}/part-url   → Presigned URL for a multipart part
-- POST /api/v1/admin/uploads/multipart/{uploadId}/complete → Complete multipart upload
-- POST /api/v1/admin/uploads/multipart/{uploadId}/abort    → Abort multipart upload
-- POST /api/v1/admin/uploads/direct-proxy              → Direct proxy small files (≤ 10 MiB)
+- POST /api/v1/admin/uploads/init                           → Presigned PUT for single-part upload
+- POST /api/v1/admin/uploads/multipart/create               → Create multipart upload (returns uploadId + key)
+- GET  /api/v1/admin/uploads/multipart/{uploadId}/part-url  → Presigned URL for a multipart part
+- POST /api/v1/admin/uploads/multipart/{uploadId}/complete  → Complete multipart upload
+- POST /api/v1/admin/uploads/multipart/{uploadId}/abort     → Abort multipart upload
+- POST /api/v1/admin/uploads/direct-proxy                   → Direct proxy small files (≤ 10 MiB)
 
 Security & Operations
 ---------------------
@@ -47,7 +47,6 @@ from app.core.redis_client import redis_wrapper
 from app.security_headers import set_sensitive_cache
 from app.services.audit_log_service import log_audit_event
 
-
 from app.db.models.user import User
 from app.utils.aws import S3Client, S3StorageError
 
@@ -58,6 +57,7 @@ router = APIRouter(tags=["Admin • Uploads"])
 # 🧰 Helpers & Constants
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_DIRECT_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MiB
+MAX_PARTS = 10_000
 
 # Common MIME→ext mapping (extend as needed)
 _EXT_MAP = {
@@ -71,11 +71,15 @@ _EXT_MAP = {
     "video/mpeg": "mpg",
     "video/webm": "webm",
     "video/quicktime": "mov",
-    # text/docs
+    "video/mp2t": "ts",
+    "video/iso.segment": "m4s",
+    # text/docs/captions/hls
     "text/plain": "txt",
     "application/pdf": "pdf",
     "text/vtt": "vtt",
     "application/x-subrip": "srt",
+    "application/vnd.apple.mpegurl": "m3u8",
+    "application/x-mpegurl": "m3u8",
 }
 
 _SAFE_SEG_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -101,6 +105,34 @@ def _ensure_s3() -> S3Client:
 def _ext_for_content_type(ct: str) -> str:
     """Map a content-type to a safe file extension; fallback to .bin."""
     return _EXT_MAP.get((ct or "").lower(), "bin")
+
+
+def _default_cache_control(ct: str) -> str:
+    """
+    Recommend a `Cache-Control` based on content type.
+
+    These defaults should match your CloudFront cache policies.
+    """
+    ct = (ct or "").lower()
+
+    # HLS playlists are short-lived
+    if ct in ("application/vnd.apple.mpegurl", "application/x-mpegurl"):
+        return "public,max-age=30"
+
+    # TS/segments immutable for a week
+    if ct in ("video/mp2t", "video/iso.segment"):
+        return "public,max-age=604800,immutable"
+
+    # Subtitles are text, moderate cache
+    if ct in ("text/vtt", "application/x-subrip"):
+        return "public,max-age=86400"
+
+    # Images default long cache
+    if ct.startswith("image/"):
+        return "public,max-age=2592000"
+
+    # Safe default for unknowns
+    return "public,max-age=3600"
 
 
 def _sanitize_segment(s: Optional[str], fallback: str) -> str:
@@ -147,7 +179,8 @@ def _safe_prefix(prefix: Optional[str], default: str) -> str:
 
 def _short_hash(value: str, *, length: int = 8) -> str:
     """Short, deterministic SHA-1 hash (hex)."""
-    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
+    import hashlib as _hashlib
+    return _hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +191,15 @@ class UploadInitIn(BaseModel):
     content_type: str
     key_prefix: Optional[str] = Field("uploads/title", description="Base path prefix; sanitized")
     filename_hint: Optional[str] = None
+    cache_control: Optional[str] = Field(None, description="Override Cache-Control stored on object")
+    content_disposition: Optional[str] = Field(None, description="Optional Content-Disposition")
+
+
+class UploadInitOut(BaseModel):
+    upload_url: str
+    storage_key: str
+    headers: Dict[str, str]
+    cdn_url: Optional[str] = None
 
 
 class MultipartCreateIn(BaseModel):
@@ -165,6 +207,14 @@ class MultipartCreateIn(BaseModel):
     content_type: str
     key_prefix: Optional[str] = Field("uploads/multipart", description="Base path prefix; sanitized")
     filename_hint: Optional[str] = None
+    cache_control: Optional[str] = None
+    content_disposition: Optional[str] = None
+
+
+class MultipartCreateOut(BaseModel):
+    uploadId: str
+    storage_key: str
+    cdn_url: Optional[str] = None
 
 
 class MultipartCompleteIn(BaseModel):
@@ -184,12 +234,19 @@ class DirectProxyIn(BaseModel):
     data_base64: str
     key_prefix: Optional[str] = Field("uploads/direct", description="Base path prefix; sanitized")
     filename_hint: Optional[str] = None
+    cache_control: Optional[str] = None
+    content_disposition: Optional[str] = None
+
+
+class DirectProxyOut(BaseModel):
+    storage_key: str
+    cdn_url: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔗 Single-part Presigned Upload
 # ─────────────────────────────────────────────────────────────────────────────
-@router.post("/uploads/init", summary="Init single upload (presigned PUT)")
+@router.post("/uploads/init", summary="Init single upload (presigned PUT)", response_model=UploadInitOut)
 @rate_limit("20/minute")
 async def uploads_init(
     payload: UploadInitIn | Dict[str, Any],
@@ -204,12 +261,12 @@ async def uploads_init(
     -----
     1. AuthZ/MFA + cache hardening
     2. Build deterministic storage key (idempotency-aware)
-    3. Return presigned PUT URL
+    3. Return presigned PUT URL + the headers the client must send
 
     Returns
     -------
     200 JSON
-        `{ "upload_url": str, "storage_key": str }`
+        `{ upload_url, storage_key, headers, cdn_url? }`
     """
     set_sensitive_cache(response)
 
@@ -238,8 +295,29 @@ async def uploads_init(
         return _json(snap)
 
     # Presign
-    url = s3.presigned_put(key, content_type=payload.content_type, public=False)
-    body = {"upload_url": url, "storage_key": key}
+    cache_control = payload.cache_control or _default_cache_control(payload.content_type)
+    try:
+        url = s3.presigned_put(
+            key,
+            content_type=payload.content_type,
+            cache_control=cache_control,
+            content_disposition=payload.content_disposition,
+            expires_in=900,
+            public=False,
+        )
+    except S3StorageError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    body: Dict[str, Any] = {
+        "upload_url": url,
+        "storage_key": key,
+        "headers": {
+            "Content-Type": payload.content_type,
+            "Cache-Control": cache_control,
+            **({"Content-Disposition": payload.content_disposition} if payload.content_disposition else {}),
+        },
+        "cdn_url": s3.cdn_url(key),
+    }
 
     # Snapshot + audit (best-effort)
     try:
@@ -264,7 +342,7 @@ async def uploads_init(
 # ─────────────────────────────────────────────────────────────────────────────
 # 🧩 Multipart: Create
 # ─────────────────────────────────────────────────────────────────────────────
-@router.post("/uploads/multipart/create", summary="Create multipart upload (returns uploadId)")
+@router.post("/uploads/multipart/create", summary="Create multipart upload (returns uploadId)", response_model=MultipartCreateOut)
 @rate_limit("20/minute")
 async def multipart_create(
     payload: MultipartCreateIn | Dict[str, Any],
@@ -305,18 +383,21 @@ async def multipart_create(
 
     # ── S3 multipart init (only if not a replay) ────────────────────────────
     s3 = _ensure_s3()
+    cache_control = payload.cache_control or _default_cache_control(payload.content_type)
     try:
         upload = s3.client.create_multipart_upload(
             Bucket=s3.bucket,
             Key=key,
             ContentType=payload.content_type,
+            CacheControl=cache_control,
+            **({"ContentDisposition": payload.content_disposition} if payload.content_disposition else {}),
             ACL="private",
         )
         upload_id = upload["UploadId"]
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Multipart init failed: {e}")
 
-    body = {"uploadId": upload_id, "storage_key": key}
+    body = {"uploadId": upload_id, "storage_key": key, "cdn_url": s3.cdn_url(key)}
 
     # Best-effort idempotency snapshot + audit
     try:
@@ -324,7 +405,6 @@ async def multipart_create(
     except Exception:
         pass
     try:
-        # Call module-level symbol so tests can monkeypatch `mod.log_audit_event`
         await log_audit_event(
             None,
             user=current_user,
@@ -347,13 +427,18 @@ async def multipart_create(
 async def multipart_part_url(
     uploadId: str,
     key: str,
-    partNumber: int = Query(..., ge=1, le=10_000),
+    partNumber: int = Query(..., ge=1, le=MAX_PARTS),
     request: Request = None,
     response: Response = None,
     current_user: User = Depends(get_current_user),
 ) -> JSONResponse:
     """
     Return a presigned **PUT** URL for a specific multipart `partNumber`.
+
+    Notes
+    -----
+    * The client **must** upload the part with this URL and later provide
+      the returned **ETag** exactly (including quotes) during `complete`.
 
     Returns
     -------
@@ -397,6 +482,11 @@ async def multipart_complete(
     """
     Complete a multipart upload by supplying `{ETag, PartNumber}` for each part.
 
+    Implementation detail
+    ---------------------
+    * S3 requires the `Parts` list to be **sorted** by `PartNumber` ascending.
+      We enforce that here to avoid subtle 400 errors.
+
     Returns
     -------
     200 JSON
@@ -412,13 +502,23 @@ async def multipart_complete(
     await _ensure_admin(current_user)
     await _ensure_mfa(request)
 
+    # Sort and coerce parts
+    try:
+        parts = [
+            {"ETag": str(p["ETag"]), "PartNumber": int(p["PartNumber"])}
+            for p in payload.parts
+        ]
+        parts.sort(key=lambda x: x["PartNumber"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid parts list")
+
     s3 = _ensure_s3()
     try:
         s3.client.complete_multipart_upload(
             Bucket=s3.bucket,
             Key=payload.key,
             UploadId=uploadId,
-            MultipartUpload={"Parts": [{"ETag": p["ETag"], "PartNumber": int(p["PartNumber"])} for p in payload.parts]},
+            MultipartUpload={"Parts": parts},
         )
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Complete failed: {e}")
@@ -492,7 +592,7 @@ async def multipart_abort(
 # ─────────────────────────────────────────────────────────────────────────────
 # 📤 Direct Proxy (Small Files)
 # ─────────────────────────────────────────────────────────────────────────────
-@router.post("/uploads/direct-proxy", summary="Direct proxy upload (small files)")
+@router.post("/uploads/direct-proxy", summary="Direct proxy upload (small files)", response_model=DirectProxyOut)
 @rate_limit("20/minute")
 async def direct_proxy_upload(
     payload: DirectProxyIn | Dict[str, Any],
@@ -509,7 +609,7 @@ async def direct_proxy_upload(
     Returns
     -------
     200 JSON
-        `{ "storage_key": str }`
+        `{ "storage_key": str, "cdn_url"?: str }`
 
     Raises
     ------
@@ -547,8 +647,16 @@ async def direct_proxy_upload(
     stem_hint = _sanitize_segment(payload.filename_hint, f"direct_{_short_hash(idem_hdr)}")
     key = f"{prefix}/{stem_hint}.{ext}"
 
+    cache_control = payload.cache_control or _default_cache_control(payload.content_type)
     try:
-        s3.put_bytes(key, data, content_type=payload.content_type, public=False)
+        s3.put_bytes(
+            key,
+            data,
+            content_type=payload.content_type,
+            public=False,
+            cache_control=cache_control,
+            content_disposition=payload.content_disposition,
+        )
     except S3StorageError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -564,4 +672,4 @@ async def direct_proxy_upload(
     except Exception:
         pass
 
-    return _json({"storage_key": key})
+    return _json({"storage_key": key, "cdn_url": s3.cdn_url(key)})
